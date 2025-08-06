@@ -1,0 +1,42 @@
+[package]
+name = "tbbsplus_rust"
+version = "0.1.0"
+edition = "2021"
+
+# Main library dependencies for examples
+[dependencies]
+bbs_plus = "0.25.0"
+ark-bls12-381 = "0.4"
+ark-ff = "0.4"  
+ark-ec = "0.4"
+ark-std = "0.4"
+blake2 = "0.10"
+
+# Additional dependencies for selective disclosure example
+schnorr_pok = "0.23.0"
+dock_crypto_utils = "0.23.0"
+
+# Additional dependencies for threshold examples
+secret_sharing_and_dkg = "0.16.0"
+anyhow = "1.0"
+
+# Examples
+[[example]]
+name = "basic_credential"
+path = "examples/basic_credential.rs"
+
+[[example]]
+name = "blind_credential"
+path = "examples/blind_credential.rs"
+
+[[example]]
+name = "selective_disclosure"
+path = "examples/selective_disclosure.rs"
+
+[[example]]
+name = "threshold_demo_simple"
+path = "examples/threshold_system/threshold_demo_simple.rs"
+
+[[example]]
+name = "threshold_demo1"
+path = "examples/threshold_system/threshold_demo1.rs"
