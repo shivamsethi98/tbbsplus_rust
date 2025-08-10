@@ -1,0 +1,10 @@
+# test ouputs
+*.yml
+!.github/workflows/*.yml
+*.yaml
+*.json
+*.tar
+*.tar.gz
+out
+
+venv
