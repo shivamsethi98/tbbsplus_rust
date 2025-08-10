@@ -1,3 +1,87 @@
+## v1 contracts + orchestration demo
+
+This repo demonstrates the early v1 flow for threshold BBS+ credentials with:
+
+- Solidity contracts (events-only v1):
+    - `contracts/Params.sol`: owner sets immutable params per credential name (t, n, messageCount, encodings).
+    - `contracts/RequestCredential.sol`: client broadcasts a signing request as an event. PoK verification is stubbed (will use EIP-2537 later).
+    - `contracts/Issue.sol`: on-chain issuer allowlisting and blind-sign notification event (`emitIssue`).
+    - `contracts/SetupPublicParams.sol`: emits public parameter events (H vector, opaque X string).
+- Rust orchestration demo:
+    - `src/bin/ttp.rs`: trusted dealer that assigns shares to issuers over TCP (demo only).
+    - `src/bin/issuer.rs`: connects to TTP, binds to 127.0.0.1:9200+(id-1), serves user requests, returns demo partial shares.
+    - `src/bin/user.rs`: requests shares from issuers and collects at least threshold t shares.
+    - `src/bin/run_orchestration.rs`: launches TTP and N issuers (and optionally the user) for a local demo.
+    - Mesh (peer) scaffolding: `src/orchestration/mesh.rs` (stub), `src/orchestration/mpc.rs` (behind feature `mpc`).
+
+Status (v1):
+- Contracts compile and tests pass locally without mainnet fork.
+- Precompile tests are present; mainnet fork is optional (`FORK=1`) and slower.
+- PoK is stubbed in `RequestCredential`; EIP-2537 integration planned next.
+
+### Quick start (JS)
+
+Install deps and run tests:
+
+```bash
+npm install
+npm test           # fast, no fork
+FORK=1 npm test    # optional, forks mainnet for precompile checks
+```
+
+### Quick start (Rust demo)
+
+Open two terminals. In terminal 1, launch the demo:
+
+```bash
+cargo run --bin run_orchestration
+```
+
+Optionally run with auto user:
+
+```bash
+RUN_USER=1 cargo run --bin run_orchestration
+```
+
+Or run each component manually:
+
+```bash
+cargo run --bin ttp
+cargo run --bin issuer   # run multiple instances
+cargo run --bin user
+```
+
+Enable experimental MPC scaffolding (no crypto wired yet):
+
+```bash
+cargo build --features mpc
+```
+
+### Environment (Rust orchestration)
+
+- THRESHOLD: default 3
+- TOTAL: default THRESHOLD
+- TTP_ADDR: default 127.0.0.1:9000
+- ISSUER_BIND: default 127.0.0.1:0 (issuer auto-binds to 127.0.0.1:9200+(id-1))
+- USER_ADDR: default 127.0.0.1:9100
+
+### Expected behavior (current)
+
+- TTP listens and assigns sequential IDs + demo key shares to issuers.
+- Issuers connect to TTP, then bind to 127.0.0.1:9200+(id-1), accept a single user connection, and return a demo partial share.
+- User connects to the first t issuer ports and collects shares; aggregation is not implemented yet (placeholder).
+- Contracts provide:
+    - Immutable params per credential name (Params).
+    - Event-based request broadcasting (RequestCredential).
+    - On-chain issuer allowlisting and blind-sign emission (Issue).
+
+### Next steps
+
+- Add `PartialSignatureRelay.sol` that emits PartialShare events (issuer → SC → user listening events).
+- Wire real PoK verification using EIP-2537 (PAIR) on-chain.
+- Replace demo shares with real threshold BBS+ partials and aggregation in Rust.
+- Off-chain MPC coordination: use a pub/sub hub (NATS/Redis/libp2p) to collect t partials without using SC or the user as the coordinator.
+
 # Threshold BBS+ Signature System in Rust
 
 A comprehensive implementation of **Threshold BBS+ signatures** and **anonymous credentials** in Rust, featuring distributed key generation, multi-party computation protocols, and zero-knowledge proofs for selective disclosure.
@@ -138,6 +222,21 @@ let sig_share = BBSPlusSignatureShare::new(
 // Aggregate shares to form complete signature
 let signature = BBSPlusSignatureShare::aggregate(sig_shares)?;
 ```
+
+### Stage-1 threshold demo (env-driven TCP JSON-lines)
+
+- Binaries: `ttp`, `issuer`, `user`
+- Env (defaults in parens):
+    - `THRESHOLD` (3), `TOTAL` (5), `MESSAGE_COUNT` (5)
+    - `TTP_ADDR` (127.0.0.1:9000), `USER_ADDR` (127.0.0.1:9100)
+    - `ISSUER_BIND` (0 = OS-assigned; for demo we run issuers on 127.0.0.1:9200..)
+
+Run flow:
+1) Start TTP: cargo run --bin ttp
+2) Start N issuers on ports 9200.., e.g. in separate terminals set `ISSUER_BIND=127.0.0.1:9200` then `cargo run --bin issuer` (repeat 9201, 9202, ...)
+3) Start user to collect shares: cargo run --bin user
+
+This Stage-1 demo assigns key shares and returns demo signature shares (hashed payloads) to prove the wiring. MPC phases and real BBS+ shares will be integrated next.
 
 ## 🔧 Getting Started
 

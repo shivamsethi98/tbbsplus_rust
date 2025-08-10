@@ -11,6 +11,13 @@ ark-ff = "0.4"
 ark-ec = "0.4"
 ark-std = "0.4"
 blake2 = "0.10"
+ark-serialize = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+thiserror = "1.0"
+hex = "0.4"
+dotenvy = "0.15"
 
 # Additional dependencies for selective disclosure example (using local crypto libraries)
 schnorr_pok = { path = "crypto/schnorr_pok" }
@@ -23,8 +30,16 @@ anyhow = "1.0"
 # Additional dependencies for hybrid verification example
 proof_system = { path = "crypto/proof_system" }
 legogroth16 = { path = "crypto/legogroth16" }
-ark-serialize = "0.4"
-serde_json = "1.0"
+libp2p = { version = "0.54", default-features = false, features = ["tcp", "dns", "tokio", "noise", "yamux", "gossipsub", "mdns", "identify", "request-response", "cbor", "kad", "macros"], optional = true }
+oblivious_transfer_protocols = { path = "crypto/oblivious_transfer" }
+test_utils = { path = "crypto/test_utils" }
+sha3 = "0.10"
+base64 = "0.21"
+rand = "0.8"
+futures = "0.3"
+
+[features]
+mpc = ["libp2p"]
 
 # Examples
 [[example]]

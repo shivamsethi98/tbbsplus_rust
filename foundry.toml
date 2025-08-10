@@ -1,6 +1,6 @@
 [profile.default]
 solc_version = "0.8.24"
-src = "src"
+src = "contracts"
 test = "test"
 libs = ["lib"]
 

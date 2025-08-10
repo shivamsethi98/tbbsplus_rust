@@ -9,6 +9,7 @@
   "test:hoodi": "hardhat test --network hoodi",
   "test:local": "hardhat test",
   "test:mainnet": "hardhat test --network mainnet",
+  "demo:issuer": "hardhat run scripts/issuer_relay_demo.ts",
   "call:map1": "ts-node scripts/eip2537_ethcall.ts map1",
   "call:map2": "ts-node scripts/eip2537_ethcall.ts map2",
   "call:pair-empty": "ts-node scripts/eip2537_ethcall.ts pair-empty",
