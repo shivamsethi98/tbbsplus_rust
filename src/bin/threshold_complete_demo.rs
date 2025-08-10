@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
     
     // Simulate trusted key generation (in practice, use DKG)
     let (secret_key, key_shares) = {
-        let (secret, shares, _) = deal_random_secret(&mut master_rng, THRESHOLD, TOTAL)?;
+        let (secret, shares, _) = deal_random_secret(&mut master_rng, THRESHOLD, TOTAL)
+            .map_err(|e| anyhow::anyhow!("Failed to deal secret: {:?}", e))?;
         (secret, shares.0.into_iter().map(|s| s.share).collect::<Vec<_>>())
     };
     
@@ -73,7 +74,6 @@ async fn main() -> anyhow::Result<()> {
     
     // Create network nodes and coordinators
     let mut coordinators = Vec::new();
-    let mut handles = Vec::new();
     
     for i in 1..=TOTAL {
         let listen_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{}", base_port + i - 1).parse()?;
@@ -103,13 +103,12 @@ async fn main() -> anyhow::Result<()> {
             TOTAL,
             BATCH_SIZE,
             b"threshold-bbs-demo".to_vec(),
-            handle.clone(),
+            handle,
             commitment_rx,  // Will multiplex this for both commitments and signatures
             direct_rx,
         );
         
         coordinators.push(coordinator);
-        handles.push(handle);
         
         println!("  ✓ Node {} initialized on {}", i, listen_addr);
     }
@@ -125,8 +124,10 @@ async fn main() -> anyhow::Result<()> {
     // Create tasks for each participant
     let mut tasks = Vec::new();
     
-    for i in 0..THRESHOLD as usize {
-        let mut coordinator = coordinators.into_iter().nth(i).unwrap();
+    // Take only threshold number of coordinators
+    let active_coordinators: Vec<_> = coordinators.into_iter().take(THRESHOLD as usize).collect();
+    
+    for (i, mut coordinator) in active_coordinators.into_iter().enumerate() {
         let key_share = key_shares[i].clone();
         let base_ot = base_ot_outputs[i].clone();
         let gv = gadget_vector.clone();
@@ -185,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n🔍 Step 7: Verify Threshold Signature");
     
     println!("  Signature components:");
-    println!("    A: {} (G1 element)", if signature.A.is_zero() { "ZERO" } else { "valid" });
+    println!("    A: G1 element present");
     println!("    e: {} (field element)", if signature.e == Fr::from(0) { "ZERO" } else { "valid" });
     println!("    s: {} (field element)", if signature.s == Fr::from(0) { "ZERO" } else { "valid" });
     

@@ -9,7 +9,7 @@ use tokio::sync::{mpsc::{channel, Sender, Receiver}, oneshot};
 pub mod p2p {
     use super::*;
     use libp2p::{
-        gossipsub::{self, MessageId, MessageAuthenticity, Topic, TopicHash, topic::IdentityHash},
+        gossipsub::{self, MessageId, MessageAuthenticity, Topic, TopicHash, Sha256Topic as MyTopic},
         identity::Keypair,
         mdns,
         noise,
@@ -70,6 +70,7 @@ pub mod p2p {
         peer_to_participant: HashMap<PeerId, u16>,
     }
     
+    #[derive(Clone)]
     pub struct MeshHandle {
         cmd_tx: Sender<Command>,
         participant_id: u16,
@@ -167,7 +168,7 @@ pub mod p2p {
             mesh.peer_to_participant.insert(local_peer_id, participant_id);
             
             // Dial bootstrap peers
-            for (pid, addr) in bootstrap_peers {
+            for (_pid, addr) in bootstrap_peers {
                 mesh.swarm.dial(addr)?;
                 // Note: peer_id will be discovered via mDNS or when they connect
             }
@@ -176,7 +177,7 @@ pub mod p2p {
         }
         
         pub async fn subscribe_broadcast(&mut self, topic: &str) -> Result<Receiver<Vec<u8>>> {
-            let topic = Topic::<IdentityHash>::new(topic);
+            let topic = MyTopic::new(topic);
             self.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
             
             let (tx, rx) = channel(64);
@@ -250,7 +251,7 @@ pub mod p2p {
                         Some(cmd) = cmd_rx.recv() => {
                             match cmd {
                                 Command::Broadcast { topic, data } => {
-                                    let topic = Topic::<IdentityHash>::new(&topic);
+                                    let topic = MyTopic::new(&topic);
                                     let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                     let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, data);
                                 }
