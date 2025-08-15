@@ -1,0 +1,39 @@
+import { ethers } from "hardhat";
+
+async function main() {
+  const [owner] = await ethers.getSigners();
+  const credName = process.env.CRED_NAME || "IITH_UG_AC";
+  const messageCount = Number(process.env.MESSAGE_COUNT || 5);
+  const t = Number(process.env.THRESHOLD || 3);
+  const n = Number(process.env.TOTAL || 4);
+
+  const Params = await ethers.getContractFactory("Params");
+  const params = await Params.connect(owner).deploy();
+  await params.waitForDeployment();
+  await (
+    await (params as any).connect(owner).setParamsOnce(
+      credName,
+      messageCount,
+      t,
+      n,
+      [1, 2],
+      messageCount
+    )
+  ).wait();
+
+  const Request = await ethers.getContractFactory("RequestCredential");
+  const request = await Request.connect(owner).deploy();
+  await request.waitForDeployment();
+
+  const Relay = await ethers.getContractFactory("PartialSignatureRelay");
+  const relay = await Relay.connect(owner).deploy(await params.getAddress());
+  await relay.waitForDeployment();
+
+  console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
+  console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
+  console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
+  console.log(`export CHAIN_ID=31337`);
+  console.log(`export ETH_WS=ws://127.0.0.1:8545`);
+}
+
+main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });

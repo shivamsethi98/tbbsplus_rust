@@ -12,9 +12,11 @@ const SHOULD_FORK = process.env.FORK === "1";
 
 const config: HardhatUserConfig = {
   solidity: {
-    version: "0.8.24",
+    version: "0.8.30",
     settings: {
-      optimizer: { enabled: true, runs: 200 },
+  optimizer: { enabled: true, runs: 200 },
+  viaIR: true,
+  evmVersion: "prague",
     },
   },
   paths: {
@@ -31,6 +33,14 @@ const config: HardhatUserConfig = {
             },
           }
         : {}),
+    },
+    localhost: {
+      url: "http://127.0.0.1:8545",
+      chainId: 31337,
+    },
+    anvil: {
+      url: "http://127.0.0.1:8545",
+      chainId: 31337,
     },
     sepolia: {
       url: `https://sepolia.infura.io/v3/${INFURA_KEY}`,

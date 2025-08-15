@@ -308,6 +308,11 @@ pub struct Phase2Coordinator {
     pub phase2: Option<Phase2<Fr, KAPPA, STATISTICAL_SECURITY_PARAMETER>>,
     pub round1_messages: BTreeMap<ParticipantId, Vec<u8>>,
     pub round2_messages: BTreeMap<ParticipantId, Vec<u8>>,
+    // Role-aware expectations: R1 from lower IDs, R2 from higher IDs
+    pub expected_r1_from: BTreeSet<ParticipantId>,
+    pub expected_r2_from: BTreeSet<ParticipantId>,
+    pub got_r1_from: BTreeSet<ParticipantId>,
+    pub got_r2_from: BTreeSet<ParticipantId>,
     #[cfg(feature = "mpc")]
     pub mesh_handle: Option<MeshHandle>,
 }
@@ -320,6 +325,10 @@ impl Phase2Coordinator {
             phase2: None,
             round1_messages: BTreeMap::new(),
             round2_messages: BTreeMap::new(),
+            expected_r1_from: BTreeSet::new(),
+            expected_r2_from: BTreeSet::new(),
+            got_r1_from: BTreeSet::new(),
+            got_r2_from: BTreeSet::new(),
             #[cfg(feature = "mpc")]
             mesh_handle: None,
         }
@@ -340,23 +349,33 @@ impl Phase2Coordinator {
         gadget_vector: &GadgetVector<Fr, KAPPA, STATISTICAL_SECURITY_PARAMETER>,
     ) -> anyhow::Result<()> {
         // Use the same set of others from Phase 1 output
-        let others: BTreeSet<ParticipantId> = phase1_output.others.iter().cloned().collect();
+        let others_set: BTreeSet<ParticipantId> = phase1_output.others.iter().cloned().collect();
 
-    let (phase2, messages) = Phase2::<Fr, KAPPA, STATISTICAL_SECURITY_PARAMETER>::init::<_, Shake256>(
+        let (phase2, messages) = Phase2::<Fr, KAPPA, STATISTICAL_SECURITY_PARAMETER>::init::<_, Shake256>(
             rng,
             self.id,
             phase1_output.masked_signing_key_shares.clone(),
             phase1_output.masked_rs.clone(),
             base_ot_output,
-            others,
+            others_set.clone(),
             ote_params,
             gadget_vector,
     ).map_err(|e| anyhow::anyhow!("phase2 init failed: {:?}", e))?;
 
         self.phase2 = Some(phase2);
 
+        // Compute expected senders based on id ordering
+        self.expected_r1_from = others_set.iter().copied().filter(|pid| *pid < self.id).collect();
+        self.expected_r2_from = others_set.iter().copied().filter(|pid| *pid > self.id).collect();
+        self.got_r1_from.clear();
+        self.got_r2_from.clear();
+        println!(
+            "[P{}] Phase2 init: expect R1 from {:?}, R2 from {:?}",
+            self.id, self.expected_r1_from, self.expected_r2_from
+        );
         // Send round 1 messages
-    for (_to, msg) in messages {
+        for (_to, msg) in messages {
+            println!("[P{}] send R1 to {}", self.id, _to);
             let mut msg_bytes = Vec::new();
             msg.serialize_compressed(&mut msg_bytes)?;
 
@@ -384,6 +403,7 @@ impl Phase2Coordinator {
     ) -> anyhow::Result<()> {
         match msg {
             Phase2Message::Round1 { from, to, message } => {
+                println!("[P{}] recv R1 from {} to {}", self.id, from, to);
                 if to != self.id {
                     return Ok(()); // Not for us
                 }
@@ -397,6 +417,12 @@ impl Phase2Coordinator {
                         msg1,
                         gadget_vector,
                     ).map_err(|e| anyhow::anyhow!("receive_message1 failed: {:?}", e))?;
+
+                    // Mark Round1 received from this peer (only if expected)
+                    if self.expected_r1_from.contains(&from) {
+                        self.got_r1_from.insert(from);
+                        println!("[P{}] got R1 from {} ({} / {})", self.id, from, self.got_r1_from.len(), self.expected_r1_from.len());
+                    }
 
                     // Send round 2 message back
                     let mut msg2_bytes = Vec::new();
@@ -428,6 +454,7 @@ impl Phase2Coordinator {
     ) -> anyhow::Result<()> {
         match msg {
             Phase2Message::Round2 { from, to, message } => {
+                println!("[P{}] recv R2 from {} to {}", self.id, from, to);
                 if to != self.id {
                     return Ok(()); // Not for us
                 }
@@ -438,6 +465,12 @@ impl Phase2Coordinator {
                         .map_err(|e| anyhow::anyhow!("deserialize round2 failed: {:?}", e))?;
                     phase2.receive_message2::<Blake2b512>(from, msg2, &gadget_vector)
                         .map_err(|e| anyhow::anyhow!("receive_message2 failed: {:?}", e))?;
+
+                    // Mark Round2 received from this peer (only if expected)
+                    if self.expected_r2_from.contains(&from) {
+                        self.got_r2_from.insert(from);
+                        println!("[P{}] got R2 from {} ({} / {})", self.id, from, self.got_r2_from.len(), self.expected_r2_from.len());
+                    }
                 }
             }
             _ => {}
@@ -455,6 +488,16 @@ impl Phase2Coordinator {
     }
 }
 
+impl Phase2Coordinator {
+    /// Whether Phase 2 can be finalized (all expected messages received)
+    pub fn is_ready(&self) -> bool {
+        self.got_r1_from.len() == self.expected_r1_from.len()
+            && self.got_r2_from.len() == self.expected_r2_from.len()
+    }
+}
+
+// (phase2_ready and complete_phase2 are implemented on the main orchestrator impl below)
+
 /// High-level orchestrator for the complete threshold signing protocol
 pub struct ThresholdSigningOrchestrator {
     pub participant_id: ParticipantId,
@@ -471,6 +514,12 @@ pub struct ThresholdSigningOrchestrator {
 }
 
 impl ThresholdSigningOrchestrator {
+    pub fn phase2_ready(&self) -> bool {
+        self.phase2_coordinator
+            .as_ref()
+            .map(|p| p.is_ready())
+            .unwrap_or(false)
+    }
     pub fn new(
         participant_id: ParticipantId,
         threshold: u16,
@@ -594,9 +643,13 @@ impl ThresholdSigningOrchestrator {
 
     /// Complete Phase 2
     pub fn complete_phase2(&mut self) -> anyhow::Result<Phase2Output<Fr>> {
-        let coordinator = self.phase2_coordinator.as_mut()
+        if !self.phase2_ready() {
+            anyhow::bail!("phase2 not ready: waiting for expected Round1 and Round2 messages");
+        }
+        let coordinator = self
+            .phase2_coordinator
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Phase 2 not started"))?;
-
         coordinator.finalize()
     }
 

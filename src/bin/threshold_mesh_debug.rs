@@ -100,13 +100,13 @@ async fn main() -> anyhow::Result<()> {
         
         println!("  Signer {} initiating with others: {:?}", i, others);
         
-        let (round1, comm, comm_zero) = Phase1::<Fr, 256>::init_for_bbs_plus::<_, Blake2b512>(
+    let (round1, comm, comm_zero) = Phase1::<Fr, 256>::init_for_bbs_plus::<_, Blake2b512>(
             &mut rng,
             BATCH_SIZE,
             i,
             others,
             protocol_id.clone(),
-        )?;
+    ).map_err(|e| anyhow::anyhow!("phase1 init failed: {:?}", e))?;
         
         round1s.push(round1);
         commitments.push(comm);
@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
                             .get(&i)
                             .unwrap()
                             .clone(),
-                    )?;
+                    ).map_err(|e| anyhow::anyhow!("receive_commitment failed: {:?}", e))?;
             }
         }
     }
@@ -139,7 +139,8 @@ async fn main() -> anyhow::Result<()> {
                     .get_comm_shares_and_salts_for_zero_sharing_protocol_with_other(&i);
                 
                 round1s[i as usize - 1]
-                    .receive_shares::<Blake2b512>(j, share, zero_share)?;
+                    .receive_shares::<Blake2b512>(j, share, zero_share)
+                    .map_err(|e| anyhow::anyhow!("receive_shares failed: {:?}", e))?;
             }
         }
     }
@@ -148,7 +149,8 @@ async fn main() -> anyhow::Result<()> {
     let mut round1_outputs = Vec::new();
     for (i, round1) in round1s.into_iter().enumerate() {
         let output = round1
-            .finish_for_bbs_plus::<Blake2b512>(&key_shares[i])?;
+            .finish_for_bbs_plus::<Blake2b512>(&key_shares[i])
+            .map_err(|e| anyhow::anyhow!("phase1 finalize failed: {:?}", e))?;
         
         println!("  Phase1Output[{}]:", i + 1);
         println!("    e: {:?}", output.e);
@@ -169,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         let mut others = threshold_party_set.clone();
         others.remove(&i);
         
-        let (phase, msg1s) = Phase2::init::<_, Shake256>(
+    let (phase, msg1s) = Phase2::init::<_, Shake256>(
             &mut rng,
             i,
             round1_outputs[i as usize - 1].masked_signing_key_shares.clone(),
@@ -178,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
             others,
             ote_params,
             &gadget_vector,
-        )?;
+    ).map_err(|e| anyhow::anyhow!("phase2 init failed: {:?}", e))?;
         
         round2s.push(phase);
         all_msg_1s.push((i, msg1s));
@@ -189,7 +191,8 @@ async fn main() -> anyhow::Result<()> {
     for (sender_id, msg_1s) in all_msg_1s {
         for (receiver_id, m) in msg_1s {
             let m2 = round2s[receiver_id as usize - 1]
-                .receive_message1::<Blake2b512, Shake256>(sender_id, m, &gadget_vector)?;
+                .receive_message1::<Blake2b512, Shake256>(sender_id, m, &gadget_vector)
+                .map_err(|e| anyhow::anyhow!("receive_message1 failed: {:?}", e))?;
             all_msg_2s.push((receiver_id, sender_id, m2));
         }
     }
@@ -197,7 +200,8 @@ async fn main() -> anyhow::Result<()> {
     // Process messages round 2
     for (sender_id, receiver_id, m2) in all_msg_2s {
         round2s[receiver_id as usize - 1]
-            .receive_message2::<Blake2b512>(sender_id, m2, &gadget_vector)?;
+            .receive_message2::<Blake2b512>(sender_id, m2, &gadget_vector)
+            .map_err(|e| anyhow::anyhow!("receive_message2 failed: {:?}", e))?;
     }
 
     // Finish Phase 2
@@ -212,13 +216,13 @@ async fn main() -> anyhow::Result<()> {
     let mut signature_shares = Vec::new();
     
     for i in 0..THRESHOLD as usize {
-        let share = BBSPlusSignatureShare::new(
+    let share = BBSPlusSignatureShare::new(
             &messages,
             0, // sig_index_in_batch
             &round1_outputs[i],
             &round2_outputs[i],
             &params,
-        )?;
+    ).map_err(|e| anyhow::anyhow!("create signature share failed: {:?}", e))?;
         
         println!("  Share[{}]:", i + 1);
         println!("    e: {:?}", share.e);
@@ -231,7 +235,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Step 8: Aggregate signature shares
     println!("\n🔗 Step 8: Aggregate Signature Shares");
-    let signature = BBSPlusSignatureShare::aggregate(signature_shares)?;
+    let signature = BBSPlusSignatureShare::aggregate(signature_shares)
+        .map_err(|e| anyhow::anyhow!("aggregate failed: {:?}", e))?;
     println!("  Aggregated signature:");
     println!("    A: {:?}", signature.A);
     println!("    e: {:?}", signature.e);

@@ -2,6 +2,7 @@
 name = "tbbsplus_rust"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 # Main library dependencies for examples (using local crypto libraries)
 [dependencies]
@@ -37,9 +38,24 @@ sha3 = "0.10"
 base64 = "0.21"
 rand = "0.8"
 futures = "0.3"
+ethers = { version = "2", default-features = false, features = ["abigen", "ws", "rustls"] }
 
 [features]
 mpc = ["libp2p"]
+
+[[bin]]
+name = "issuer_onchain"
+path = "src/bin/issuer_onchain.rs"
+required-features = ["mpc"]
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+required-features = ["mpc"]
+
+[[bin]]
+name = "ttp"
+path = "src/bin/ttp.rs"
 
 # Examples
 [[example]]

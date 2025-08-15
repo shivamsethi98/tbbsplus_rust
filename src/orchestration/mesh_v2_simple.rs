@@ -175,6 +175,10 @@ pub mod p2p {
             
             Ok(mesh)
         }
+
+        pub fn local_peer_id(&self) -> PeerId {
+            self.local_peer_id
+        }
         
         pub async fn subscribe_broadcast(&mut self, topic: &str) -> Result<Receiver<Vec<u8>>> {
             let topic = MyTopic::new(topic);
@@ -218,6 +222,13 @@ pub mod p2p {
                                         request_response::Message::Request { request, channel, .. } => {
                                             // Try to deserialize as DirectMessage
                                             if let Ok(msg) = serde_json::from_slice::<DirectMessage>(&request) {
+                                                // Learn mapping from incoming message
+                                                // This allows peers to discover participant_id -> peer_id mapping lazily
+                                                // and enables subsequent direct sends without prior registration.
+                                                // Safe to overwrite to keep most recent mapping.
+                                                // Note: no authentication of mapping beyond transport channel.
+                                                self.participant_to_peer.insert(msg.from, peer);
+                                                self.peer_to_participant.insert(peer, msg.from);
                                                 if let Some(sink) = &self.direct_sink {
                                                     let _ = sink.send(msg).await;
                                                 }
@@ -234,9 +245,13 @@ pub mod p2p {
                                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(
                                     mdns::Event::Discovered(peers)
                                 )) => {
-                                    for (peer_id, _addr) in peers {
-                                        // Auto-discover peers via mDNS
-                                        // In production, would need proper peer ID mapping
+                                    for (peer_id, addr) in peers {
+                                        // Auto-discover peers via mDNS and proactively dial
+                                        // so that direct request-response channels can be established.
+                                        let _ = self.swarm.dial(addr);
+                                        // Note: participant_id mapping is learned lazily from incoming
+                                        // direct messages or explicit registration at higher layers.
+                                        let _ = peer_id; // suppress unused warning if addr move fails
                                     }
                                 }
                                 

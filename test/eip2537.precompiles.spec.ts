@@ -24,6 +24,22 @@ describe("EIP-2537 Precompiles", function () {
     return res !== "0x" && res.length === 2 + 256 * 2;
   }
 
+  async function isG1MSMPresent(): Promise<boolean> {
+    // one pair: 128B point (all zeros) || 32B scalar (zero)
+    const input = "0x" + "00".repeat(160);
+    const res = await ethers.provider.call({ to: ADDR.G1MSM, data: input }).catch(() => "0x");
+    return res !== "0x" && res.length === 2 + 128 * 2;
+  }
+
+  it("reports presence on localhost:8545 (no fail)", async function () {
+    const m1 = await isMapToG1Present();
+    const m2 = await isMapToG2Present();
+    const msm = await isG1MSMPresent();
+    // eslint-disable-next-line no-console
+    console.log(`[2537] presence localhost:8545 => MAP1=${m1} MAP2=${m2} G1MSM=${msm}`);
+    // Always pass; other tests below will conditionally run/skip
+  });
+
   // BLS12-381 Fp modulus (big-endian) padded to 64 bytes
   // p = 0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab
   const FP_MODULUS_HEX_64 =

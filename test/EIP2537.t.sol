@@ -35,6 +35,7 @@ contract EIP2537Test {
         (bool ok, bytes memory ret) = MAP_FP_TO_G1.staticcall(input);
         if (!(ok && ret.length == 128)) {
             // Skip if local EVM (fork engine) does not implement the precompile
+            // NOTE: This means precompiles are currently unavailable in this EVM
             return;
         }
         // If present, assert output length per spec
@@ -46,6 +47,7 @@ contract EIP2537Test {
         bytes memory input = new bytes(128);
         (bool ok, bytes memory ret) = MAP_FP2_TO_G2.staticcall(input);
         if (!(ok && ret.length == 256)) {
+            // NOTE: This means precompiles are currently unavailable in this EVM
             return;
         }
         require(ret.length == 256, "unexpected MAP_FP2_TO_G2 output length");

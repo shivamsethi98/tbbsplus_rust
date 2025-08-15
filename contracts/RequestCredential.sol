@@ -21,7 +21,7 @@ contract RequestCredential {
         address indexed client,
         uint256 indexed sid,
         string indexed name,
-        uint256[2] commitmentB,
+        bytes commitmentB,
         uint32[] revealedIdx,
         uint256[] revealedVals,
         bytes proof,   // opaque bytes for PoK (issuers verify off-chain for now)
@@ -55,7 +55,7 @@ contract RequestCredential {
     function broadcastSigReqBBSPlus(
         uint256 sid,
         string calldata name,
-        uint256[2] calldata commitmentB,
+        bytes calldata commitmentB,
         uint32[] calldata revealedIdx,
         uint256[] calldata revealedVals,
         bytes calldata proof,

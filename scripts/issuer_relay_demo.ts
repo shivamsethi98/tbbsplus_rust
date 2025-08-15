@@ -21,8 +21,8 @@ async function main() {
   const relay = await Relay.connect(owner).deploy(await params.getAddress());
   await relay.waitForDeployment();
 
-  // Allowlist issuer1 with index 1
-  await (await relay.connect(owner).setIssuer(issuer1.address, 1, true)).wait();
+  // Allowlist issuer1 with index 1 in Params (single registry)
+  await (await (params as any).connect(owner).setIssuer(issuer1.address, 1, true)).wait();
 
   // Listen for BBS+ request; issuer relays a dummy share on-chain
   request.on(
@@ -38,7 +38,7 @@ async function main() {
       _context
     ) => {
       console.log("SigReqBBSPlus:", { clientAddr, sid, name, revealedIdx, revealedVals });
-      const payload = ethers.randomBytes(64);
+  const payload = ethers.randomBytes(64);
   const tx = await relay.connect(issuer1).submitPartialShare(credName, sid, 1, payload);
       await tx.wait();
       console.log("Submitted partial share from", issuer1.address);
@@ -62,11 +62,17 @@ async function main() {
     const proof = ethers.randomBytes(32);
     const context = ethers.toUtf8Bytes("demo");
 
-    await (
+  await (
       await request
         .connect(client)
   .broadcastSigReqBBSPlus(1n, credName, commitmentB, revealedIdx, revealedVals, proof, context)
     ).wait();
+
+  // Export addresses for Rust env consumption
+  console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
+  console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
+  console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
+  console.log(`export ETH_WS=ws://127.0.0.1:8545`);
   });
 }
 

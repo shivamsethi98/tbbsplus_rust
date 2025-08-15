@@ -196,10 +196,19 @@ async fn main() -> anyhow::Result<()> {
         println!("  ✓ Node {} initiated Phase 2", i + 1);
     }
     
-    // Allow time for phase 2 messages to flow
+    // Pump until all participants are ready to finalize Phase 2 (or timeout)
     println!("  ⏳ Executing multiplication protocol...");
-    pump_messages(&mut orchestrators, &mut subs_phase1, &mut subs_phase2, Duration::from_secs(2)).await?;
-    
+    let ready_deadline_p2 = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let all_ready = orchestrators
+            .iter()
+            .take(THRESHOLD as usize)
+            .all(|o| o.phase2_ready());
+        if all_ready { break; }
+        if tokio::time::Instant::now() > ready_deadline_p2 { break; }
+        pump_messages(&mut orchestrators, &mut subs_phase1, &mut subs_phase2, Duration::from_millis(200)).await?;
+    }
+
     // Complete Phase 2
     let mut phase2_outputs = Vec::new();
     for i in 0..THRESHOLD as usize {

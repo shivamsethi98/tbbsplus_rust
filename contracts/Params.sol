@@ -26,6 +26,14 @@ contract Params {
 
     event ParamsSet(string indexed name, uint256 indexed id, uint256 messageCount, uint256 t, uint256 n);
 
+    // Global issuer registry and optional libp2p multiaddrs
+    mapping(address => bool) public issuerAllowed;
+    mapping(address => uint16) public issuerIndex; // 1..n index used by off-chain/relay
+    mapping(address => string[]) private issuerMultiaddrs; // optional libp2p multiaddrs per issuer
+    address[] private issuersList; // enumerate allowlisted issuers (may contain removed entries marked disallowed)
+    event IssuerSet(address indexed issuer, uint16 idx, bool allowed);
+    event IssuerMultiaddrsSet(address indexed issuer, string[] addrs);
+
     function setParamsOnce(
         string memory name,
         uint256 messageCount,
@@ -62,5 +70,35 @@ contract Params {
     function getParamsById(uint256 id) external view returns (CredParams memory) {
         require(id != 0 && id < nextId, "bad id");
         return paramsById[id];
+    }
+
+    // Issuer registry ops
+    function setIssuer(address issuer, uint16 idx, bool allowed) external onlyOwner {
+        require(idx > 0, "bad idx");
+        issuerAllowed[issuer] = allowed;
+        issuerIndex[issuer] = idx;
+        // Add to list if first time seen
+        bool seen = false;
+        for (uint256 i = 0; i < issuersList.length; i++) {
+            if (issuersList[i] == issuer) { seen = true; break; }
+        }
+        if (!seen) { issuersList.push(issuer); }
+        emit IssuerSet(issuer, idx, allowed);
+    }
+
+    function setIssuerMultiaddrs(address issuer, string[] calldata addrs) external onlyOwner {
+        delete issuerMultiaddrs[issuer];
+        for (uint256 i = 0; i < addrs.length; i++) {
+            issuerMultiaddrs[issuer].push(addrs[i]);
+        }
+        emit IssuerMultiaddrsSet(issuer, addrs);
+    }
+
+    function getIssuerMultiaddrs(address issuer) external view returns (string[] memory) {
+        return issuerMultiaddrs[issuer];
+    }
+
+    function getIssuers() external view returns (address[] memory) {
+        return issuersList;
     }
 }

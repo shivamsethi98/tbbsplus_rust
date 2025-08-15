@@ -17,22 +17,9 @@ contract PartialSignatureRelay {
         _;
     }
 
-    // On-chain issuer allowlisting and index assignment (1..n)
-    mapping(address => bool) public issuers;
-    mapping(address => uint16) public issuerIndex; // 1..n
-
-    event IssuerSet(address indexed issuer, uint16 idx, bool allowed);
-
-    function setIssuer(address issuer, uint16 idx, bool allowed) external onlyOwner {
-        require(idx > 0, "bad idx");
-        issuers[issuer] = allowed;
-        issuerIndex[issuer] = idx;
-        emit IssuerSet(issuer, idx, allowed);
-    }
-
     modifier onlyIssuers(uint16 idx) {
-        require(issuers[msg.sender], "not issuer");
-        require(issuerIndex[msg.sender] == idx, "idx mismatch");
+        require(params.issuerAllowed(msg.sender), "not issuer");
+        require(params.issuerIndex(msg.sender) == idx, "idx mismatch");
         _;
     }
 

@@ -116,6 +116,7 @@ pub mod p2p {
                         maybe_evt = self.swarm.next() => {
                             match maybe_evt {
                                 Some(libp2p::swarm::SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. })) => {
+                                    println!("[mesh] rx gossipsub on topic {:?}, {} bytes", message.topic, message.data.len());
                                     let key = message.topic.clone();
                                     if let Some(sink) = self.sinks.get(&key) {
                                         let _ = sink.send(message.data.clone()).await;
@@ -128,6 +129,7 @@ pub mod p2p {
                         maybe_cmd = cmd_rx.recv() => {
                             match maybe_cmd {
                                 Some(Command::Publish { topic, bytes }) => {
+                                    println!("[mesh] tx gossipsub topic {}, {} bytes", topic, bytes.len());
                                     let topic = gossipsub::IdentTopic::new(&topic);
                                     let _ = self.swarm.behaviour_mut().subscribe(&topic);
                                     let _ = self.swarm.behaviour_mut().publish(topic, bytes);
