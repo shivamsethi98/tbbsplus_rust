@@ -21,6 +21,7 @@ use ethers::abi::Abi;
 use ethers::types::Bytes as EthBytes;
 use ethers::providers::{Provider, Ws};
 use ethers::types::TxHash;
+use ethers::types::H256;
 
 abigen!(
     RequestCredential,
@@ -267,11 +268,10 @@ async fn main() -> anyhow::Result<()> {
                 let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
                 println!("Client: sent cred request sid={}", sid);
                 if let Some(rcpt) = rcpt_opt.as_ref() {
-                    use ethers::utils::id;
-                    let sig = id("SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)");
+                    let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)"));
                     let mut found = false;
                     for lg in rcpt.logs.iter() {
-                        if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == sig { found = true; break; }
+                        if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; }
                     }
                     println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" });
                 }
@@ -324,11 +324,10 @@ async fn main() -> anyhow::Result<()> {
                 let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
                 println!("Client: sent cred request sid={}", sid);
                 if let Some(rcpt) = rcpt_opt.as_ref() {
-                    use ethers::utils::id;
-                    let sig = id("SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)");
+                    let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)"));
                     let mut found = false;
                     for lg in rcpt.logs.iter() {
-                        if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == sig { found = true; break; }
+                        if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; }
                     }
                     println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" });
                 }

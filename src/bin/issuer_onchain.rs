@@ -10,6 +10,7 @@ use std::str::FromStr;
 use base64::Engine;
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
+use ark_ff::PrimeField;
 use std::io::Read;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use bbs_plus::prelude::*;
@@ -636,6 +637,7 @@ fn u256_to_fr<F: ark_ff::PrimeField>(v: &U256) -> F {
 fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
     use ark_bls12_381::Fq;
     use ark_ec::AffineRepr;
+    use ark_ec::CurveGroup;
     if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
     let mut x_be48 = [0u8; 48];
     let mut y_be48 = [0u8; 48];
@@ -643,7 +645,8 @@ fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec:
     y_be48.copy_from_slice(&bytes128[80..128]);
     let x = Fq::from_be_bytes_mod_order(&x_be48);
     let y = Fq::from_be_bytes_mod_order(&y_be48);
-    Ok(<ark_bls12_381::G1Affine as AffineRepr>::new_unchecked(x, y))
+    let p = ark_bls12_381::G1Affine::new(x, y);
+    Ok(p)
 }
 
 fn verify_commitment_pok_from_fields(

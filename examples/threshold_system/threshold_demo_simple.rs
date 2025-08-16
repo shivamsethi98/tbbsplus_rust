@@ -1,5 +1,6 @@
 //! Simplified threshold BBS+ signature demo
 //! This example demonstrates the basic workflow without complex MPC
+use std::collections::BTreeMap;
 
 use bbs_plus::{
     prelude::*,
@@ -7,9 +8,11 @@ use bbs_plus::{
         threshold_bbs_plus::BBSPlusSignatureShare,
         ParticipantId,
     },
+    BBSPlusError,
 };
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_std::rand::{rngs::StdRng, RngCore, SeedableRng};
+use ark_ff::UniformRand;
 use secret_sharing_and_dkg::shamir_ss::deal_random_secret;
 use std::collections::BTreeSet;
 
@@ -20,9 +23,10 @@ fn trusted_party_keygen<R: RngCore>(
     rng: &mut R,
     threshold: ParticipantId,
     total: ParticipantId,
-) -> (Fr, Vec<Fr>) {
+) -> (SecretKey<Fr>, Vec<Fr>) {
     let (secret, shares, _) = deal_random_secret(rng, threshold, total).unwrap();
-    (secret, shares.0.into_iter().map(|s| s.share).collect())
+    let secret_key = SecretKey::new(secret.share);
+    (secret_key, shares.0.into_iter().map(|s| s.share).collect())
 }
 
 fn main() -> Result<()> {
@@ -32,7 +36,7 @@ fn main() -> Result<()> {
     // System parameters
     const THRESHOLD: u16 = 3;
     const TOTAL_ISSUERS: u16 = 4;
-    const MESSAGE_COUNT: usize = 5;
+    const MESSAGE_COUNT: u32 = 5;
 
     let mut rng = StdRng::seed_from_u64(42);
 
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
             issuer_key_share,
             &messages,
             &randomness,
-        )?;
+        ).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         
         signature_shares.push((issuer_id, share));
         println!("  ✓ Issuer {} generated signature share", issuer_id);
@@ -86,12 +90,14 @@ fn main() -> Result<()> {
 
     // Step 5: Aggregate signature shares
     println!("\n🔗 Step 5: Aggregate Signature Shares");
-    let signature = BBSPlusSignatureShare::aggregate_signature_shares(signature_shares)?;
+    let signature = BBSPlusSignatureShare::aggregate_signature_shares(signature_shares)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     println!("  ✓ Aggregated {} signature shares", THRESHOLD);
 
     // Step 6: Verify the threshold signature
     println!("\n🔍 Step 6: Verify Threshold Signature");
-    let is_valid = signature.verify(&messages, &public_key, &params)?;
+    let is_valid = signature.verify(&messages, &public_key, &params)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     
     if is_valid {
         println!("  ✅ Threshold signature is VALID!");
