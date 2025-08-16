@@ -226,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
             let mut commitment_bytes = Vec::new();
             commitment.serialize_compressed(&mut commitment_bytes)?;
 
+            // Persist revealed pairs for this sid so later verification uses exact signed values
+            persist_revealed_pairs(&user_id, &cred_name, sid, &revealed_idx, &revealed_vals).ok();
+
             // Build Schnorr-style PoK bound to transcript and serialize proof bytes
             let proof_bytes = build_commitment_pok(&params_bbs, &commitment, &hidden_msgs_fr, &blinding, mcount_onchain, sid, &cred_name, &revealed_idx, &revealed_vals, &context)?;
 
@@ -496,6 +499,12 @@ async fn persist_and_optionally_present(
     let (messages, signature) = if !shares.is_empty() {
         let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
         if !messages.is_empty() { messages[0] = Fr::from(sid); }
+        // Override with any persisted revealed pairs (index 0 stays bound to sid)
+        if let Ok(Some(rev)) = load_revealed_pairs(user_id, cred_name, sid) {
+            for (i, fr_val) in rev {
+                if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; }
+            }
+        }
         let mut sig_shares = Vec::new();
         for b in shares {
             let share: bbs_plus::threshold::threshold_bbs_plus::BBSPlusSignatureShare<Bls12_381> =
@@ -699,10 +708,34 @@ async fn persist_and_optionally_present(
         check_len("sig.d", &sig_d, 128)?;
         let ctx_t = (onchain_mcount, ctx_g1, ctx_h0, ctx_h);
     let sig_t = (sig_ap.clone(), sig_ab.clone(), sig_d);
-        let revealed_vals_u256: Vec<U256> = revealed_idx.iter().map(|ix| {
+        let mut revealed_vals_u256: Vec<U256> = revealed_idx.iter().map(|ix| {
             let v = messages[*ix as usize];
             fr_to_u256(&v)
         }).collect();
+        // Optional debug tamper for verifyPok: set VERIFYPOK_TAMPER=1 and optionally VERIFYPOK_TAMPER_IDX=<u32>
+        if let Ok(tamper) = std::env::var("VERIFYPOK_TAMPER") {
+            let t = tamper.to_ascii_lowercase();
+            if !(t.is_empty() || t == "0" || t == "false") {
+                let idx_to_tamper = std::env::var("VERIFYPOK_TAMPER_IDX").ok().and_then(|s| s.parse::<u32>().ok());
+                let pos_opt = if let Some(ix) = idx_to_tamper {
+                    revealed_idx.iter().position(|i| *i == ix)
+                } else if !revealed_idx.is_empty() { Some(0usize) } else { None };
+                if let Some(pos) = pos_opt {
+                    let old = revealed_vals_u256[pos];
+                    let mut be = [0u8; 32];
+                    old.to_big_endian(&mut be);
+                    be[31] ^= 1; // flip low bit
+                    let new = U256::from_big_endian(&be);
+                    revealed_vals_u256[pos] = new;
+                    println!(
+                        "[present debug] VERIFYPOK_TAMPER: changed revealed value at idx {} from {} to {}",
+                        revealed_idx[pos], old, new
+                    );
+                } else {
+                    println!("[present debug] VERIFYPOK_TAMPER set but no revealed indices to tamper");
+                }
+            }
+        }
         let revealed_t = (revealed_idx.clone(), revealed_vals_u256);
         let p1_t_t1 = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
         check_len("p1.T1", &p1_t_t1, 128)?;
@@ -882,7 +915,55 @@ async fn persist_and_optionally_present(
         continue;
     }
 }
-Ok(())
+    Ok(())
+}
+
+fn persist_revealed_pairs(
+    user_id: &str,
+    cred_name: &str,
+    sid: u64,
+    revealed_idx: &Vec<u32>,
+    revealed_vals: &Vec<U256>,
+) -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::PathBuf;
+    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid)].iter().collect();
+    fs::create_dir_all(&dir)?;
+    let vals_hex: Vec<String> = revealed_vals.iter().map(|v| {
+        let mut be = [0u8; 32];
+        v.to_big_endian(&mut be);
+        format!("0x{}", hex::encode(be))
+    }).collect();
+    let obj = serde_json::json!({
+        "idx": revealed_idx,
+        "vals": vals_hex,
+    });
+    fs::write(dir.join("revealed.json"), serde_json::to_vec_pretty(&obj)?)?;
+    Ok(())
+}
+
+fn load_revealed_pairs(
+    user_id: &str,
+    cred_name: &str,
+    sid: u64,
+) -> anyhow::Result<Option<Vec<(u32, Fr)>>> {
+    use std::fs;
+    use std::path::PathBuf;
+    let p: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid), "revealed.json"].iter().collect();
+    if !p.exists() { return Ok(None); }
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(p)?)?;
+    let idx_arr = v.get("idx").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.idx"))?;
+    let vals_arr = v.get("vals").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.vals"))?;
+    if idx_arr.len() != vals_arr.len() { return Ok(None); }
+    let mut out = Vec::with_capacity(idx_arr.len());
+    for (i_v, s_v) in idx_arr.iter().zip(vals_arr.iter()) {
+        let i_u32 = i_v.as_u64().ok_or_else(|| anyhow::anyhow!("idx not u64"))? as u32;
+        let s = s_v.as_str().ok_or_else(|| anyhow::anyhow!("val not string"))?;
+        let u = if s.starts_with("0x") { U256::from_str_radix(&s[2..], 16)? } else { U256::from_dec_str(s)? };
+        let fr: Fr = u256_to_fr(&u);
+        out.push((i_u32, fr));
+    }
+    Ok(Some(out))
 }
 
 fn fq_to_be64(x: &Fq) -> [u8; 64] {
