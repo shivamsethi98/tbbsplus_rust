@@ -21,6 +21,8 @@ contract Params {
         uint256[] public_m_encoding;
         // H vector length (event will carry points in SetupPublicParams)
         uint256 hLen;
+    // Optional: BLS12-381 G2 public key (uncompressed 256-byte x.c0||x.c1||y.c0||y.c1)
+    bytes pkG2;
     }
     mapping(uint256 => CredParams) private paramsById;
 
@@ -52,7 +54,8 @@ contract Params {
             t: t,
             n: n,
             public_m_encoding: public_m_encoding,
-            hLen: hLen
+            hLen: hLen,
+            pkG2: new bytes(0)
         });
         emit ParamsSet(name, id, messageCount, t, n);
     }
@@ -70,6 +73,20 @@ contract Params {
     function getParamsById(uint256 id) external view returns (CredParams memory) {
         require(id != 0 && id < nextId, "bad id");
         return paramsById[id];
+    }
+
+    // Set pkG2 for an existing credential set; can be called later once key is known.
+    function setPkG2(string memory name, bytes calldata pkG2) external onlyOwner {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        require(pkG2.length == 256, "bad pk len");
+        paramsById[id].pkG2 = pkG2;
+    }
+
+    function getPkG2ByName(string memory name) external view returns (bytes memory) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        return paramsById[id].pkG2;
     }
 
     // Issuer registry ops

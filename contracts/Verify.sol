@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {BbsPlusPokVerify} from "./BbsPlusPokVerify.sol";
+import {Bls12381} from "./lib/Bls12381.sol";
 
 /// @title Credential Presentation Verifier
 /// @notice Verifies BBS+ PoK using EIP-2537 MSM precompiles and optionally runs a pairing check
@@ -23,6 +24,26 @@ library Verify {
         BbsPlusPokVerify.Proof2 memory p2
     ) internal view returns (bool) {
         return BbsPlusPokVerify.verify(sig, ctx, revealed, challenge, p1, p2);
+    }
+
+    /// @notice Verify PoK and then pairing e(A', pkG2) == e(Abar, g2)
+    /// @param pkG2 256-byte uncompressed G2 point (x.c0||x.c1||y.c0||y.c1)
+    /// @param g2base 256-byte uncompressed G2 base used in SignatureParams.g2 (not necessarily canonical generator)
+    function verifyPokWithPairing(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+    bytes memory pkG2,
+    bytes memory g2base
+    ) internal view returns (bool) {
+        if (!BbsPlusPokVerify.verify(sig, ctx, revealed, challenge, p1, p2)) return false;
+        // Pairing expects (g1_1, g2_1, g1_2, g2_2) and returns true if product == 1
+        // We need e(A', pk) * e(-Abar, g2) == 1
+        bytes memory negAbar = Bls12381.g1neg(sig.ABar);
+    return verifyPairing(sig.APrime, pkG2, negAbar, g2base);
     }
 
     /// @notice Verify product of pairings equals 1 using PAIR precompile
@@ -60,6 +81,19 @@ contract VerifyWrapper {
         return Verify.verifyPok(sig, ctx, revealed, challenge, p1, p2);
     }
 
+    function verifyPokWithPairing(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+        bytes calldata pkG2,
+        bytes calldata g2base
+    ) external view returns (bool) {
+        return Verify.verifyPokWithPairing(sig, ctx, revealed, challenge, p1, p2, pkG2, g2base);
+    }
+
     function verifyPairing(
         bytes calldata g1_1,
         bytes calldata g2_1,
@@ -67,6 +101,11 @@ contract VerifyWrapper {
         bytes calldata g2_2
     ) external view returns (bool) {
         return Verify.verifyPairing(g1_1, g2_1, g1_2, g2_2);
+    }
+
+    // Debug helper: just expose g1neg to tests for raw checks
+    function g1neg(bytes calldata p) external pure returns (bytes memory) {
+        return Bls12381.g1neg(p);
     }
 }
 

@@ -12,7 +12,7 @@ describe("AC flow v1 (events-only)", function () {
     // set params once
     await expect(
       params.connect(owner).setParamsOnce(
-        "IITH_UG_AC",
+        "ANON_CRED",
         5, // messageCount
         2, // t
         3, // n
@@ -21,7 +21,7 @@ describe("AC flow v1 (events-only)", function () {
       )
     ).to.emit(params, "ParamsSet");
 
-    const id = await params.getMapCredentials("IITH_UG_AC");
+    const id = await params.getMapCredentials("ANON_CRED");
     expect(id).to.not.equal(0n);
 
     const Request = await ethers.getContractFactory("RequestCredential");
@@ -32,7 +32,7 @@ describe("AC flow v1 (events-only)", function () {
     await expect(
       req.connect(client).broadcastSigReq(
         1, // sid
-        "IITH_UG_AC",
+        "ANON_CRED",
         1001, // sigid
         [11, 22, 33], // attributes
         1, // no_of_private_attribute
@@ -53,7 +53,7 @@ describe("AC flow v1 (events-only)", function () {
 
     // issuer sends blind sign (event-only)
     await expect(
-      issue.connect(issuer1).SendBlindSign("IITH_UG_AC", client.address, [3, 4], [5, 6])
+      issue.connect(issuer1).SendBlindSign("ANON_CRED", client.address, [3, 4], [5, 6])
     )
       .to.emit(issue, "emitIssue")
       .withArgs(id, client.address, issuer1.address, [3, 4], [5, 6]);

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
-use ark_bls12_381::Fr;
+use ark_bls12_381::{Bls12_381, Fr, Fq};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::SeedableRng;
 use base64::Engine;
@@ -15,6 +15,10 @@ use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::providers::{Provider, Ws};
 use secret_sharing_and_dkg::shamir_ss::deal_random_secret;
+use ark_ec::{CurveGroup, AffineRepr};
+use ark_ff::PrimeField;
+use blake2::Blake2b512;
+use bbs_plus::prelude::*;
 
 abigen!(
     Params,
@@ -30,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         .context("OWNER_PK missing")?
         .parse::<LocalWallet>()?
         .with_chain_id(chain_id);
-    let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "IITH_UG_AC".into());
+    let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
     let t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
     let n: u16 = env::var("TOTAL").unwrap_or_else(|_| "4".into()).parse()?;
     let mcount: u32 = env::var("MESSAGE_COUNT").unwrap_or_else(|_| "5".into()).parse()?;
@@ -80,9 +84,65 @@ async fn main() -> anyhow::Result<()> {
 
     // Generate threshold keys
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
-    let (_secret, shares, _poly) = deal_random_secret(&mut rng, t, n)
+    let (secret, shares, _poly) = deal_random_secret(&mut rng, t, n)
         .map_err(|e| anyhow::anyhow!("deal_random_secret: {:?}", e))?;
     let shares: Vec<Fr> = shares.0.into_iter().map(|s| s.share).collect();
+
+    // Compute pkG2 from the same secret deterministically and store in Params for client pairing checks
+    let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), mcount);
+    let g2 = params_bbs.g2;
+    let pk_proj = g2.mul_bigint(secret.into_bigint());
+    let pk_affine = pk_proj.into_affine();
+
+    // Serialize G2 to 256B uncompressed per EIP-2537 (x.c0||x.c1||y.c0||y.c1), big-endian padded
+    fn fq_to_be64(x: &Fq) -> [u8; 64] {
+        let bi = x.into_bigint();
+        let limbs: [u64; 6] = bi.0;
+        let mut le48 = [0u8; 48];
+        for (i, limb) in limbs.iter().enumerate() {
+            le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+        }
+        let mut be48 = [0u8; 48];
+        for i in 0..48 { be48[i] = le48[47 - i]; }
+        let mut out = [0u8; 64];
+        out[16..].copy_from_slice(&be48);
+        out
+    }
+    fn fq2_pair_to_be(x_c0: &Fq, x_c1: &Fq) -> [u8; 128] {
+        let c0 = fq_to_be64(x_c0);
+        let c1 = fq_to_be64(x_c1);
+        let mut out = [0u8; 128];
+        out[..64].copy_from_slice(&c0);
+        out[64..].copy_from_slice(&c1);
+        out
+    }
+    let xbe = fq2_pair_to_be(&pk_affine.x.c0, &pk_affine.x.c1);
+    let ybe = fq2_pair_to_be(&pk_affine.y.c0, &pk_affine.y.c1);
+    let mut pk_bytes = vec![0u8; 256];
+    pk_bytes[..128].copy_from_slice(&xbe);
+    pk_bytes[128..].copy_from_slice(&ybe);
+
+    // Write pkG2 hex for setup script to set on-chain via Hardhat (owner signer)
+    let pk_hex = format!("0x{}", hex::encode(&pk_bytes));
+    let _ = std::fs::write(".runtime.pk_g2.hex", &pk_hex);
+    println!("export PK_G2_HEX={}", pk_hex);
+
+    // Also export the canonical G2 generator bytes in the same 256-byte format for consumers that need it (e.g., tests)
+    let g2gen_affine = <ark_bls12_381::G2Projective as CurveGroup>::Affine::generator();
+    let xgen = fq2_pair_to_be(&g2gen_affine.x.c0, &g2gen_affine.x.c1);
+    let ygen = fq2_pair_to_be(&g2gen_affine.y.c0, &g2gen_affine.y.c1);
+    let mut g2gen_bytes = vec![0u8; 256];
+    g2gen_bytes[..128].copy_from_slice(&xgen);
+    g2gen_bytes[128..].copy_from_slice(&ygen);
+    println!("export G2_GEN_256=0x{}", hex::encode(&g2gen_bytes));
+
+    // Also export the params-specific G2 base used to compute pk (since it's not the canonical generator)
+    let xg2 = fq2_pair_to_be(&g2.x.c0, &g2.x.c1);
+    let yg2 = fq2_pair_to_be(&g2.y.c0, &g2.y.c1);
+    let mut g2base_bytes = vec![0u8; 256];
+    g2base_bytes[..128].copy_from_slice(&xg2);
+    g2base_bytes[128..].copy_from_slice(&yg2);
+    println!("export G2_BASE_256=0x{}", hex::encode(&g2base_bytes));
 
     // Discover issuers and their indices
     let issuers: Vec<Address> = params.get_issuers().call().await?;

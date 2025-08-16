@@ -6,17 +6,17 @@
     "compile": "hardhat compile",
     "test": "hardhat test",
     "test:sepolia": "hardhat test --network sepolia",
-  "test:hoodi": "hardhat test --network hoodi",
-  "test:local": "hardhat test",
-  "test:mainnet": "hardhat test --network mainnet",
-  "demo:issuer": "hardhat run scripts/issuer_relay_demo.ts",
-  "deploy:local": "hardhat run scripts/deploy_local.ts",
-  "deploy:transcript:local": "hardhat run scripts/deploy_transcript_wrapper.ts",
-  "e2e:local": "bash scripts/bootstrap_local_flow.sh",
-  "call:map1": "ts-node scripts/eip2537_ethcall.ts map1",
-  "call:map2": "ts-node scripts/eip2537_ethcall.ts map2",
-  "call:pair-empty": "ts-node scripts/eip2537_ethcall.ts pair-empty",
-  "vectors:validate": "ts-node scripts/validate_bls_vectors.ts"
+    "test:hoodi": "hardhat test --network hoodi",
+    "test:local": "hardhat test",
+    "test:mainnet": "hardhat test --network mainnet",
+    "demo:issuer": "hardhat run scripts/issuer_relay_demo.ts",
+    "deploy:local": "hardhat run scripts/deploy_local.ts",
+    "deploy:transcript:local": "hardhat run scripts/deploy_transcript_wrapper.ts",
+    "e2e:local": "bash scripts/bootstrap_local_flow.sh",
+    "call:map1": "ts-node scripts/eip2537_ethcall.ts map1",
+    "call:map2": "ts-node scripts/eip2537_ethcall.ts map2",
+    "call:pair-empty": "ts-node scripts/eip2537_ethcall.ts pair-empty",
+    "vectors:validate": "ts-node scripts/validate_bls_vectors.ts"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-foundry": "^1.2.0",
@@ -25,5 +25,8 @@
     "hardhat": "^2.26.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "mocha": "^11.7.1"
   }
 }

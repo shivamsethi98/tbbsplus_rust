@@ -9,7 +9,7 @@ describe("RequestCredential BBS+", function () {
     await request.waitForDeployment();
 
     const sid = 1n;
-    const name = "IITH_UG_AC";
+    const name = "ANON_CRED";
     const commitmentB: [bigint, bigint] = [0n, 0n];
     const revealedIdx: number[] = [0, 2];
     const revealedVals: bigint[] = [123n, 456n];

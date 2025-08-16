@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0
-pragma solidity >=0.7.0 <0.9.0;
+pragma solidity ^0.8.24;
+
+import {CommitmentPokVerify} from "./CommitmentPokVerify.sol";
 
 contract RequestCredential {
     // For now we skip in-contract curve checks; off-chain PoK/zk to be added later using precompiles.
@@ -16,17 +18,6 @@ contract RequestCredential {
         uint256 c
     );
 
-    // BBS+ specific request carrying full commitment to hidden messages and revealed subset
-    event SigReqBBSPlus(
-        address indexed client,
-        uint256 indexed sid,
-        string indexed name,
-        bytes commitmentB,
-        uint32[] revealedIdx,
-        uint256[] revealedVals,
-        bytes proof,   // opaque bytes for PoK (issuers verify off-chain for now)
-        bytes context  // optional domain/context binding
-    );
 
     function broadcastSigReq(
         uint256 sid,
@@ -52,25 +43,47 @@ contract RequestCredential {
         );
     }
 
-    function broadcastSigReqBBSPlus(
+    // Non-verified BBS+ request removed intentionally to enforce on-chain PoK verification
+
+    // New gated request with on-chain verification of commitment correctness PoK (Schnorr)
+    event SigReqBBSPlusVerified(
+        address indexed client,
+        uint256 indexed sid,
+        string indexed name,
+        bytes commitmentB,
+        uint32[] revealedIdx,
+        uint256[] revealedVals,
+        uint32[] hiddenIdx,
+        bytes T,
+        uint256 challenge,
+        uint256[] responses,
+        bytes context
+    );
+
+    /// @notice Verify commitment-correctness PoK and emit verified request
+    /// @param h0 128B
+    /// @param H array of 128B, length == messageCount
+    /// @param hiddenIdx sorted indices of hidden messages (subset of [0..messageCount-1], typically excludes 0)
+    /// @param T 128B commitment to randomness
+    /// @param challenge Fr scalar
+    /// @param responses aligned responses: [resp_s, resp_m_i...]
+    function broadcastSigReqBBSPlusVerified(
         uint256 sid,
         string calldata name,
+        bytes calldata commitmentU,
         bytes calldata commitmentB,
         uint32[] calldata revealedIdx,
         uint256[] calldata revealedVals,
-        bytes calldata proof,
+        bytes calldata h0,
+        bytes[] calldata H,
+        uint32[] calldata hiddenIdx,
+        bytes calldata T,
+        uint256 challenge,
+        uint256[] calldata responses,
         bytes calldata context
     ) external {
-        // PoK verification is off-chain for now; precompile-based check to be added later.
-        emit SigReqBBSPlus(
-            msg.sender,
-            sid,
-            name,
-            commitmentB,
-            revealedIdx,
-            revealedVals,
-            proof,
-            context
-        );
+        bool ok = CommitmentPokVerify.verify(h0, H, hiddenIdx, T, challenge, responses, commitmentU);
+        require(ok, "commitment PoK failed");
+        emit SigReqBBSPlusVerified(msg.sender, sid, name, commitmentB, revealedIdx, revealedVals, hiddenIdx, T, challenge, responses, context);
     }
 }

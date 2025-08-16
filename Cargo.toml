@@ -57,6 +57,11 @@ required-features = ["mpc"]
 name = "ttp"
 path = "src/bin/ttp.rs"
 
+# Exporter to generate PoK JSON matching TTP deterministic key
+[[bin]]
+name = "export_pok_json_ttp"
+path = "src/bin/export_pok_json_ttp.rs"
+
 # Examples
 [[example]]
 name = "basic_credential"

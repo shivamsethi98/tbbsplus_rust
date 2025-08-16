@@ -10,7 +10,7 @@ describe("Issue allowlisting", function () {
     await params.waitForDeployment();
     await params
       .connect(owner)
-      .setParamsOnce("IITH_UG_AC", 5, 2, 3, [1, 2], 6);
+      .setParamsOnce("ANON_CRED", 5, 2, 3, [1, 2], 6);
 
     const Issue = await ethers.getContractFactory("Issue");
     const issue = await Issue.connect(owner).deploy(await params.getAddress());
@@ -18,16 +18,16 @@ describe("Issue allowlisting", function () {
 
     // Non-allowlisted should revert
     await expect(
-      issue.connect(rando).SendBlindSign("IITH_UG_AC", client.address, [3, 4], [5, 6])
+      issue.connect(rando).SendBlindSign("ANON_CRED", client.address, [3, 4], [5, 6])
     ).to.be.revertedWith("not issuer");
 
     // Allowlist issuer1
     await issue.connect(owner).addIssuer(issuer1.address);
 
     // Now it should pass and emit
-    const id = await params.getMapCredentials("IITH_UG_AC");
+    const id = await params.getMapCredentials("ANON_CRED");
     await expect(
-      issue.connect(issuer1).SendBlindSign("IITH_UG_AC", client.address, [3, 4], [5, 6])
+      issue.connect(issuer1).SendBlindSign("ANON_CRED", client.address, [3, 4], [5, 6])
     )
       .to.emit(issue, "emitIssue")
       .withArgs(id, client.address, issuer1.address, [3, 4], [5, 6]);

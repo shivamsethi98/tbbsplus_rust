@@ -26,7 +26,7 @@ npx hardhat clean >/dev/null 2>&1 || true
 npx hardhat compile --force
 
 echo "Deploying contracts..."
-DEPLOY_OUT=$(CRED_NAME=${CRED_NAME:-IITH_UG_AC} MESSAGE_COUNT=${MESSAGE_COUNT:-5} THRESHOLD=${THRESHOLD:-3} TOTAL=${TOTAL:-4} npx hardhat run --network localhost scripts/deploy_local.ts)
+DEPLOY_OUT=$(CRED_NAME=${CRED_NAME:-ANON_CRED} MESSAGE_COUNT=${MESSAGE_COUNT:-5} THRESHOLD=${THRESHOLD:-3} TOTAL=${TOTAL:-4} npx hardhat run --network localhost scripts/deploy_local.ts)
 echo "$DEPLOY_OUT"
 eval "$DEPLOY_OUT"
 
@@ -57,7 +57,7 @@ CHAIN_ID=31337
 REQ_CONTRACT=${REQ_CONTRACT}
 RELAY_CONTRACT=${RELAY_CONTRACT}
 PARAMS_CONTRACT=${PARAMS_CONTRACT}
-CRED_NAME=${CRED_NAME:-IITH_UG_AC}
+CRED_NAME=${CRED_NAME:-ANON_CRED}
 MESSAGE_COUNT=${MESSAGE_COUNT:-5}
 THRESHOLD=${THRESHOLD:-3}
 TOTAL=${TOTAL:-4}
