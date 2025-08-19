@@ -23,6 +23,12 @@ contract Params {
         uint256 hLen;
     // Optional: BLS12-381 G2 public key (uncompressed 256-byte x.c0||x.c1||y.c0||y.c1)
     bytes pkG2;
+    // Optional: BLS12-381 G1 generator (128B) and h0 (128B) and G2 base (256B) for pairing & commitments
+    bytes g1;
+    bytes h0;
+    bytes g2Base;
+    // H vector of G1 points, 128-byte uncompressed each, length == messageCount
+    bytes[] H;
     }
     mapping(uint256 => CredParams) private paramsById;
 
@@ -55,7 +61,11 @@ contract Params {
             n: n,
             public_m_encoding: public_m_encoding,
             hLen: hLen,
-            pkG2: new bytes(0)
+            pkG2: new bytes(0),
+            g1: new bytes(0),
+            h0: new bytes(0),
+            g2Base: new bytes(0),
+            H: new bytes[](0)
         });
         emit ParamsSet(name, id, messageCount, t, n);
     }
@@ -87,6 +97,48 @@ contract Params {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
         return paramsById[id].pkG2;
+    }
+
+    event ParamsG1H0G2Set(string indexed name);
+    function setG1H0G2(string memory name, bytes calldata g1, bytes calldata h0, bytes calldata g2Base) external onlyOwner {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        require(g1.length == 128 && h0.length == 128 && g2Base.length == 256, "bad lens");
+        paramsById[id].g1 = g1;
+        paramsById[id].h0 = h0;
+        paramsById[id].g2Base = g2Base;
+        emit ParamsG1H0G2Set(name);
+    }
+
+    function getG1H0G2ByName(string memory name) external view returns (bytes memory g1, bytes memory h0, bytes memory g2Base) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        CredParams storage cp = paramsById[id];
+        return (cp.g1, cp.h0, cp.g2Base);
+    }
+
+    event HSet(string indexed name, uint256 count);
+    function setHByName(string memory name, bytes[] calldata H) external onlyOwner {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        // Ensure each point is 128 bytes
+        for (uint256 i = 0; i < H.length; i++) {
+            require(H[i].length == 128, "bad H pt len");
+        }
+        CredParams storage cp = paramsById[id];
+        delete cp.H;
+        for (uint256 j = 0; j < H.length; j++) {
+            cp.H.push(H[j]);
+        }
+        cp.hLen = H.length;
+        emit HSet(name, H.length);
+    }
+
+    function getHByName(string memory name) external view returns (bytes[] memory H) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        CredParams storage cp = paramsById[id];
+        return cp.H;
     }
 
     // Issuer registry ops

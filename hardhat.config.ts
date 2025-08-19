@@ -12,7 +12,7 @@ const SHOULD_FORK = process.env.FORK === "1";
 
 const config: HardhatUserConfig = {
   solidity: {
-    version: "0.8.30",
+    version: "0.8.27",
     settings: {
   optimizer: { enabled: true, runs: 200 },
   viaIR: true,

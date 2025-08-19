@@ -22,14 +22,11 @@ use ethers::types::Bytes as EthBytes;
 use ethers::providers::{Provider, Ws};
 use ethers::types::TxHash;
 use ethers::types::H256;
+use futures::StreamExt;
 
 abigen!(
     RequestCredential,
     "artifacts/contracts/RequestCredential.sol/RequestCredential.json"
-);
-abigen!(
-    PartialSignatureRelay,
-    "artifacts/contracts/PartialSignatureRelay.sol/PartialSignatureRelay.json"
 );
 abigen!(
     Params,
@@ -63,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let ws_url = env::var("ETH_WS").unwrap_or_else(|_| "ws://127.0.0.1:8545".into());
     let chain_id: u64 = env::var("CHAIN_ID").unwrap_or_else(|_| "31337".into()).parse()?;
     let req_addr: Address = env::var("REQ_CONTRACT").expect("REQ_CONTRACT").parse()?;
-    let relay_addr: Address = env::var("RELAY_CONTRACT").expect("RELAY_CONTRACT").parse()?;
+    // Note: RELAY_CONTRACT deprecated; using CredentialRegistry events and getters
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
     let t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
@@ -152,7 +149,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let req = RequestCredential::new(req_addr, client.clone());
-    let relay = PartialSignatureRelay::new(relay_addr, client.clone());
+    // Optional CredentialRegistry for on-chain aggregation
+    // Dynamic Contract for CredentialRegistry (avoid abigen error type collisions)
+    let registry_opt: Option<Contract<SignerMiddleware<Provider<Ws>, LocalWallet>>> = env::var("REGISTRY_CONTRACT")
+        .ok()
+        .and_then(|s| s.parse::<Address>().ok())
+        .and_then(|addr| {
+            let art_path = "artifacts/contracts/CredentialRegistry.sol/CredentialRegistry.json";
+            let art_str = std::fs::read_to_string(art_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&art_str).ok()?;
+            let abi_val = v.get("abi")?.clone();
+            let abi: Abi = serde_json::from_value(abi_val).ok()?;
+            Some(Contract::new(addr, abi, client.clone()))
+        });
     let params_contract = Params::new(params_addr, client.clone());
 
     // Handle debug command early and exit
@@ -245,14 +254,24 @@ async fn main() -> anyhow::Result<()> {
             let (hidden_idx_vec, t_b, c_u256, resp_vec_u256) = decode_commitment_pok_for_onchain(&proof_bytes)?;
 
             if wait_and_verify {
-                // Create event stream first to avoid missing early shares, keep builder alive in this scope
-                use ethers::types::BlockNumber;
-                let eb = relay
-                    .event::<partial_signature_relay::PartialShareFilter>()
+                // Require registry; subscribe to Aggregated(name,sid,...) before broadcasting
+                if registry_opt.is_none() { anyhow::bail!("REGISTRY_CONTRACT missing; cannot wait for Aggregated event"); }
+                use ethers::types::{BlockNumber, Filter, ValueOrArray};
+                let registry = registry_opt.as_ref().unwrap();
+                let event_sig = H256::from(ethers::utils::keccak256(b"Aggregated(string,uint256,bytes,uint256,uint256)"));
+                let name_topic = H256::from(ethers::utils::keccak256(cred_name.as_bytes()));
+                let mut sid_be = [0u8; 32];
+                U256::from(sid).to_big_endian(&mut sid_be);
+                let sid_topic = H256::from(sid_be);
+                let filter = Filter::new()
+                    .address(ValueOrArray::Value(registry.address()))
+                    .topic0(ValueOrArray::Value(event_sig))
+                    .topic1(ValueOrArray::Value(name_topic))
+                    .topic2(ValueOrArray::Value(sid_topic))
                     .from_block(BlockNumber::Latest);
-                let mut stream = eb.stream().await?;
+                let mut agg_stream = client.provider().subscribe_logs(&filter).await?;
 
-                // Try verified path first; fallback to legacy event if the contract doesn't support it
+                // Broadcast verified request
                 let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
                     U256::from(sid),
                     cred_name.clone(),
@@ -285,28 +304,70 @@ async fn main() -> anyhow::Result<()> {
                         persist_request_meta(&user_id, &cred_name, sid, txh, bn.as_u64()).ok();
                     }
                 }
+                // Wait for Aggregated log and then fetch signature
+                loop {
+                    if let Some(_log) = agg_stream.next().await {
+                        // Fetch aggregated signature from registry
+                        let (abytes, e_u, s_u, _status): (ethers::types::Bytes, U256, U256, u8) = registry
+                            .method("getSignature", (cred_name.clone(), U256::from(sid)))
+                            .unwrap()
+                            .call()
+                            .await?;
+                        if abytes.0.len() != 128 { anyhow::bail!("registry returned bad A len: {}", abytes.0.len()); }
+                        // Build messages and persist artifacts
+                        let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
+                        let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
+                        let onchain_t: u16 = pc.t.as_u64() as u16;
+                        let onchain_n: u16 = pc.n.as_u64() as u16;
 
-                // Collect shares
-                use std::collections::{BTreeMap, BTreeSet};
-                let mut share_by_idx: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
-                let mut seen: BTreeSet<u16> = BTreeSet::new();
-                while share_by_idx.len() < t as usize {
-                    if let Some(ev) = stream.next().await { if let Ok(ev) = ev {
-                        if ev.sid.as_u64() == sid {
-                            let idx_u16: u16 = ev.idx;
-                            if !seen.contains(&idx_u16) {
-                                let p = ev.payload.to_vec();
-                                share_by_idx.insert(idx_u16, p.clone());
-                                seen.insert(idx_u16);
-                                println!("Client: got share {} from idx {}", share_by_idx.len(), idx_u16);
-                                persist_share(&user_id, &cred_name, sid, idx_u16, &p).ok();
+                        let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
+                        if !messages.is_empty() { messages[0] = Fr::from(sid); }
+                        if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
+                            for (i, fr_val) in rev {
+                                if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; }
                             }
                         }
-                    }}
+
+                        use std::fs;
+                        use std::path::PathBuf;
+                        use ark_ec::AffineRepr;
+                        let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
+                        let _ = fs::create_dir_all(&base);
+
+                        let msgs_hex: Vec<String> = messages.iter().map(|f| {
+                            let mut be = Vec::new();
+                            ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap();
+                            format!("0x{}", hex::encode(be))
+                        }).collect();
+                        fs::write(base.join("messages.json"), serde_json::to_vec_pretty(&msgs_hex)?)?;
+                        let params_obj = serde_json::json!({
+                            "cred_name": cred_name,
+                            "messageCount": onchain_mcount,
+                            "t": onchain_t,
+                            "n": onchain_n,
+                        });
+                        fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
+
+                        // Persist aggregated signature from registry
+                        let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                        let e = u256_to_fr::<Fr>(&e_u);
+                        let s = u256_to_fr::<Fr>(&s_u);
+                        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                        let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
+                        let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
+                        let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
+                        let sig_obj = serde_json::json!({
+                            "A": format!("0x{}", hex::encode(a_bytes)),
+                            "e": format!("0x{}", hex::encode(e_bytes)),
+                            "s": format!("0x{}", hex::encode(s_bytes)),
+                        });
+                        fs::write(base.join("agg_signature.json"), serde_json::to_vec_pretty(&sig_obj)?)?;
+
+                        // Enter action loop
+                        persist_and_optionally_present(&user_id, &client, &params_contract, &cred_name, mcount, sid, Vec::new()).await?;
+                        break;
+                    }
                 }
-                let shares: Vec<Vec<u8>> = share_by_idx.values().cloned().collect();
-                // After aggregation, persist and offer actions instead of just exiting
-                persist_and_optionally_present(&user_id, &client, &params_contract, &cred_name, mcount, sid, shares).await?;
             } else {
                 // Send request only (verified path preferred)
                 let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
@@ -343,49 +404,123 @@ async fn main() -> anyhow::Result<()> {
             }
     }
     Mode::Verify { sid } => {
-            // Load persisted shares for this sid (preferred), else fetch from chain using earliest request block
-            let mut shares: Vec<Vec<u8>> = load_persisted_shares(&user_id, &cred_name, sid).unwrap_or_default();
-            if shares.len() < t as usize {
-                // Derive start block from SigReqBBSPlus events for this sid
-                let req_events_with_meta = req
-                    .event::<request_credential::SigReqBBSPlusVerifiedFilter>()
-                    .from_block(0u64) // safe to scan earliest; local cache guards reprocessing
-                    .query_with_meta()
+            // Prefer registry aggregation: fetch signature directly; else try to find Aggregated event
+            if let Some(registry) = registry_opt.as_ref() {
+                // Try to fetch signature via dynamic call
+                let res: (ethers::types::Bytes, U256, U256, u8) = registry
+                    .method("getSignature", (cred_name.clone(), U256::from(sid)))
+                    .unwrap()
+                    .call()
                     .await?;
-                let mut start_block_opt: Option<u64> = None;
-                for (ev, meta) in req_events_with_meta.into_iter() {
-                    if ev.sid.as_u64() == sid {
-                        let bn = meta.block_number;
-                        start_block_opt = Some(start_block_opt.map_or(bn.as_u64(), |b| b.min(bn.as_u64())));
+                let (abytes, e_u, s_u, _status_raw) = res;
+                if abytes.0.len() == 128 {
+                    // Persist artifacts and enter action loop
+                    let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
+                    let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
+                    let onchain_t: u16 = pc.t.as_u64() as u16;
+                    let onchain_n: u16 = pc.n.as_u64() as u16;
+
+                    let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
+                    if !messages.is_empty() { messages[0] = Fr::from(sid); }
+                    if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
+                        for (i, fr_val) in rev {
+                            if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; }
+                        }
+                    }
+
+                    use std::fs;
+                    use std::path::PathBuf;
+                    use ark_ec::AffineRepr;
+                    let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
+                    let _ = fs::create_dir_all(&base);
+
+                    let msgs_hex: Vec<String> = messages.iter().map(|f| {
+                        let mut be = Vec::new();
+                        ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap();
+                        format!("0x{}", hex::encode(be))
+                    }).collect();
+                    fs::write(base.join("messages.json"), serde_json::to_vec_pretty(&msgs_hex)?)?;
+                    let params_obj = serde_json::json!({ "cred_name": cred_name, "messageCount": onchain_mcount, "t": onchain_t, "n": onchain_n });
+                    fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
+
+                    let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                    let e = u256_to_fr::<Fr>(&e_u);
+                    let s = u256_to_fr::<Fr>(&s_u);
+                    let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                    let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
+                    let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
+                    let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
+                    let sig_obj = serde_json::json!({
+                        "A": format!("0x{}", hex::encode(a_bytes)),
+                        "e": format!("0x{}", hex::encode(e_bytes)),
+                        "s": format!("0x{}", hex::encode(s_bytes)),
+                    });
+                    fs::write(base.join("agg_signature.json"), serde_json::to_vec_pretty(&sig_obj)?)?;
+
+                    persist_and_optionally_present(&user_id, &client, &params_contract, &cred_name, mcount, sid, Vec::new()).await?;
+                    return Ok(());
+                } else {
+                    // Try to find Aggregated event and then fetch signature
+                    // Query past logs via provider filter
+                    use ethers::types::{Filter, ValueOrArray};
+                    let event_sig = H256::from(ethers::utils::keccak256(b"Aggregated(string,uint256,bytes,uint256,uint256)"));
+                    let name_topic = H256::from(ethers::utils::keccak256(cred_name.as_bytes()));
+                    let mut sid_be = [0u8; 32];
+                    U256::from(sid).to_big_endian(&mut sid_be);
+                    let sid_topic = H256::from(sid_be);
+                    let filter = Filter::new()
+                        .address(ValueOrArray::Value(registry.address()))
+                        .topic0(ValueOrArray::Value(event_sig))
+                        .topic1(ValueOrArray::Value(name_topic))
+                        .topic2(ValueOrArray::Value(sid_topic))
+                        .from_block(0u64);
+                    let logs = client.provider().get_logs(&filter).await?;
+                    let found = !logs.is_empty();
+                    if found {
+                        let (abytes2, e_u2, s_u2, _status2): (ethers::types::Bytes, U256, U256, u8) = registry
+                            .method("getSignature", (cred_name.clone(), U256::from(sid)))
+                            .unwrap()
+                            .call()
+                    .await?;
+                        if abytes2.0.len() == 128 {
+                            // Recurse into same logic by resetting variables
+                            let abytes = abytes2; let e_u = e_u2; let s_u = s_u2;
+                            // Persist and continue
+                            let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
+                            let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
+                            let onchain_t: u16 = pc.t.as_u64() as u16;
+                            let onchain_n: u16 = pc.n.as_u64() as u16;
+                            let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
+                            if !messages.is_empty() { messages[0] = Fr::from(sid); }
+                            if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
+                                for (i, fr_val) in rev {
+                                    if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; }
+                                }
+                            }
+                            use std::fs; use std::path::PathBuf; use ark_ec::AffineRepr;
+                            let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
+                            let _ = fs::create_dir_all(&base);
+                            let msgs_hex: Vec<String> = messages.iter().map(|f| { let mut be = Vec::new(); ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap(); format!("0x{}", hex::encode(be)) }).collect();
+                            fs::write(base.join("messages.json"), serde_json::to_vec_pretty(&msgs_hex)?)?;
+                            let params_obj = serde_json::json!({ "cred_name": cred_name, "messageCount": onchain_mcount, "t": onchain_t, "n": onchain_n });
+                            fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
+                            let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                            let e = u256_to_fr::<Fr>(&e_u);
+                            let s = u256_to_fr::<Fr>(&s_u);
+                            let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                            let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
+                            let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
+                            let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
+                            let sig_obj = serde_json::json!({ "A": format!("0x{}", hex::encode(a_bytes)), "e": format!("0x{}", hex::encode(e_bytes)), "s": format!("0x{}", hex::encode(s_bytes)) });
+                            fs::write(base.join("agg_signature.json"), serde_json::to_vec_pretty(&sig_obj)?)?;
+                            persist_and_optionally_present(&user_id, &client, &params_contract, &cred_name, mcount, sid, Vec::new()).await?;
+                            return Ok(());
+                        }
                     }
                 }
-                let start_block = start_block_opt.unwrap_or(0u64);
-                // Fetch shares from relay from start_block and pick the latest per idx using log_index
-                let share_events = relay
-                    .event::<partial_signature_relay::PartialShareFilter>()
-                    .from_block(start_block)
-                    .query_with_meta()
-                    .await?;
-                use std::collections::BTreeMap;
-                let mut by_idx: BTreeMap<u16, (u64, Vec<u8>)> = BTreeMap::new();
-                for (ev, meta) in share_events.into_iter() {
-                    if ev.sid.as_u64() != sid { continue; }
-                    let li = meta.log_index.as_u64();
-                    let entry = by_idx.entry(ev.idx).or_insert((0u64, Vec::new()));
-                    if li >= entry.0 {
-                        *entry = (li, ev.payload.to_vec());
-                    }
-                }
-                for (idx, (_li, payload)) in by_idx.iter() {
-                    println!("Client: found past share from idx {}", idx);
-                }
-                shares = by_idx.into_iter().map(|(idx, (_li, p))| { persist_share(&user_id, &cred_name, sid, idx, &p).ok(); p }).collect();
             }
-            if shares.len() < t as usize {
-                eprintln!("Client: not enough shares for sid {}: got {}, need {}", sid, shares.len(), t);
-            }
-            // Persist credential and optionally present
-            persist_and_optionally_present(&user_id, &client, &params_contract, &cred_name, mcount, sid, shares).await?;
+
+            anyhow::bail!("Aggregated signature not found in registry for sid {}", sid);
         }
         Mode::DebugG2 => {
             // Already handled above; this is here to make the match exhaustive.
@@ -1008,6 +1143,19 @@ fn g2_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine) ->
     out[..128].copy_from_slice(&xbe);
     out[128..].copy_from_slice(&ybe);
     out
+}
+
+fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
+    use ark_ec::AffineRepr;
+    if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
+    let mut x_be48 = [0u8; 48];
+    let mut y_be48 = [0u8; 48];
+    x_be48.copy_from_slice(&bytes128[16..64]);
+    y_be48.copy_from_slice(&bytes128[80..128]);
+    let x = Fq::from_be_bytes_mod_order(&x_be48);
+    let y = Fq::from_be_bytes_mod_order(&y_be48);
+    let p = ark_bls12_381::G1Affine::new(x, y);
+    Ok(p)
 }
 
 // fn bls12_381_g2_generator_bytes() -> [u8; 256] {

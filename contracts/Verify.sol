@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {BbsPlusPokVerify} from "./BbsPlusPokVerify.sol";
 import {Bls12381} from "./lib/Bls12381.sol";
+import {Params} from "./Params.sol";
 
 /// @title Credential Presentation Verifier
 /// @notice Verifies BBS+ PoK using EIP-2537 MSM precompiles and optionally runs a pairing check
@@ -91,6 +92,25 @@ contract VerifyWrapper {
         bytes calldata pkG2,
         bytes calldata g2base
     ) external view returns (bool) {
+        return Verify.verifyPokWithPairing(sig, ctx, revealed, challenge, p1, p2, pkG2, g2base);
+    }
+
+    /// @notice Verify PoK and run pairing using pkG2 and g2Base fetched from Params by credential name
+    /// @dev This avoids passing pk/g2base from the client; reads on-chain via Params.
+    function verifyPokWithPairingFromParams(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+        string calldata name,
+        address paramsAddr
+    ) external view returns (bool) {
+        Params p = Params(paramsAddr);
+        ( , , bytes memory g2base) = p.getG1H0G2ByName(name);
+        bytes memory pkG2 = p.getPkG2ByName(name);
+        if (pkG2.length == 0 || g2base.length != 256) return false;
         return Verify.verifyPokWithPairing(sig, ctx, revealed, challenge, p1, p2, pkG2, g2base);
     }
 

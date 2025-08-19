@@ -54,6 +54,11 @@ path = "src/bin/client.rs"
 required-features = ["mpc"]
 
 [[bin]]
+name = "client2"
+path = "src/bin/client2.rs"
+required-features = ["mpc"]
+
+[[bin]]
 name = "ttp"
 path = "src/bin/ttp.rs"
 
@@ -90,3 +95,7 @@ path = "examples/hybrid_onchain_verification.rs"
 [[example]]
 name = "bbs_proof_system_demo"
 path = "examples/bbs_proof_system_demo.rs"
+
+[[bin]]
+name = "cred_confirm"
+path = "src/bin/cred_confirm.rs"

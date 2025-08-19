@@ -21,6 +21,10 @@ async function main() {
     )
   ).wait();
 
+  const Registry = await ethers.getContractFactory("CredentialRegistry");
+  const registry = await Registry.connect(owner).deploy(await params.getAddress());
+  await registry.waitForDeployment();
+
   const Request = await ethers.getContractFactory("RequestCredential");
   const request = await Request.connect(owner).deploy();
   await request.waitForDeployment();
@@ -31,6 +35,7 @@ async function main() {
 
   console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
   console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
+  console.log(`export REGISTRY_CONTRACT=${await registry.getAddress()}`);
   console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
   console.log(`export CHAIN_ID=31337`);
   console.log(`export ETH_WS=ws://127.0.0.1:8545`);

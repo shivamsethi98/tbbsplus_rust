@@ -144,6 +144,61 @@ async fn main() -> anyhow::Result<()> {
     g2base_bytes[128..].copy_from_slice(&yg2);
     println!("export G2_BASE_256=0x{}", hex::encode(&g2base_bytes));
 
+    // Also set g1, h0, H, g2base, pkG2 on-chain (requires OWNER to call onlyOwner fns)
+    // Helper: convert G1 affine to 128-byte EIP-2537 format (x||y with 16-byte zero pad per coord)
+    fn fq_to_be64_g1(x: &ark_bls12_381::Fq) -> [u8; 64] {
+        let bi = x.into_bigint();
+        let limbs: [u64; 6] = bi.0;
+        let mut le48 = [0u8; 48];
+        for (i, limb) in limbs.iter().enumerate() {
+            le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+        }
+        let mut be48 = [0u8; 48];
+        for i in 0..48 { be48[i] = le48[47 - i]; }
+        let mut out = [0u8; 64];
+        out[16..].copy_from_slice(&be48);
+        out
+    }
+    fn g1_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine) -> [u8; 128] {
+        let (x, y) = (p.x, p.y);
+        let xb = fq_to_be64_g1(&x);
+        let yb = fq_to_be64_g1(&y);
+        let mut out = [0u8; 128];
+        out[..64].copy_from_slice(&xb);
+        out[64..].copy_from_slice(&yb);
+        out
+    }
+
+    // g1/h0/H from label-derived params
+    let g1_b = g1_to_eip2537_bytes(&params_bbs.g1).to_vec();
+    let h0_b = g1_to_eip2537_bytes(&params_bbs.h_0).to_vec();
+    let mut H_bytes: Vec<Vec<u8>> = Vec::with_capacity(params_bbs.h.len());
+    for h in params_bbs.h.iter() { H_bytes.push(g1_to_eip2537_bytes(h).to_vec()); }
+
+    params
+        .set_g1h0g2(
+            cred_name.clone(),
+            g1_b.clone().into(),
+            h0_b.clone().into(),
+            g2base_bytes.clone().into(),
+        )
+        .send()
+        .await?
+        .await?;
+    params
+        .set_h_by_name(
+            cred_name.clone(),
+            H_bytes.clone().into_iter().map(ethers::types::Bytes::from).collect(),
+        )
+        .send()
+        .await?
+        .await?;
+    params
+        .set_pk_g2(cred_name.clone(), pk_bytes.clone().into())
+        .send()
+        .await?
+        .await?;
+
     // Discover issuers and their indices
     let issuers: Vec<Address> = params.get_issuers().call().await?;
     println!("TTP: {} issuers discovered", issuers.len());

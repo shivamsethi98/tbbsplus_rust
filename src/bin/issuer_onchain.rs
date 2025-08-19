@@ -15,6 +15,8 @@ use std::io::Read;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use bbs_plus::prelude::*;
 use ethers::contract::abigen;
+use ethers::contract::Contract;
+use ethers::abi::Abi;
 use ethers::prelude::*;
 use ethers::signers::{coins_bip39::English, MnemonicBuilder};
 use ethers::providers::{Provider, Ws};
@@ -33,10 +35,7 @@ abigen!(
     "artifacts/contracts/RequestCredential.sol/RequestCredential.json"
 );
 
-abigen!(
-    PartialSignatureRelay,
-    "artifacts/contracts/PartialSignatureRelay.sol/PartialSignatureRelay.json"
-);
+// Avoid abigen for CredentialRegistry to prevent error type collisions; use dynamic Contract instead
 
 abigen!(
     Params,
@@ -49,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let ws_url = env::var("ETH_WS").unwrap_or_else(|_| "ws://127.0.0.1:8545".into());
     let req_addr: Address = env::var("REQ_CONTRACT").expect("REQ_CONTRACT").parse()?;
-    let relay_addr: Address = env::var("RELAY_CONTRACT").expect("RELAY_CONTRACT").parse()?;
+    // PartialSignatureRelay deprecated for aggregation; using CredentialRegistry instead
+    // let relay_addr: Address = env::var("RELAY_CONTRACT").expect("RELAY_CONTRACT").parse()?;
+    let registry_addr: Address = env::var("REGISTRY_CONTRACT").expect("REGISTRY_CONTRACT").parse()?;
     let chain_id: u64 = env::var("CHAIN_ID").unwrap_or_else(|_| "31337".into()).parse()?;
     // Issuer PK no longer passed explicitly; use local dev anvil keys or pre-funded wallet if needed.
     // For demo, derive from anvil default via index (PID-1) if PRIVATE_KEY not provided.
@@ -76,7 +77,14 @@ async fn main() -> anyhow::Result<()> {
     let client = std::sync::Arc::new(client);
 
     let req = RequestCredential::new(req_addr, client.clone());
-    let relay = PartialSignatureRelay::new(relay_addr, client.clone());
+    // Dynamic contract for CredentialRegistry
+    let reg_art_path = "artifacts/contracts/CredentialRegistry.sol/CredentialRegistry.json";
+    let reg_art_str = std::fs::read_to_string(reg_art_path)
+        .map_err(|e| anyhow::anyhow!("read {} failed: {:?}", reg_art_path, e))?;
+    let reg_v: serde_json::Value = serde_json::from_str(&reg_art_str)?;
+    let reg_abi_val = reg_v.get("abi").ok_or_else(|| anyhow::anyhow!("abi missing in {}", reg_art_path))?.clone();
+    let reg_abi: Abi = serde_json::from_value(reg_abi_val)?;
+    let registry = Contract::new(registry_addr, reg_abi, client.clone());
     // Params for multiaddr discovery
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let params = Params::new(params_addr, client.clone());
@@ -126,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
     let handle = mesh.run_background();
 
     // --- Load TTP-dealt key share and construct params ---
-    let params = SignatureParamsG1::<Bls12_381>::new::<blake2::Blake2b512>(cred_name.as_bytes(), message_count);
+    let params_bbs = SignatureParamsG1::<Bls12_381>::new::<blake2::Blake2b512>(cred_name.as_bytes(), message_count);
     let shares_file = env::var("SHARES_FILE").unwrap_or_else(|_| ".runtime.shares.json".into());
     let data = std::fs::read(&shares_file)
         .map_err(|e| anyhow::anyhow!("failed to read shares file {shares_file}: {:?}", e))?;
@@ -214,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
     let resp_fr: Vec<Fr> = ev.responses.iter().map(u256_to_fr::<Fr>).collect();
     // Fallback off-chain PoK check mirroring on-chain verification (double-check; cheap)
     let pok_res = verify_commitment_pok_from_fields(
-        &params,
+        &params_bbs,
         &commitment,
         sid,
         &cred_name,
@@ -588,39 +596,46 @@ async fn main() -> anyhow::Result<()> {
             0,
             &phase1_output,
             &phase2_output,
-            &params,
+            &params_bbs,
     )
     .map_err(|e| anyhow::anyhow!("create signature share (blind) failed: {:?}", e))?;
         let mut payload_vec = Vec::new();
         share.serialize_compressed(&mut payload_vec)?;
 
-        // Submit partial share
-        let mut method = relay.submit_partial_share(
-            cred_name.clone(),
-            sid.into(),
-            participant_id,
-            payload_vec.into(),
-        );
-        // For local anvil, ensure gas price is set (some providers might return 0)
+        // Submit share to CredentialRegistry for on-chain aggregation
+        // Extract (R,u,e,s) and convert to EVM types
+        let r_bytes128 = ethers::types::Bytes::from(g1_to_eip2537_bytes(&share.R).to_vec());
+        let u_u256 = fr_to_u256(&share.u);
+        let e_u256 = fr_to_u256(&share.e);
+        let s_u256 = fr_to_u256(&share.s);
+        // Fetch threshold t from Params (authoritative)
+        let pc = params.get_params_by_name(cred_name.clone()).call().await?;
+        let onchain_t: u16 = pc.t.as_u64() as u16;
+        let mut call = registry.method::<_, ()>(
+            "submitShare",
+            (
+                cred_name.clone(),
+                U256::from(sid),
+                participant_id,
+                r_bytes128,
+                u_u256,
+                e_u256,
+                s_u256,
+                onchain_t,
+            ),
+        )?;
         if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
-            method = method.gas_price(U256::from(1_000_000_000u64)); // 1 gwei
+            call = call.gas_price(U256::from(1_000_000_000u64));
         }
-        let send_res = method.send().await;
+        let send_res = call.send().await;
         match send_res {
             Ok(pend) => {
                 let rcpt = pend.await?.ok_or_else(|| anyhow::anyhow!("no receipt"))?;
-                println!("submitted partial share: hash={:?}", rcpt.transaction_hash);
+                println!("[registry] submitShare ok: tx={:?}", rcpt.transaction_hash);
                 processed_sids.insert(sid);
             }
             Err(e) => {
-                // Gracefully handle duplicate submission reverts
-                let msg = format!("{:?}", e);
-                if msg.contains("dup share") || msg.contains("revert") {
-                    eprintln!("duplicate or reverted share for sid {}: {}", sid, msg);
-                    processed_sids.insert(sid);
-                } else {
-                    return Err(anyhow::anyhow!("submit_partial_share failed: {}", msg));
-                }
+                return Err(anyhow::anyhow!("submitShare failed: {:?}", e));
             }
         }
     }
@@ -632,6 +647,42 @@ fn u256_to_fr<F: ark_ff::PrimeField>(v: &U256) -> F {
     let mut be = [0u8; 32];
     v.to_big_endian(&mut be);
     F::from_be_bytes_mod_order(&be)
+}
+
+fn fq_to_be64(x: &ark_bls12_381::Fq) -> [u8; 64] {
+    let bi = x.into_bigint();
+    let limbs: [u64; 6] = bi.0;
+    let mut le48 = [0u8; 48];
+    for (i, limb) in limbs.iter().enumerate() {
+        le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    let mut be48 = [0u8; 48];
+    for i in 0..48 { be48[i] = le48[47 - i]; }
+    let mut out = [0u8; 64];
+    out[16..].copy_from_slice(&be48);
+    out
+}
+
+fn g1_to_eip2537_bytes(p: &<ark_bls12_381::Bls12_381 as ark_ec::pairing::Pairing>::G1Affine) -> [u8; 128] {
+    let (x, y) = (p.x, p.y);
+    let xb = fq_to_be64(&x);
+    let yb = fq_to_be64(&y);
+    let mut out = [0u8; 128];
+    out[..64].copy_from_slice(&xb);
+    out[64..].copy_from_slice(&yb);
+    out
+}
+
+fn fr_to_u256(fr: &ark_bls12_381::Fr) -> U256 {
+    let bi = fr.into_bigint();
+    let limbs: [u64; 4] = bi.0;
+    let mut le32 = [0u8; 32];
+    for (i, limb) in limbs.iter().enumerate() {
+        le32[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    let mut be32 = [0u8; 32];
+    for i in 0..32 { be32[i] = le32[31 - i]; }
+    U256::from_big_endian(&be32)
 }
 
 fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
