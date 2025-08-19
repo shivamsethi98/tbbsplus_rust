@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     if let Mode::DebugG2 = mode {
         let pc = params_contract.get_params_by_name(cred_name.to_string()).call().await?;
         let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
-        let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
+        let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
         let g2_bytes = g2_to_eip2537_bytes(&params_bbs.g2);
         let g2_hex = format!("0x{}", hex::encode(g2_bytes));
         println!("G2_BASE_256={}", g2_hex);
@@ -187,8 +187,8 @@ async fn main() -> anyhow::Result<()> {
             // Fetch on-chain params to know message_count and match params generation
             let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
             let mcount_onchain: u32 = pc.message_count.as_u64() as u32;
-            // Deterministic params generation (must match issuers/TTP demo)
-            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), mcount_onchain);
+            // Load params from smart contract to avoid off-chain derivation mismatch
+            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
 
             // Ensure index 0 is revealed and equals sid
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) {
@@ -241,7 +241,7 @@ async fn main() -> anyhow::Result<()> {
             // Build Schnorr-style PoK bound to transcript and serialize proof bytes
             let proof_bytes = build_commitment_pok(&params_bbs, &commitment, &hidden_msgs_fr, &blinding, mcount_onchain, sid, &cred_name, &revealed_idx, &revealed_vals, &context)?;
 
-            let commitment_b = ethers::types::Bytes::from(commitment_bytes.clone());
+            let commitment_b = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let commitment_u = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let context_bytes = ethers::types::Bytes::from(context.clone());
             // Prepare on-chain inputs for verified request call
@@ -584,14 +584,12 @@ async fn verify_with_shares(
     match bbs_plus::threshold::threshold_bbs_plus::BBSPlusSignatureShare::aggregate(sig_shares) {
         Ok(signature) => {
             println!("Client: aggregated signature: A={:?} e={:?} s={:?}", signature.A, signature.e, signature.s);
-            // Reconstruct public key deterministically
-            // Params must match issuers (label-derived from cred_name and message_count), not RNG-generated.
-            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
-            // Match TTP: secret is generated from StdRng seeded with 42 with no prior RNG usage here.
-            let mut rng_sk = StdRng::seed_from_u64(42);
-            let (secret, _shares, _poly) = secret_sharing_and_dkg::shamir_ss::deal_random_secret(&mut rng_sk, onchain_t, onchain_n)
-                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
-            let pk = PublicKeyG2::generate_using_secret_key(&SecretKey(secret), &params_bbs);
+            // Load params and pkG2 from smart contract
+            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
+            let pk_bytes = pc.pk_g2.clone();
+            if pk_bytes.0.is_empty() { anyhow::bail!("pkG2 not set on-chain for credential {}", cred_name); }
+            let pk_aff = eip2537_g2_to_affine(&pk_bytes.0[..])?;
+            let pk = PublicKeyG2::<Bls12_381>(pk_aff);
             // Blind signatures must be unblinded before verification if blinding was used
             let sig_to_verify = if let Some(b) = blinding { signature.unblind(&b) } else { signature };
             match sig_to_verify.verify(&messages, pk, params_bbs) {
@@ -698,11 +696,11 @@ async fn persist_and_optionally_present(
         std::io::stdin().read_line(&mut line)?;
         let choice = line.trim().to_lowercase();
         if choice.is_empty() || choice == "v" || choice == "verify" {
-            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
-            let mut rng_sk = StdRng::seed_from_u64(42);
-            let (secret, _shares, _poly) = secret_sharing_and_dkg::shamir_ss::deal_random_secret::<_, Fr>(&mut rng_sk, onchain_t, onchain_n)
-                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
-            let pk = PublicKeyG2::generate_using_secret_key(&SecretKey(secret), &params_bbs);
+            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
+            let pk_bytes = pc.pk_g2.clone();
+            if pk_bytes.0.is_empty() { anyhow::bail!("pkG2 not set on-chain for credential {}", cred_name); }
+            let pk_aff = eip2537_g2_to_affine(&pk_bytes.0[..])?;
+            let pk = PublicKeyG2::<Bls12_381>(pk_aff);
             let sig_for_verify = {
                 let bpath = base.join("blinding.hex");
                 if let Ok(s) = fs::read_to_string(&bpath) {
@@ -777,7 +775,7 @@ async fn persist_and_optionally_present(
         };
 
         // Rebuild params and signature types
-        let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
+        let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
         // Use in-memory aggregated signature; try to unblind using persisted blinding if available
         let sig_struct = {
             // Attempt to read blinding from known locations
@@ -1156,6 +1154,40 @@ fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec:
     let y = Fq::from_be_bytes_mod_order(&y_be48);
     let p = ark_bls12_381::G1Affine::new(x, y);
     Ok(p)
+}
+
+fn eip2537_g2_to_affine(bytes256: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine> {
+    use ark_bls12_381::{Fq, Fq2};
+    use ark_ec::AffineRepr;
+    if bytes256.len() != 256 { anyhow::bail!("bad g2 len"); }
+    // x.c0 (first 64), x.c1 (next 64), y.c0 (next 64), y.c1 (last 64)
+    let x_c0_be = &bytes256[0..64];
+    let x_c1_be = &bytes256[64..128];
+    let y_c0_be = &bytes256[128..192];
+    let y_c1_be = &bytes256[192..256];
+    let fq_from_be64 = |be64: &[u8]| -> Fq {
+        // be64 has 64 bytes where the last 48 are the big-endian field element and the first 16 are zero padding
+        let mut be48 = [0u8; 48];
+        be48.copy_from_slice(&be64[16..64]);
+        Fq::from_be_bytes_mod_order(&be48)
+    };
+    let x = Fq2 { c0: fq_from_be64(x_c0_be), c1: fq_from_be64(x_c1_be) };
+    let y = Fq2 { c0: fq_from_be64(y_c0_be), c1: fq_from_be64(y_c1_be) };
+    Ok(ark_bls12_381::G2Affine::new(x, y))
+}
+
+async fn load_params_from_sc(
+    params: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
+    name: &str,
+) -> anyhow::Result<SignatureParamsG1<Bls12_381>> {
+    let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(name.to_string()).call().await?;
+    let h_vec: Vec<ethers::types::Bytes> = params.get_h_by_name(name.to_string()).call().await?;
+    let g1 = eip2537_g1_to_affine(&g1_b.0)?;
+    let h0 = eip2537_g1_to_affine(&h0_b.0)?;
+    let g2 = eip2537_g2_to_affine(&g2_b.0)?;
+    let mut h = Vec::with_capacity(h_vec.len());
+    for hb in h_vec.iter() { h.push(eip2537_g1_to_affine(&hb.0)?); }
+    Ok(SignatureParamsG1 { g1, g2, h_0: h0, h })
 }
 
 // fn bls12_381_g2_generator_bytes() -> [u8; 256] {

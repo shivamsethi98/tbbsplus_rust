@@ -2,9 +2,25 @@
 pragma solidity ^0.8.24;
 
 import {CommitmentPokVerify} from "./CommitmentPokVerify.sol";
+// Minimal interface to the registry for recording request data
+interface ICredentialRegistry {
+    function noteRequest(string calldata name, uint256 sid, address owner_) external;
+    function recordBprime(string calldata name, uint256 sid, bytes calldata Bprime) external;
+    function recordRevealed(string calldata name, uint256 sid, uint32[] calldata idx, uint256[] calldata vals) external;
+}
 
 contract RequestCredential {
     // For now we skip in-contract curve checks; off-chain PoK/zk to be added later using precompiles.
+
+    // Optional registry to record request metadata so CredentialRegistry can later confirm via pairing
+    address public registry;
+    event RegistrySet(address registry);
+    function setRegistry(address r) external {
+        require(registry == address(0), "registry set");
+        require(r != address(0), "bad reg");
+        registry = r;
+        emit RegistrySet(r);
+    }
 
     event SigReqBroadcast(
         address indexed client,
@@ -84,6 +100,16 @@ contract RequestCredential {
     ) external {
         bool ok = CommitmentPokVerify.verify(h0, H, hiddenIdx, T, challenge, responses, commitmentU);
         require(ok, "commitment PoK failed");
+        // If a registry is configured and has been granted request authority via setRequestContract,
+        // record the request owner, B' and revealed pairs for later confirmCredential
+        if (registry != address(0)) {
+            ICredentialRegistry reg = ICredentialRegistry(registry);
+            // These will succeed only if CredentialRegistry.setRequestContract(address(this)) was called by owner
+            // prior to this call; otherwise they will revert with "only request".
+            try reg.noteRequest(name, sid, msg.sender) {} catch {}
+            try reg.recordBprime(name, sid, commitmentB) {} catch {}
+            try reg.recordRevealed(name, sid, revealedIdx, revealedVals) {} catch {}
+        }
         emit SigReqBBSPlusVerified(msg.sender, sid, name, commitmentB, revealedIdx, revealedVals, hiddenIdx, T, challenge, responses, context);
     }
 }

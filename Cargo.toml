@@ -99,3 +99,7 @@ path = "examples/bbs_proof_system_demo.rs"
 [[bin]]
 name = "cred_confirm"
 path = "src/bin/cred_confirm.rs"
+
+[[bin]]
+name = "cred_status"
+path = "src/bin/cred_status.rs"

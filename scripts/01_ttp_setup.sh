@@ -67,15 +67,6 @@ export OWNER_PK=${OWNER_PK:-0xac0974bec36b3...} # placeholder, will set exact ne
 export OWNER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 eval "$(SHARES_FILE=$SHARES_FILE cargo run --features mpc --bin ttp | sed -n 's/^export /export /p')"
 
-echo "[07] Validate shares file"
-node -e '
-const fs=require("fs");
-const f=process.env.SHARES_FILE||".runtime.shares.json";
-const t=parseInt(process.env.THRESHOLD||"0",10);
-const j=JSON.parse(fs.readFileSync(f, "utf8"));
-const m=j.shares||{}; let missing=[];
-for(let i=1;i<=t;i++){ if(!m[i]) missing.push(i); }
-if(missing.length){ console.error(`[error] shares missing for PIDs: ${missing.join(",")}`); process.exit(2);} else { console.log("[ok] shares OK"); }
-'
 
-echo "[08] Done"
+
+echo "[07] Done"

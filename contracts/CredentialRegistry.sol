@@ -220,9 +220,14 @@ contract CredentialRegistry {
         }
         // g1 + B''
         bytes memory g1PlusBpp = Bls12381.g1add(g1, Bpp);
-        // Pairing check (via Verify library)
+        // Include e in pairing: check e(A, pkG2 + e*g2base) == e(g1 + B'', g2base)
+        uint256[] memory sc_one = _oneScalar(srec.e);
+        bytes[] memory g2_one = new bytes[](1);
+        g2_one[0] = g2base;
+        bytes memory eg2 = Bls12381.g2msm(Bls12381.concatMSM_G2(g2_one, sc_one));
+        bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
         bytes memory neg_g1_plus_bpp = Bls12381.g1neg(g1PlusBpp);
-        bool ok = Verify.verifyPairing(srec.A, pkG2, neg_g1_plus_bpp, g2base);
+        bool ok = Verify.verifyPairing(srec.A, pk_plus_eg2, neg_g1_plus_bpp, g2base);
         require(ok, "pairing fail");
         srec.status = Status.Verified;
         emit Confirmed(name, sid);
@@ -287,7 +292,13 @@ contract CredentialRegistry {
             base = Bls12381.g1add(base, sumRevealed);
         }
         bytes memory g1PlusBpp = Bls12381.g1add(g1, base);
-        return Verify.verifyPairing(srec.A, pkG2, Bls12381.g1neg(g1PlusBpp), g2base);
+        // Include e in debug pairing as well
+        uint256[] memory sc_one = _oneScalar(srec.e);
+        bytes[] memory g2_one = new bytes[](1);
+        g2_one[0] = g2base;
+        bytes memory eg2 = Bls12381.g2msm(Bls12381.concatMSM_G2(g2_one, sc_one));
+        bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
+        return Verify.verifyPairing(srec.A, pk_plus_eg2, Bls12381.g1neg(g1PlusBpp), g2base);
     }
 
     // --- helpers ---

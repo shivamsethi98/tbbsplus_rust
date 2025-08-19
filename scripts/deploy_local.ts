@@ -2,7 +2,7 @@ import { ethers } from "hardhat";
 
 async function main() {
   const [owner] = await ethers.getSigners();
-  const credName = process.env.CRED_NAME || "IITH_UG_AC";
+  const credName = process.env.CRED_NAME || "ANON_CRED";
   const messageCount = Number(process.env.MESSAGE_COUNT || 5);
   const t = Number(process.env.THRESHOLD || 3);
   const n = Number(process.env.TOTAL || 4);
@@ -29,6 +29,12 @@ async function main() {
   const request = await Request.connect(owner).deploy();
   await request.waitForDeployment();
 
+  // Wire Request <-> Registry:
+  // 1) Allow RequestCredential to record request data into the registry
+  await (await (registry as any).connect(owner).setRequestContract(await request.getAddress())).wait();
+  // 2) Let RequestCredential know the registry so it can forward request metadata post-PoK
+  await (await (request as any).connect(owner).setRegistry(await registry.getAddress())).wait();
+
   const Relay = await ethers.getContractFactory("PartialSignatureRelay");
   const relay = await Relay.connect(owner).deploy(await params.getAddress());
   await relay.waitForDeployment();
@@ -42,3 +48,4 @@ async function main() {
 }
 
 main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+
