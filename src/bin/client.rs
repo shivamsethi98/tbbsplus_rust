@@ -24,6 +24,24 @@ use ethers::types::TxHash;
 use ethers::types::H256;
 use futures::StreamExt;
 
+// Bring solidity helpers into scope directly
+use tbbsplus_rust::orchestration::helpers::{
+    decode_commitment_pok_for_onchain,
+    persist_share,
+    load_persisted_shares,
+    persist_request_meta,
+    u256_to_fr,
+    build_commitment_pok,
+    fr_to_u256,
+    keccak_to_fr,
+    fq_to_be64,
+    g1_to_eip2537_bytes,
+    fq2_to_be64_pair,
+    g2_to_eip2537_bytes,
+    eip2537_g1_to_affine,
+    eip2537_g2_to_affine,
+};
+
 abigen!(
     RequestCredential,
     "artifacts/contracts/RequestCredential.sol/RequestCredential.json"
@@ -53,6 +71,83 @@ async fn interactive_local_actions(
     // Delegate to common action loop using on-disk artifacts
     persist_and_optionally_present(user_id, client, params_contract, cred_name, 0, sid, Vec::new()).await
 }
+
+fn persist_revealed_pairs(
+    user_id: &str,
+    cred_name: &str,
+    sid: u64,
+    revealed_idx: &Vec<u32>,
+    revealed_vals: &Vec<U256>,
+) -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::PathBuf;
+    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid)].iter().collect();
+    fs::create_dir_all(&dir)?;
+    let vals_hex: Vec<String> = revealed_vals.iter().map(|v| {
+        let mut be = [0u8; 32];
+        v.to_big_endian(&mut be);
+        format!("0x{}", hex::encode(be))
+    }).collect();
+    let obj = serde_json::json!({
+        "idx": revealed_idx,
+        "vals": vals_hex,
+    });
+    fs::write(dir.join("revealed.json"), serde_json::to_vec_pretty(&obj)?)?;
+    Ok(())
+}
+
+pub fn load_revealed_pairs(
+    user_id: &str,
+    cred_name: &str,
+    sid: u64,
+) -> anyhow::Result<Option<Vec<(u32, Fr)>>> {
+    use std::fs;
+    use std::path::PathBuf;
+    let p: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid), "revealed.json"].iter().collect();
+    if !p.exists() { return Ok(None); }
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(p)?)?;
+    let idx_arr = v.get("idx").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.idx"))?;
+    let vals_arr = v.get("vals").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.vals"))?;
+    if idx_arr.len() != vals_arr.len() { return Ok(None); }
+    let mut out = Vec::with_capacity(idx_arr.len());
+    for (i_v, s_v) in idx_arr.iter().zip(vals_arr.iter()) {
+        let i_u32 = i_v.as_u64().ok_or_else(|| anyhow::anyhow!("idx not u64"))? as u32;
+        let s = s_v.as_str().ok_or_else(|| anyhow::anyhow!("val not string"))?;
+        let u = if s.starts_with("0x") { U256::from_str_radix(&s[2..], 16)? } else { U256::from_dec_str(s)? };
+        let fr: Fr = u256_to_fr(&u);
+        out.push((i_u32, fr));
+    }
+    Ok(Some(out))
+}
+
+fn prompt_line(prompt: &str) -> anyhow::Result<String> {
+    if !prompt.is_empty() { print!("{}: ", prompt); io::stdout().flush()?; }
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    Ok(s.trim_end().to_string())
+}
+
+fn prompt_parse_u64(prompt: &str, default: u64) -> anyhow::Result<u64> {
+    let l = prompt_line(&format!("{} [default: {}]", prompt, default))?;
+    if l.trim().is_empty() { return Ok(default); }
+    Ok(l.trim().parse()?)
+}
+
+fn parse_revealed(line: &str) -> anyhow::Result<(Vec<u32>, Vec<U256>)> {
+    let mut idx = Vec::new();
+    let mut vals = Vec::new();
+    for part in line.split(',') {
+        let p = part.trim();
+        if p.is_empty() { continue; }
+        let mut it = p.split('=');
+        let i: u32 = it.next().ok_or_else(|| anyhow::anyhow!("bad pair"))?.trim().parse()?;
+        let v_str = it.next().ok_or_else(|| anyhow::anyhow!("bad pair"))?.trim();
+        let v = if v_str.starts_with("0x") { U256::from_str_radix(&v_str[2..], 16)? } else { U256::from_dec_str(v_str)? };
+        idx.push(i); vals.push(v);
+    }
+    Ok((idx, vals))
+}
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -166,11 +261,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle debug command early and exit
     if let Mode::DebugG2 = mode {
-        let pc = params_contract.get_params_by_name(cred_name.to_string()).call().await?;
-        let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
-        let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
-        let g2_bytes = g2_to_eip2537_bytes(&params_bbs.g2);
-        let g2_hex = format!("0x{}", hex::encode(g2_bytes));
+        // Fetch g2 base from Params and print
+        let g1h0g2 = params_contract.get_g1h0g2_by_name(cred_name.to_string()).call().await?;
+        let g2_bytes: ethers::types::Bytes = g1h0g2.2;
+        let g2_hex = format!("0x{}", hex::encode(&g2_bytes.0));
         println!("G2_BASE_256={}", g2_hex);
         let _ = std::fs::write(".runtime.g2_base.hex", &g2_hex);
         return Ok(());
@@ -187,8 +281,15 @@ async fn main() -> anyhow::Result<()> {
             // Fetch on-chain params to know message_count and match params generation
             let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
             let mcount_onchain: u32 = pc.message_count.as_u64() as u32;
-            // Load params from smart contract to avoid off-chain derivation mismatch
-            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
+            // Rebuild BBS+ params from on-chain values
+            let (g1_b, h0_b, g2_b) = params_contract.get_g1h0g2_by_name(cred_name.clone()).call().await?;
+            let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
+            let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
+            let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
+            let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.clone()).call().await?;
+            let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+            for hb in h_bytes { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
+            let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
 
             // Ensure index 0 is revealed and equals sid
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) {
@@ -531,34 +632,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prompt_line(prompt: &str) -> anyhow::Result<String> {
-    if !prompt.is_empty() { print!("{}: ", prompt); io::stdout().flush()?; }
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    Ok(s.trim_end().to_string())
-}
-
-fn prompt_parse_u64(prompt: &str, default: u64) -> anyhow::Result<u64> {
-    let l = prompt_line(&format!("{} [default: {}]", prompt, default))?;
-    if l.trim().is_empty() { return Ok(default); }
-    Ok(l.trim().parse()?)
-}
-
-fn parse_revealed(line: &str) -> anyhow::Result<(Vec<u32>, Vec<U256>)> {
-    let mut idx = Vec::new();
-    let mut vals = Vec::new();
-    for part in line.split(',') {
-        let p = part.trim();
-        if p.is_empty() { continue; }
-        let mut it = p.split('=');
-        let i: u32 = it.next().ok_or_else(|| anyhow::anyhow!("bad pair"))?.trim().parse()?;
-        let v_str = it.next().ok_or_else(|| anyhow::anyhow!("bad pair"))?.trim();
-        let v = if v_str.starts_with("0x") { U256::from_str_radix(&v_str[2..], 16)? } else { U256::from_dec_str(v_str)? };
-        idx.push(i); vals.push(v);
-    }
-    Ok((idx, vals))
-}
-
 async fn verify_with_shares(
     params_contract: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     cred_name: &str,
@@ -584,12 +657,14 @@ async fn verify_with_shares(
     match bbs_plus::threshold::threshold_bbs_plus::BBSPlusSignatureShare::aggregate(sig_shares) {
         Ok(signature) => {
             println!("Client: aggregated signature: A={:?} e={:?} s={:?}", signature.A, signature.e, signature.s);
-            // Load params and pkG2 from smart contract
-            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
-            let pk_bytes = pc.pk_g2.clone();
-            if pk_bytes.0.is_empty() { anyhow::bail!("pkG2 not set on-chain for credential {}", cred_name); }
-            let pk_aff = eip2537_g2_to_affine(&pk_bytes.0[..])?;
-            let pk = PublicKeyG2::<Bls12_381>(pk_aff);
+            // Reconstruct public key deterministically
+            // Params must match issuers (label-derived from cred_name and message_count), not RNG-generated.
+            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
+            // Match TTP: secret is generated from StdRng seeded with 42 with no prior RNG usage here.
+            let mut rng_sk = StdRng::seed_from_u64(42);
+            let (secret, _shares, _poly) = secret_sharing_and_dkg::shamir_ss::deal_random_secret(&mut rng_sk, onchain_t, onchain_n)
+                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
+            let pk = PublicKeyG2::generate_using_secret_key(&SecretKey(secret), &params_bbs);
             // Blind signatures must be unblinded before verification if blinding was used
             let sig_to_verify = if let Some(b) = blinding { signature.unblind(&b) } else { signature };
             match sig_to_verify.verify(&messages, pk, params_bbs) {
@@ -696,11 +771,11 @@ async fn persist_and_optionally_present(
         std::io::stdin().read_line(&mut line)?;
         let choice = line.trim().to_lowercase();
         if choice.is_empty() || choice == "v" || choice == "verify" {
-            let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
-            let pk_bytes = pc.pk_g2.clone();
-            if pk_bytes.0.is_empty() { anyhow::bail!("pkG2 not set on-chain for credential {}", cred_name); }
-            let pk_aff = eip2537_g2_to_affine(&pk_bytes.0[..])?;
-            let pk = PublicKeyG2::<Bls12_381>(pk_aff);
+            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(cred_name.as_bytes(), onchain_mcount);
+            let mut rng_sk = StdRng::seed_from_u64(42);
+            let (secret, _shares, _poly) = secret_sharing_and_dkg::shamir_ss::deal_random_secret::<_, Fr>(&mut rng_sk, onchain_t, onchain_n)
+                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
+            let pk = PublicKeyG2::generate_using_secret_key(&SecretKey(secret), &params_bbs);
             let sig_for_verify = {
                 let bpath = base.join("blinding.hex");
                 if let Ok(s) = fs::read_to_string(&bpath) {
@@ -775,7 +850,15 @@ async fn persist_and_optionally_present(
         };
 
         // Rebuild params and signature types
-        let params_bbs = load_params_from_sc(&params_contract, &cred_name).await?;
+        // Rebuild BBS+ params from Params
+        let (g1_b, h0_b, g2_b) = params_contract.get_g1h0g2_by_name(cred_name.to_string()).call().await?;
+        let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
+        let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
+        let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
+        let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.to_string()).call().await?;
+        let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+        for hb in h_bytes { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
+        let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
         // Use in-memory aggregated signature; try to unblind using persisted blinding if available
         let sig_struct = {
             // Attempt to read blinding from known locations
@@ -810,8 +893,12 @@ async fn persist_and_optionally_present(
         let message_iter = messages.iter().enumerate().map(|(i, m)| {
             if revealed_msgs.contains_key(&i) { MessageOrBlinding::RevealMessage(m) } else { MessageOrBlinding::BlindMessageRandomly(m) }
         });
-        let pok = bbs_plus::proof::PoKOfSignatureG1Protocol::<Bls12_381>::init(&mut rng, &sig_struct, &params_bbs, message_iter)
-            .map_err(|e| anyhow::anyhow!("pok init failed: {:?}", e))?;
+        // Fetch opener Ybar and use init_with_encryption for strict binding with enc relation
+        let ybar_bytes = params_contract.get_opener_ybar_by_name(cred_name.to_string()).call().await?;
+        if ybar_bytes.0.len() != 128 { anyhow::bail!("opener Ybar missing or wrong length"); }
+        let ybar_aff = eip2537_g1_to_affine(&ybar_bytes.0[..])?;
+        let pok = bbs_plus::proof::PoKOfSignatureG1Protocol::<Bls12_381>::init_with_encryption(&mut rng, &sig_struct, &params_bbs, message_iter, &ybar_aff)
+            .map_err(|e| anyhow::anyhow!("pok init_with_encryption failed: {:?}", e))?;
         // Transcript and challenge (keccak to Fr)
         let mut transcript = Vec::new();
         pok.challenge_contribution(&revealed_msgs, &params_bbs, &mut transcript)
@@ -1009,9 +1096,16 @@ async fn persist_and_optionally_present(
             );
             println!("[present debug] verifyPairing with derived pk -> ok1={} ok2={}", ok_pair_derived_1, ok_pair_derived_2);
 
+            // Encryption extras from proof
+            let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
+            let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
+            let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
+            let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
+            let params_addr_u8: [u8; 20] = params_contract.address().into();
+            let params_addr_eth: Address = Address::from(params_addr_u8);
             match contract
                 .method::<_, bool>(
-                    "verifyPokWithPairing",
+                    "verifyPokEncWithPairingFromParams",
                     (
                         sig_t,
                         ctx_t,
@@ -1019,8 +1113,12 @@ async fn persist_and_optionally_present(
                         challenge_u256,
                         p1_t,
                         p2_t,
-                        pk_g2,
-                        ethers::types::Bytes::from(g2_base.to_vec()),
+                        t2enc_b,
+                        t_enc_b,
+                        resp_a3_u,
+                        resp_k_u,
+                        cred_name.to_string(),
+                        params_addr_eth,
                     ),
                 )?
                 .call()
@@ -1051,400 +1149,6 @@ async fn persist_and_optionally_present(
     Ok(())
 }
 
-fn persist_revealed_pairs(
-    user_id: &str,
-    cred_name: &str,
-    sid: u64,
-    revealed_idx: &Vec<u32>,
-    revealed_vals: &Vec<U256>,
-) -> anyhow::Result<()> {
-    use std::fs;
-    use std::path::PathBuf;
-    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid)].iter().collect();
-    fs::create_dir_all(&dir)?;
-    let vals_hex: Vec<String> = revealed_vals.iter().map(|v| {
-        let mut be = [0u8; 32];
-        v.to_big_endian(&mut be);
-        format!("0x{}", hex::encode(be))
-    }).collect();
-    let obj = serde_json::json!({
-        "idx": revealed_idx,
-        "vals": vals_hex,
-    });
-    fs::write(dir.join("revealed.json"), serde_json::to_vec_pretty(&obj)?)?;
-    Ok(())
-}
 
-fn load_revealed_pairs(
-    user_id: &str,
-    cred_name: &str,
-    sid: u64,
-) -> anyhow::Result<Option<Vec<(u32, Fr)>>> {
-    use std::fs;
-    use std::path::PathBuf;
-    let p: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid), "revealed.json"].iter().collect();
-    if !p.exists() { return Ok(None); }
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(p)?)?;
-    let idx_arr = v.get("idx").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.idx"))?;
-    let vals_arr = v.get("vals").and_then(|x| x.as_array()).ok_or_else(|| anyhow::anyhow!("bad revealed.vals"))?;
-    if idx_arr.len() != vals_arr.len() { return Ok(None); }
-    let mut out = Vec::with_capacity(idx_arr.len());
-    for (i_v, s_v) in idx_arr.iter().zip(vals_arr.iter()) {
-        let i_u32 = i_v.as_u64().ok_or_else(|| anyhow::anyhow!("idx not u64"))? as u32;
-        let s = s_v.as_str().ok_or_else(|| anyhow::anyhow!("val not string"))?;
-        let u = if s.starts_with("0x") { U256::from_str_radix(&s[2..], 16)? } else { U256::from_dec_str(s)? };
-        let fr: Fr = u256_to_fr(&u);
-        out.push((i_u32, fr));
-    }
-    Ok(Some(out))
-}
 
-fn fq_to_be64(x: &Fq) -> [u8; 64] {
-    let bi = x.into_bigint();
-    let limbs: [u64; 6] = bi.0;
-    let mut le48 = [0u8; 48];
-    for (i, limb) in limbs.iter().enumerate() {
-        le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    let mut be48 = [0u8; 48];
-    for i in 0..48 { be48[i] = le48[47 - i]; }
-    let mut out = [0u8; 64];
-    out[16..].copy_from_slice(&be48);
-    out
-}
 
-fn g1_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine) -> [u8; 128] {
-    let (x, y) = (p.x, p.y);
-    let xb = fq_to_be64(&x);
-    let yb = fq_to_be64(&y);
-    let mut out = [0u8; 128];
-    out[..64].copy_from_slice(&xb);
-    out[64..].copy_from_slice(&yb);
-    out
-}
-
-fn fq2_to_be64_pair(x_c0: &Fq, x_c1: &Fq) -> [u8; 128] {
-    let x0 = fq_to_be64(x_c0);
-    let x1 = fq_to_be64(x_c1);
-    let mut out = [0u8; 128];
-    out[..64].copy_from_slice(&x0);
-    out[64..].copy_from_slice(&x1);
-    out
-}
-
-fn g2_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine) -> [u8; 256] {
-    use ark_bls12_381::Fq2;
-    let (x, y) = (p.x, p.y);
-    let mut out = [0u8; 256];
-    let xbe = fq2_to_be64_pair(&x.c0, &x.c1);
-    let ybe = fq2_to_be64_pair(&y.c0, &y.c1);
-    out[..128].copy_from_slice(&xbe);
-    out[128..].copy_from_slice(&ybe);
-    out
-}
-
-fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
-    use ark_ec::AffineRepr;
-    if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
-    let mut x_be48 = [0u8; 48];
-    let mut y_be48 = [0u8; 48];
-    x_be48.copy_from_slice(&bytes128[16..64]);
-    y_be48.copy_from_slice(&bytes128[80..128]);
-    let x = Fq::from_be_bytes_mod_order(&x_be48);
-    let y = Fq::from_be_bytes_mod_order(&y_be48);
-    let p = ark_bls12_381::G1Affine::new(x, y);
-    Ok(p)
-}
-
-fn eip2537_g2_to_affine(bytes256: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine> {
-    use ark_bls12_381::{Fq, Fq2};
-    use ark_ec::AffineRepr;
-    if bytes256.len() != 256 { anyhow::bail!("bad g2 len"); }
-    // x.c0 (first 64), x.c1 (next 64), y.c0 (next 64), y.c1 (last 64)
-    let x_c0_be = &bytes256[0..64];
-    let x_c1_be = &bytes256[64..128];
-    let y_c0_be = &bytes256[128..192];
-    let y_c1_be = &bytes256[192..256];
-    let fq_from_be64 = |be64: &[u8]| -> Fq {
-        // be64 has 64 bytes where the last 48 are the big-endian field element and the first 16 are zero padding
-        let mut be48 = [0u8; 48];
-        be48.copy_from_slice(&be64[16..64]);
-        Fq::from_be_bytes_mod_order(&be48)
-    };
-    let x = Fq2 { c0: fq_from_be64(x_c0_be), c1: fq_from_be64(x_c1_be) };
-    let y = Fq2 { c0: fq_from_be64(y_c0_be), c1: fq_from_be64(y_c1_be) };
-    Ok(ark_bls12_381::G2Affine::new(x, y))
-}
-
-async fn load_params_from_sc(
-    params: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
-    name: &str,
-) -> anyhow::Result<SignatureParamsG1<Bls12_381>> {
-    let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(name.to_string()).call().await?;
-    let h_vec: Vec<ethers::types::Bytes> = params.get_h_by_name(name.to_string()).call().await?;
-    let g1 = eip2537_g1_to_affine(&g1_b.0)?;
-    let h0 = eip2537_g1_to_affine(&h0_b.0)?;
-    let g2 = eip2537_g2_to_affine(&g2_b.0)?;
-    let mut h = Vec::with_capacity(h_vec.len());
-    for hb in h_vec.iter() { h.push(eip2537_g1_to_affine(&hb.0)?); }
-    Ok(SignatureParamsG1 { g1, g2, h_0: h0, h })
-}
-
-// fn bls12_381_g2_generator_bytes() -> [u8; 256] {
-//     use ark_ec::CurveGroup;
-//     let gen = <ark_bls12_381::G2Projective as CurveGroup>::Affine::generator();
-//     g2_to_eip2537_bytes(&gen)
-// }
-
-fn fr_to_u256(fr: &Fr) -> U256 {
-    let bi = fr.into_bigint();
-    let limbs: [u64; 4] = bi.0;
-    let mut le32 = [0u8; 32];
-    for (i, limb) in limbs.iter().enumerate() {
-        le32[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    let mut be32 = [0u8; 32];
-    for i in 0..32 { be32[i] = le32[31 - i]; }
-    U256::from_big_endian(&be32)
-}
-
-fn keccak_to_fr(bytes: &[u8]) -> Fr {
-    use sha3::Digest;
-    let mut h = sha3::Keccak256::new();
-    h.update(bytes);
-    let out = h.finalize();
-    Fr::from_be_bytes_mod_order(&out)
-}
-
-async fn probe_msm_precompiles(
-    client: &std::sync::Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
-    params: &SignatureParamsG1<Bls12_381>,
-    proof: &bbs_plus::proof::PoKOfSignatureG1Proof<Bls12_381>,
-    revealed_idx: &Vec<u32>,
-    messages: &Vec<Fr>,
-    c_fr: &Fr,
-) -> anyhow::Result<()> {
-    use ethers::types::Address;
-    let g1add: Address = "0x000000000000000000000000000000000000000b".parse()?;
-    let g1msm: Address = "0x000000000000000000000000000000000000000c".parse()?;
-    // Check one MSM input shape: g1*1
-    let g1 = EthBytes::from(g1_to_eip2537_bytes(&params.g1).to_vec());
-    if g1.len() != 128 { eprintln!("[debug] ctx.g1 not 128 bytes: {}", g1.len()); }
-    let mut data = Vec::with_capacity(160);
-    data.extend_from_slice(&g1);
-    data.extend_from_slice(&[0u8; 31]);
-    data.push(1u8); // scalar 1
-    let call_req = serde_json::json!([{ "to": format!("0x{:040x}", g1msm), "data": format!("0x{}", hex::encode(&data)) }, "latest"]);
-    match client.provider().request::<serde_json::Value, String>("eth_call", call_req).await {
-        Ok(s) => {
-            let out_bytes = hex::decode(s.trim_start_matches("0x")).unwrap_or_default();
-            if out_bytes.len() != 128 { eprintln!("[debug] g1msm(g1*1) returned {} bytes", out_bytes.len()); }
-        }
-        Err(e) => {
-            eprintln!("[debug] eth_call g1msm probe error: {:?}", e);
-        }
-    }
-    // Check T1 size
-    let t1 = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
-    if t1.len() != 128 { eprintln!("[debug] p1.T1 not 128 bytes: {}", t1.len()); }
-    // Check T2 size
-    let t2 = EthBytes::from(g1_to_eip2537_bytes(&proof.T2).to_vec());
-    if t2.len() != 128 { eprintln!("[debug] p2.T2 not 128 bytes: {}", t2.len()); }
-    // Check respMsgs count
-    let undis = (params.h.len() as usize) - revealed_idx.len();
-    if let Some(sc2) = &proof.sc_resp_2 { if sc2.0.len() != undis + 2 { eprintln!("[debug] responses count {} != expected {} (undis+2)", sc2.0.len(), undis+2); } }
-    Ok(())
-}
-
-fn u256_to_fr<F: PrimeField>(v: &U256) -> F {
-    let mut be = [0u8; 32];
-    v.to_big_endian(&mut be);
-    F::from_be_bytes_mod_order(&be)
-}
-
-fn build_commitment_pok(
-    params: &SignatureParamsG1<Bls12_381>,
-    commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
-    hidden_msgs: &std::collections::BTreeMap<usize, Fr>,
-    blinding: &Fr,
-    mcount: u32,
-    sid: u64,
-    cred_name: &str,
-    revealed_idx: &Vec<u32>,
-    revealed_vals: &Vec<U256>,
-    context: &Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
-    use ark_ec::AffineRepr;
-    use std::collections::BTreeMap;
-
-    // Bases for Schnorr: [h_0] for blinding, and [h_i] for each hidden i
-    let mut bases = Vec::with_capacity(1 + hidden_msgs.len());
-    bases.push(params.h_0);
-    let mut witnesses = Vec::with_capacity(1 + hidden_msgs.len());
-    witnesses.push(*blinding);
-    let mut hidden_indices_sorted: Vec<usize> = hidden_msgs.keys().copied().collect();
-    hidden_indices_sorted.sort_unstable();
-    for i in hidden_indices_sorted.iter() {
-        bases.push(params.h[*i]);
-        witnesses.push(*hidden_msgs.get(i).unwrap());
-    }
-    // y is the commitment; not used directly here as we serialize t and verify at issuers
-    // Random blindings for Schnorr
-    let mut rng = StdRng::seed_from_u64(rand::random::<u64>());
-    let blindings = (0..witnesses.len()).map(|_| Fr::rand(&mut rng)).collect::<Vec<_>>();
-    let comm = SchnorrCommitment::new(&bases, blindings);
-
-    // Transcript for challenge: domain separator + sid + name + mcount + revealed pairs sorted + hidden idx set + commitment + t + context
-    let mut chal_bytes = Vec::new();
-    chal_bytes.extend_from_slice(b"TBBS+_Blind_PoK_v1");
-    chal_bytes.extend_from_slice(&sid.to_be_bytes());
-    chal_bytes.extend_from_slice(&(mcount as u64).to_be_bytes());
-    chal_bytes.extend_from_slice(cred_name.as_bytes());
-    // revealed pairs sorted by idx
-    let mut pairs: Vec<(u32, &U256)> = revealed_idx.iter().cloned().zip(revealed_vals.iter()).collect();
-    pairs.sort_by_key(|(i, _)| *i);
-    for (i, v) in pairs.into_iter() {
-        chal_bytes.extend_from_slice(&i.to_be_bytes());
-        let mut be = [0u8; 32];
-        v.to_big_endian(&mut be);
-        chal_bytes.extend_from_slice(&be);
-    }
-    // hidden indices
-    for i in hidden_indices_sorted.iter() {
-        let i_u32 = *i as u32;
-        chal_bytes.extend_from_slice(&i_u32.to_be_bytes());
-    }
-    // commitment and Schnorr t contribution
-    commitment.serialize_compressed(&mut chal_bytes)?;
-    SchnorrChallengeContributor::challenge_contribution(&comm, &mut chal_bytes)
-        .map_err(|e| anyhow::anyhow!("challenge_contribution failed: {:?}", e))?;
-    // context
-    chal_bytes.extend_from_slice(context);
-
-    // Compute challenge using Blake2b512
-    let c: Fr = compute_random_oracle_challenge::<Fr, Blake2b512>(&chal_bytes);
-    let resp = comm.response(&witnesses, &c)
-        .map_err(|e| anyhow::anyhow!("Schnorr response failed: {:?}", e))?;
-
-    // Serialize proof bytes: hidden_len || hidden_indices || t || c || rlen || responses
-    let mut out = Vec::new();
-    // encode hidden count and indices
-    let hidden_len = hidden_indices_sorted.len() as u32;
-    out.extend_from_slice(&hidden_len.to_be_bytes());
-    for i in hidden_indices_sorted.iter() {
-        let i_u32 = *i as u32;
-        out.extend_from_slice(&i_u32.to_be_bytes());
-    }
-    // encode t (commitment to randomness)
-    comm.t.serialize_compressed(&mut out)?;
-    // encode challenge c
-    c.serialize_compressed(&mut out)?;
-    // encode responses count and values
-    let rlen = resp.len() as u32;
-    out.extend_from_slice(&rlen.to_be_bytes());
-    for j in 0..resp.len() {
-        let rj = resp.get_response(j)
-            .map_err(|e| anyhow::anyhow!("get_response failed: {:?}", e))?;
-        rj.serialize_compressed(&mut out)?;
-    }
-    Ok(out)
-}
-
-// Decode the locally-built commitment PoK into fields needed for on-chain verification
-fn decode_commitment_pok_for_onchain(
-    proof_bytes: &[u8]
-) -> anyhow::Result<(Vec<u32>, EthBytes, U256, Vec<U256>)> {
-    use ark_serialize::CanonicalDeserialize;
-    use std::io::Read;
-    // hidden_len || hidden_indices || T || c || rlen || responses
-    let mut rdr = std::io::Cursor::new(proof_bytes);
-    let mut u32buf = [0u8; 4];
-    rdr.read_exact(&mut u32buf)?;
-    let hidden_len = u32::from_be_bytes(u32buf) as usize;
-    let mut hidden_idx = Vec::with_capacity(hidden_len);
-    for _ in 0..hidden_len { rdr.read_exact(&mut u32buf)?; hidden_idx.push(u32::from_be_bytes(u32buf)); }
-    let t_aff: <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine = CanonicalDeserialize::deserialize_compressed(&mut rdr)?;
-    let mut tb = [0u8; 128]; tb.copy_from_slice(&g1_to_eip2537_bytes(&t_aff));
-    let c_fr: Fr = CanonicalDeserialize::deserialize_compressed(&mut rdr)?;
-    let c_u256 = fr_to_u256(&c_fr);
-    rdr.read_exact(&mut u32buf)?;
-    let rlen = u32::from_be_bytes(u32buf) as usize;
-    let mut responses_u256 = Vec::with_capacity(rlen);
-    for _ in 0..rlen {
-        let rj: Fr = CanonicalDeserialize::deserialize_compressed(&mut rdr)?;
-        responses_u256.push(fr_to_u256(&rj));
-    }
-    Ok((hidden_idx, EthBytes::from(tb.to_vec()), c_u256, responses_u256))
-}
-
-// --- Persistence helpers for per-sid artifacts ---
-fn persist_share(user_id: &str, cred_name: &str, sid: u64, idx: u16, payload: &[u8]) -> anyhow::Result<()> {
-    use std::fs;
-    use std::path::PathBuf;
-    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid), "shares"].iter().collect();
-    fs::create_dir_all(&dir)?;
-    let fp = dir.join(format!("{}.bin", idx));
-    fs::write(fp, payload)?;
-    Ok(())
-}
-
-fn load_persisted_shares(user_id: &str, cred_name: &str, sid: u64) -> anyhow::Result<Vec<Vec<u8>>> {
-    use std::fs;
-    use std::path::PathBuf;
-    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid), "shares"].iter().collect();
-    if !dir.exists() { return Ok(Vec::new()); }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let e = entry?;
-        if e.file_type()?.is_file() {
-            out.push(fs::read(e.path())?);
-        }
-    }
-    Ok(out)
-}
-
-fn persist_request_meta(user_id: &str, cred_name: &str, sid: u64, tx_hash: TxHash, block_number: u64) -> anyhow::Result<()> {
-    use std::fs;
-    use std::path::PathBuf;
-    let dir: PathBuf = [".runtime", "users", user_id, cred_name, &format!("sid_{}", sid)].iter().collect();
-    fs::create_dir_all(&dir)?;
-    let meta = serde_json::json!({
-        "tx": format!("0x{:x}", tx_hash),
-        "block": block_number,
-    });
-    fs::write(dir.join("request_meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-    Ok(())
-}
-
-async fn find_request_block(
-    req: &RequestCredential<SignerMiddleware<Provider<Ws>, LocalWallet>>,
-    sid: u64,
-) -> anyhow::Result<Option<u64>> {
-    use std::fs;
-    use std::path::PathBuf;
-    // First try persisted meta
-    let cred_name = std::env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-    let user_id = std::env::var("USER_ID").unwrap_or_else(|_| "unknown".into());
-    let p: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid), "request_meta.json"].iter().collect();
-    if p.exists() {
-        if let Ok(bytes) = fs::read(&p) {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(b) = v.get("block").and_then(|x| x.as_u64()) { return Ok(Some(b)); }
-            }
-        }
-    }
-    // Fallback: query recent logs for this sid and return its block
-    let evs = req
-        .event::<request_credential::SigReqBBSPlusVerifiedFilter>()
-        .from_block(0u64)
-        .query()
-        .await?;
-    for ev in evs.into_iter().rev() {
-        if ev.sid.as_u64() == sid {
-            // We don't have block_number in the filter type; use log_index/transaction_hash as hints not needed here
-            // Fallback to current latest block number from provider if available via the contract client
-            return Ok(Some(0u64));
-        }
-    }
-    Ok(None)
-}

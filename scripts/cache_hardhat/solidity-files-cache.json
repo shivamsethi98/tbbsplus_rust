@@ -117,8 +117,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/lib/Bls12381.sol": {
-      "lastModificationDate": 1755580985524,
-      "contentHash": "84359bf3e95c168d8af249bcd6f0672f",
+      "lastModificationDate": 1755603217617,
+      "contentHash": "a93b4d8d9426824c925ddd46e8ea6d6c",
       "sourceName": "contracts/lib/Bls12381.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -193,8 +193,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Verify.sol": {
-      "lastModificationDate": 1755586019077,
-      "contentHash": "36cb4b67ff02d58c6d58fd73e6dd1090",
+      "lastModificationDate": 1755949305983,
+      "contentHash": "d13c4da42352c88aecac3314cf8c52e8",
       "sourceName": "contracts/Verify.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -235,8 +235,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Params.sol": {
-      "lastModificationDate": 1755581770652,
-      "contentHash": "d2833613585f270eda694e18b31c5e2b",
+      "lastModificationDate": 1755949305983,
+      "contentHash": "057186c89f96effe47dd20820db88cbf",
       "sourceName": "contracts/Params.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -272,7 +272,7 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/PartialSignatureRelay.sol": {
-      "lastModificationDate": 1755580985524,
+      "lastModificationDate": 1755589745826,
       "contentHash": "18e4d1bc81bf9b151b53d7fe93341b73",
       "sourceName": "contracts/PartialSignatureRelay.sol",
       "solcConfig": {
@@ -350,8 +350,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CredentialRegistry.sol": {
-      "lastModificationDate": 1755586692431,
-      "contentHash": "163e69bd30e48e8cb1308957ad2e95ab",
+      "lastModificationDate": 1755618749037,
+      "contentHash": "b1218eac1238b3d6f87ffdab125b3f31",
       "sourceName": "contracts/CredentialRegistry.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -429,8 +429,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/RequestCredential.sol": {
-      "lastModificationDate": 1755586692431,
-      "contentHash": "b88718b41cd714fa8a8e2506a4228947",
+      "lastModificationDate": 1755590438124,
+      "contentHash": "1b2476b364918921181279ed5e1ecdd8",
       "sourceName": "contracts/RequestCredential.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -458,13 +458,13 @@
         }
       },
       "imports": [
-        "./CommitmentPokVerify.sol",
-        "./CredentialRegistry.sol"
+        "./CommitmentPokVerify.sol"
       ],
       "versionPragmas": [
         "^0.8.24"
       ],
       "artifacts": [
+        "ICredentialRegistry",
         "RequestCredential"
       ]
     },

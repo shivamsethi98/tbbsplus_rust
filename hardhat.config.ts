@@ -11,6 +11,7 @@ const FORK_URL = process.env.FORK_URL || `https://mainnet.infura.io/v3/${INFURA_
 const SHOULD_FORK = process.env.FORK === "1";
 
 const config: HardhatUserConfig = {
+  defaultNetwork: process.env.HARDHAT_NETWORK || "localhost",
   solidity: {
     version: "0.8.27",
     settings: {

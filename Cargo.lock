@@ -5848,6 +5848,7 @@ dependencies = [
  "dock_crypto_utils",
  "dotenvy",
  "ethers",
+ "eyre",
  "futures",
  "hex",
  "legogroth16",

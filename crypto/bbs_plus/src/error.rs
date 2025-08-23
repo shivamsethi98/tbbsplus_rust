@@ -25,6 +25,8 @@ pub enum BBSPlusError {
     FirstSchnorrVerificationFailed,
     /// 2nd schnorr proof failed during verification of proof of knowledge of signature
     SecondSchnorrVerificationFailed,
+    /// 3rd schnorr proof (encryption relation) failed during verification of proof of knowledge of signature
+    ThirdSchnorrVerificationFailed,
     InvalidMsgIdxForResponse(usize),
     #[serde(with = "ArkSerializationError")]
     Serialization(SerializationError),

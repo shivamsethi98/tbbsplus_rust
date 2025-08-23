@@ -19,6 +19,12 @@ use ark_ec::{CurveGroup, AffineRepr};
 use ark_ff::PrimeField;
 use blake2::Blake2b512;
 use bbs_plus::prelude::*;
+use tbbsplus_rust::orchestration::helpers::{
+    g1_to_eip2537_bytes,
+    g2_to_eip2537_bytes,
+    fq_to_be64,
+    fq2_pair_to_be,
+};
 
 abigen!(
     Params,
@@ -94,28 +100,8 @@ async fn main() -> anyhow::Result<()> {
     let pk_proj = g2.mul_bigint(secret.into_bigint());
     let pk_affine = pk_proj.into_affine();
 
-    // Serialize G2 to 256B uncompressed per EIP-2537 (x.c0||x.c1||y.c0||y.c1), big-endian padded
-    fn fq_to_be64(x: &Fq) -> [u8; 64] {
-        let bi = x.into_bigint();
-        let limbs: [u64; 6] = bi.0;
-        let mut le48 = [0u8; 48];
-        for (i, limb) in limbs.iter().enumerate() {
-            le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-        }
-        let mut be48 = [0u8; 48];
-        for i in 0..48 { be48[i] = le48[47 - i]; }
-        let mut out = [0u8; 64];
-        out[16..].copy_from_slice(&be48);
-        out
-    }
-    fn fq2_pair_to_be(x_c0: &Fq, x_c1: &Fq) -> [u8; 128] {
-        let c0 = fq_to_be64(x_c0);
-        let c1 = fq_to_be64(x_c1);
-        let mut out = [0u8; 128];
-        out[..64].copy_from_slice(&c0);
-        out[64..].copy_from_slice(&c1);
-        out
-    }
+
+    // EIP-2537 expects FP2 limbs in (c0 || c1) order per coordinate
     let xbe = fq2_pair_to_be(&pk_affine.x.c0, &pk_affine.x.c1);
     let ybe = fq2_pair_to_be(&pk_affine.y.c0, &pk_affine.y.c1);
     let mut pk_bytes = vec![0u8; 256];
@@ -143,6 +129,24 @@ async fn main() -> anyhow::Result<()> {
     g2base_bytes[..128].copy_from_slice(&xg2);
     g2base_bytes[128..].copy_from_slice(&yg2);
     println!("export G2_BASE_256=0x{}", hex::encode(&g2base_bytes));
+
+    // --- Opener strategy: derive opener secret deterministically and compute Ybar (G1) and opener pkG2 ---
+    // For demo, derive opener secret from label + fixed suffix
+    use blake2::Digest as _;
+    let mut h = blake2::Blake2b512::new();
+    h.update(b"TBBS+_OPENER_SK_v1");
+    h.update(cred_name.as_bytes());
+    let dig = h.finalize();
+    let mut le32 = [0u8; 32];
+    le32.copy_from_slice(&dig[..32]);
+    let opener_sk = <Fr as PrimeField>::from_be_bytes_mod_order(&le32);
+    // Ybar = g1 * opener_sk
+    use ark_ec::CurveGroup as _;
+    let ybar_aff = params_bbs.g1.mul_bigint(opener_sk.into_bigint()).into_affine();
+    let ybar_bytes = g1_to_eip2537_bytes(&ybar_aff).to_vec();
+    // opener pk in G2: g2 * opener_sk
+    let opener_pk_aff = params_bbs.g2.mul_bigint(opener_sk.into_bigint()).into_affine();
+    let opener_pk_bytes = g2_to_eip2537_bytes(&opener_pk_aff).to_vec();
 
     // Also set g1, h0, H, g2base, pkG2 on-chain (requires OWNER to call onlyOwner fns)
     // Helper: convert G1 affine to 128-byte EIP-2537 format (x||y with 16-byte zero pad per coord)
@@ -198,6 +202,34 @@ async fn main() -> anyhow::Result<()> {
         .send()
         .await?
         .await?;
+
+    // Set opener keys on-chain
+    params
+        .set_opener_keys(cred_name.clone(), ybar_bytes.clone().into(), opener_pk_bytes.clone().into())
+        .send()
+        .await?
+        .await?;
+
+    // Write a .runtime.env for tests/clients to source
+    {
+        use std::io::Write as _;
+        let mut lines = String::new();
+        lines.push_str(&format!("PK_G2_HEX={}\n", pk_hex));
+        lines.push_str(&format!("G2_GEN_256=0x{}\n", hex::encode(&g2gen_bytes)));
+        lines.push_str(&format!("G2_BASE_256=0x{}\n", hex::encode(&g2base_bytes)));
+        lines.push_str(&format!("THRESHOLD={}\n", t));
+        lines.push_str(&format!("TOTAL={}\n", n));
+        lines.push_str(&format!("OPENER_YBAR_128=0x{}\n", hex::encode(&ybar_bytes)));
+        lines.push_str(&format!("OPENER_PK_G2_256=0x{}\n", hex::encode(&opener_pk_bytes)));
+        
+        use std::fs::OpenOptions;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(".runtime.env")?;
+        file.write_all(lines.as_bytes())?;
+        println!("Appended to .runtime.env with PK_G2_HEX, G2_GEN_256, G2_BASE_256");
+    }
 
     // Discover issuers and their indices
     let issuers: Vec<Address> = params.get_issuers().call().await?;

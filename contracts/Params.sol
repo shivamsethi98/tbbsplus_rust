@@ -29,6 +29,9 @@ contract Params {
     bytes g2Base;
     // H vector of G1 points, 128-byte uncompressed each, length == messageCount
     bytes[] H;
+    // Opener keys for encryption/accumulator: Ybar in G1 (128B) and opener pkG2 (256B)
+    bytes openerYbarG1;
+    bytes openerPkG2;
     }
     mapping(uint256 => CredParams) private paramsById;
 
@@ -65,7 +68,9 @@ contract Params {
             g1: new bytes(0),
             h0: new bytes(0),
             g2Base: new bytes(0),
-            H: new bytes[](0)
+            H: new bytes[](0),
+            openerYbarG1: new bytes(0),
+            openerPkG2: new bytes(0)
         });
         emit ParamsSet(name, id, messageCount, t, n);
     }
@@ -97,6 +102,27 @@ contract Params {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
         return paramsById[id].pkG2;
+    }
+
+    // --- Opener keys (Ybar in G1, opener pk in G2) ---
+    function setOpenerKeys(string memory name, bytes calldata ybarG1, bytes calldata pkG2) external onlyOwner {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        require(ybarG1.length == 128 && pkG2.length == 256, "bad opener lens");
+        paramsById[id].openerYbarG1 = ybarG1;
+        paramsById[id].openerPkG2 = pkG2;
+    }
+
+    function getOpenerYbarByName(string memory name) external view returns (bytes memory) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        return paramsById[id].openerYbarG1;
+    }
+
+    function getOpenerPkG2ByName(string memory name) external view returns (bytes memory) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        return paramsById[id].openerPkG2;
     }
 
     event ParamsG1H0G2Set(string indexed name);

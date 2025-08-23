@@ -12,6 +12,13 @@ export interface RustPokJson {
   challenge: string; // decimal or 0x hex
   respA: string; respH0: string; respR3: string; respSPrime: string;
   respMsgs: string[];
+  // Optional encryption relation
+  Ybar?: Hex;
+  T1enc?: Hex;
+  T2enc?: Hex;
+  Tenc?: Hex;
+  respA3?: string;
+  respK?: string;
 }
 
 export function loadPokJson(filePath: string): RustPokJson {

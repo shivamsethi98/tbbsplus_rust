@@ -134,30 +134,22 @@ async fn main() -> anyhow::Result<()> {
     let handle = mesh.run_background();
 
     // --- Load TTP-dealt key share and construct params ---
-    // Load SignatureParamsG1 directly from smart contract to avoid any off-chain derivation mismatch
-    async fn load_params_from_sc(
-        params: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
-        name: &str,
-    ) -> anyhow::Result<SignatureParamsG1<Bls12_381>> {
-        let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(name.to_string()).call().await?;
-        let h_vec: Vec<ethers::types::Bytes> = params.get_h_by_name(name.to_string()).call().await?;
-        fn g1_from_eip(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
-            use ark_bls12_381::Fq; use ark_ec::AffineRepr; if bytes128.len()!=128 { anyhow::bail!("bad g1 len"); }
-            let mut x_be48=[0u8;48]; let mut y_be48=[0u8;48]; x_be48.copy_from_slice(&bytes128[16..64]); y_be48.copy_from_slice(&bytes128[80..128]);
-            let x=Fq::from_be_bytes_mod_order(&x_be48); let y=Fq::from_be_bytes_mod_order(&y_be48); Ok(ark_bls12_381::G1Affine::new(x,y))
-        }
-        fn g2_from_eip(bytes256: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine> {
-            use ark_bls12_381::{Fq, Fq2}; use ark_ec::AffineRepr; if bytes256.len()!=256 { anyhow::bail!("bad g2 len"); }
-            let fq_from_be64 = |be64: &[u8]| -> Fq { let mut be48=[0u8;48]; be48.copy_from_slice(&be64[16..64]); Fq::from_be_bytes_mod_order(&be48) };
-            let x = Fq2 { c0: fq_from_be64(&bytes256[0..64]), c1: fq_from_be64(&bytes256[64..128]) };
-            let y = Fq2 { c0: fq_from_be64(&bytes256[128..192]), c1: fq_from_be64(&bytes256[192..256]) };
-            Ok(ark_bls12_381::G2Affine::new(x,y))
-        }
-        let g1 = g1_from_eip(&g1_b.0)?; let h0 = g1_from_eip(&h0_b.0)?; let g2 = g2_from_eip(&g2_b.0)?;
-        let mut h = Vec::with_capacity(h_vec.len()); for hb in h_vec.iter() { h.push(g1_from_eip(&hb.0)?); }
-        Ok(SignatureParamsG1 { g1, g2, h_0: h0, h })
-    }
-    let params_bbs = load_params_from_sc(&params, &cred_name).await?;
+    // Fetch BBS+ params directly from Params to avoid local derivation
+    let pc0 = params.get_params_by_name(cred_name.clone()).call().await?;
+    let onchain_mcount: u32 = pc0.message_count.as_u64() as u32;
+    if onchain_mcount != message_count { eprintln!("[issuer] WARNING: MESSAGE_COUNT env {} != on-chain {}", message_count, onchain_mcount); }
+    let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(cred_name.clone()).call().await?;
+    let mut H_bytes: Vec<ethers::types::Bytes> = params.get_h_by_name(cred_name.clone()).call().await?;
+    let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
+    let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
+    let g2 = {
+        // Simple G2 decode aligned with helpers.rs if available here; fallback not needed as we only need params type
+        use tbbsplus_rust::orchestration::helpers::eip2537_g2_to_affine as decode_g2;
+        decode_g2(&g2_b.0[..])?
+    };
+    let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(H_bytes.len());
+    for hb in H_bytes.drain(..) { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
+    let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
     let shares_file = env::var("SHARES_FILE").unwrap_or_else(|_| ".runtime.shares.json".into());
     let data = std::fs::read(&shares_file)
         .map_err(|e| anyhow::anyhow!("failed to read shares file {shares_file}: {:?}", e))?;
@@ -236,14 +228,11 @@ async fn main() -> anyhow::Result<()> {
         }
     println!("[event] SigReqBBSPlusVerified: sid={}", sid);
     // Parse commitment and PoK fields from verified event
+    // TODO: check if this is correct
     let commitment: <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine = eip2537_g1_to_affine(ev.commitment_b.as_ref())?;
     let hidden_idx: Vec<u32> = ev.hidden_idx.clone();
     let t_eip: Vec<u8> = ev.t.to_vec();
     let c_fr: Fr = u256_to_fr(&ev.challenge);
-    
-
-
-    
     let resp_fr: Vec<Fr> = ev.responses.iter().map(u256_to_fr::<Fr>).collect();
     // Fallback off-chain PoK check mirroring on-chain verification (double-check; cheap)
     let pok_res = verify_commitment_pok_from_fields(

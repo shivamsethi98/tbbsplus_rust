@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 thiserror = "1.0"
 hex = "0.4"
 dotenvy = "0.15"
+eyre = "0.6"
 
 # Additional dependencies for selective disclosure example (using local crypto libraries)
 schnorr_pok = { path = "crypto/schnorr_pok" }
@@ -53,19 +54,18 @@ name = "client"
 path = "src/bin/client.rs"
 required-features = ["mpc"]
 
-[[bin]]
-name = "client2"
-path = "src/bin/client2.rs"
-required-features = ["mpc"]
 
 [[bin]]
 name = "ttp"
 path = "src/bin/ttp.rs"
 
-# Exporter to generate PoK JSON matching TTP deterministic key
+
+
+
 [[bin]]
-name = "export_pok_json_ttp"
-path = "src/bin/export_pok_json_ttp.rs"
+name = "export_pok_json"
+path = "src/bin/export_pok_json.rs"
+
 
 # Examples
 [[example]]
@@ -96,9 +96,6 @@ path = "examples/hybrid_onchain_verification.rs"
 name = "bbs_proof_system_demo"
 path = "examples/bbs_proof_system_demo.rs"
 
-[[bin]]
-name = "cred_confirm"
-path = "src/bin/cred_confirm.rs"
 
 [[bin]]
 name = "cred_status"

@@ -130,6 +130,30 @@ async fn g1msm_many_call(provider: &std::sync::Arc<Provider<Ws>>, pts: &[&[u8]],
     Ok(EthBytes::from(out_bytes))
 }
 
+async fn g2add_call(provider: &std::sync::Arc<Provider<Ws>>, a256: &EthBytes, b256: &EthBytes) -> anyhow::Result<EthBytes> {
+    let precompile: Address = "0x000000000000000000000000000000000000000d".parse()?;
+    let data = [&a256.0[..], &b256.0[..]].concat();
+    let req = serde_json::json!([{ "to": format!("0x{:040x}", precompile), "data": format!("0x{}", hex::encode(&data)) }, "latest"]);
+    let out_hex: String = provider.request("eth_call", req).await?;
+    let out_bytes = hex::decode(out_hex.trim_start_matches("0x"))?;
+    Ok(EthBytes::from(out_bytes))
+}
+
+async fn g2msm_call(provider: &std::sync::Arc<Provider<Ws>>, p256: &EthBytes, scalars: &[U256]) -> anyhow::Result<EthBytes> {
+    let precompile: Address = "0x000000000000000000000000000000000000000e".parse()?;
+    let mut input = Vec::with_capacity(288 * scalars.len());
+    for s in scalars.iter() {
+        input.extend_from_slice(&p256.0);
+        let mut be = [0u8; 32];
+        s.to_big_endian(&mut be);
+        input.extend_from_slice(&be);
+    }
+    let req = serde_json::json!([{ "to": format!("0x{:040x}", precompile), "data": format!("0x{}", hex::encode(&input)) }, "latest"]);
+    let out_hex: String = provider.request("eth_call", req).await?;
+    let out_bytes = hex::decode(out_hex.trim_start_matches("0x"))?;
+    Ok(EthBytes::from(out_bytes))
+}
+
 fn g1neg_eip(p128: &[u8]) -> EthBytes {
     if p128.len() != 128 { return EthBytes::from_static(&[]); }
     // yNeg = (modulus - y) mod modulus; leave x unchanged; zero-pad 16 bytes
@@ -330,10 +354,11 @@ async fn main() -> anyhow::Result<()> {
                 let mut is_revealed = vec![false; mc];
                 for i in 0..ridx.len() { let j = ridx[i].as_usize(); if j < mc { is_revealed[j] = true; } }
                 for i in 0..mc {
+                    if i==0 { continue; }
                     if is_revealed[i] { continue; }
                     // hidden index i
                     pts.push(&H[i].0);
-                    let m_val = if i == 0 { U256::from(sid) } else { U256::from(100u64 + i as u64) };
+                    let m_val = U256::from(100u64 + i as u64);
                     scs.push(m_val);
                 }
                 let bprime_local = g1msm_many_call(&provider, &pts, &scs).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
@@ -350,8 +375,22 @@ async fn main() -> anyhow::Result<()> {
                 g1neg_eip(&g1_plus_bpp.0)
             };
 
-            // Pairing via VerifyWrapper or precompile 0x0f
-            let ok = if let Some(verify) = verify_contract_opt.as_ref() {
+            // Compute pkG2 + e*g2base
+            let eg2 = g2msm_call(&provider, &g2_base, &[e_u]).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
+            let pk_plus_eg2 = g2add_call(&provider, &pk_g2, &eg2).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
+
+            // Pairing via VerifyWrapper or precompile 0x0f (with pk+e*g2base)
+            let ok_with_e = if let Some(verify) = verify_contract_opt.as_ref() {
+                verify
+                    .method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
+                    .call()
+                    .await
+                    .unwrap_or(false)
+            } else {
+                pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
+            };
+            // Also check without the e term for comparison
+            let ok_pk_only = if let Some(verify) = verify_contract_opt.as_ref() {
                 verify
                     .method::<_, bool>("verifyPairing", (A_b.clone(), pk_g2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
                     .call()
@@ -360,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 pairing_call(&provider, &A_b.0, &pk_g2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
             };
-            println!("[debug] off-chain reconstructed pairing -> {}", ok);
+            println!("[debug] off-chain reconstructed pairing -> with_e={} pk_only={}", ok_with_e, ok_pk_only);
 
             // Diagnostics: try alternative constructions to identify source of mismatch
             // 1) No h0^s term
@@ -375,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
                 g1add_call(&provider, &g1_b, &bpp_noh0s).await.unwrap_or_else(|_| EthBytes::from_static(&[]))
             };
             let neg_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, EthBytes>("g1neg", (g1_plus_bpp_noh0s.clone(),))?.call().await.unwrap_or_else(|_| EthBytes::from_static(&[])) } else { g1neg_eip(&g1_plus_bpp_noh0s.0) };
-            let ok_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_g2.clone(), neg_noh0s.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_g2.0, &neg_noh0s.0, &g2_base.0).await.unwrap_or(false) };
+            let ok_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_noh0s.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_noh0s.0, &g2_base.0).await.unwrap_or(false) };
 
             // 2) Treat B' as hidden-only: subtract h0^r if we can read r, then add h0^s
             let mut ok_hidden = false;
@@ -394,9 +433,9 @@ async fn main() -> anyhow::Result<()> {
                 } else { bpp_hidden };
                 let g1_plus_bpp_hidden = g1add_call(&provider, &g1_b, &bpp_hidden_plus_rev).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
                 let neg_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, EthBytes>("g1neg", (g1_plus_bpp_hidden.clone(),))?.call().await.unwrap_or_else(|_| EthBytes::from_static(&[])) } else { g1neg_eip(&g1_plus_bpp_hidden.0) };
-                ok_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_g2.clone(), neg_hidden.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_g2.0, &neg_hidden.0, &g2_base.0).await.unwrap_or(false) };
+                ok_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_hidden.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_hidden.0, &g2_base.0).await.unwrap_or(false) };
             }
-            println!("[debug] pairing variants: std={} no_h0s={} hidden_only+add_h0s={}", ok, ok_noh0s, ok_hidden);
+            println!("[debug] pairing variants: with_e={} no_h0s={} hidden_only+add_h0s={}", ok_with_e, ok_noh0s, ok_hidden);
             // Optional: could decode full CredParams here to cross-check messageCount; skipped for brevity
         }
     }

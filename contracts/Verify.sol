@@ -12,9 +12,13 @@ import {Params} from "./Params.sol";
 library Verify {
     // EIP-2537 precompile addresses
     address internal constant PAIR = address(0x0f);
+    // BLS12-381 scalar field (Fr) modulus
+    uint256 internal constant FR_MODULUS =
+        0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001;
 
     error BadLen();
     error PairingFailed();
+
 
     function verifyPok(
         BbsPlusPokVerify.PublicSignatureParts memory sig,
@@ -114,6 +118,40 @@ contract VerifyWrapper {
         return Verify.verifyPokWithPairing(sig, ctx, revealed, challenge, p1, p2, pkG2, g2base);
     }
 
+    /// @notice Verify PoK, optional encryption relation using opener Ybar, and pairing, all from Params
+    function verifyPokEncWithPairingFromParams(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+        // Encryption extras
+        bytes calldata T2enc,
+        bytes calldata Tenc,
+        uint256 respA3,
+        uint256 respK,
+        string calldata name,
+        address paramsAddr
+    ) external view returns (bool) {
+        Params p = Params(paramsAddr);
+        ( , , bytes memory g2base) = p.getG1H0G2ByName(name);
+        bytes memory pkG2 = p.getPkG2ByName(name);
+        bytes memory ybar = p.getOpenerYbarByName(name);
+        if (pkG2.length != 256 || g2base.length != 256 || ybar.length != 128) return false;
+        // First verify core PoK
+        if (!Verify.verifyPok(sig, ctx, revealed, challenge, p1, p2)) return false;
+        // Then encryption relation: lhs = A'*respA3 + Ybar*respK; rhs = Tenc + T2enc*challenge
+        bytes memory lhsA3 = this.msm1(sig.APrime, respA3);
+        bytes memory lhsK  = this.msm1(ybar,     respK);
+        bytes memory lhs   = this.g1add(lhsA3, lhsK);
+        bytes memory rhsC  = this.msm1(T2enc,    challenge);
+        bytes memory rhs   = this.g1add(Tenc, rhsC);
+        if (keccak256(lhs) != keccak256(rhs)) return false;
+        // Finally, pairing: e(A', pk) == e(Abar, g2)
+        return Verify.verifyPairing(sig.APrime, pkG2, Bls12381.g1neg(sig.ABar), g2base);
+    }
+
     function verifyPairing(
         bytes calldata g1_1,
         bytes calldata g2_1,
@@ -126,6 +164,54 @@ contract VerifyWrapper {
     // Debug helper: just expose g1neg to tests for raw checks
     function g1neg(bytes calldata p) external pure returns (bytes memory) {
         return Bls12381.g1neg(p);
+    }
+
+    /// @notice Verify encryption relation only (optional third check)
+    function verifyEnc(
+        bytes calldata APrime,
+        bytes calldata Ybar,
+        bytes calldata T2enc,
+        bytes calldata Tenc,
+        uint256 respA3,
+        uint256 respK,
+        uint256 challenge
+    ) external view returns (bool) {
+        // Build lhs and rhs using primitive ops exposed by this wrapper to avoid node-specific reverts
+        if (APrime.length != 128 || Ybar.length != 128 || T2enc.length != 128 || Tenc.length != 128) return false;
+        bytes memory lhsA3 = this.msm1(APrime, respA3);
+        bytes memory lhsK  = this.msm1(Ybar,   respK);
+        bytes memory lhs   = this.g1add(lhsA3, lhsK);
+        bytes memory rhsC  = this.msm1(T2enc,  challenge);
+        bytes memory rhs   = this.g1add(Tenc,  rhsC);
+        return keccak256(lhs) == keccak256(rhs);
+    }
+
+    /// @notice Debug: call G1 MSM with a single pair (p * s)
+    function msm1(bytes calldata p, uint256 s) external view returns (bytes memory) {
+        bytes[] memory pts = new bytes[](1);
+        uint256[] memory sc = new uint256[](1);
+        pts[0] = p; sc[0] = s;
+        return Bls12381.g1msm(Bls12381.concatMSM(pts, sc));
+    }
+
+    /// @notice Debug: call G1 MSM with two pairs (p1*s1 + p2*s2)
+    function msm2(bytes calldata p1, uint256 s1, bytes calldata p2, uint256 s2) external view returns (bytes memory) {
+        bytes[] memory pts = new bytes[](2);
+        uint256[] memory sc = new uint256[](2);
+        pts[0] = p1; sc[0] = s1;
+        pts[1] = p2; sc[1] = s2;
+        return Bls12381.g1msm(Bls12381.concatMSM(pts, sc));
+    }
+
+    /// @notice Debug: compare 2 uncompressed G1 points by bytes
+    function g1eq(bytes calldata a, bytes calldata b) external pure returns (bool) {
+        if (a.length != 128 || b.length != 128) return false;
+        return keccak256(a) == keccak256(b);
+    }
+
+    /// @notice Debug: expose G1ADD precompile for tests
+    function g1add(bytes calldata a, bytes calldata b) external view returns (bytes memory) {
+        return Bls12381.g1add(a, b);
     }
 }
 
