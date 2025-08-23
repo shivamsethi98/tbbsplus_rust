@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // Use deterministic mnemonic-based funded accounts (aligns with TTP demo; no private_key handling).
     let phrase = env::var("MNEMONIC").unwrap_or_else(|_| {
         // Default Anvil/Hardhat test mnemonic
-        "test test test test test test test test test test test junk".into()
+        "digital humor toss grant absorb fold dry dynamic crew wagon cute hint".into()
     });
     let wallet: LocalWallet = MnemonicBuilder::<English>::default()
         .phrase(phrase.as_str())

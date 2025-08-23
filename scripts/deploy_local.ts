@@ -39,10 +39,24 @@ async function main() {
   const relay = await Relay.connect(owner).deploy(await params.getAddress());
   await relay.waitForDeployment();
 
+  // Deploy Accumulator with Params and Registry
+  const Accumulator = await ethers.getContractFactory("Accumulator");
+  const accumulator = await Accumulator.connect(owner).deploy(
+    await params.getAddress(),
+    await registry.getAddress()
+  );
+  await accumulator.waitForDeployment();
+
+  // Gate: set opener account as accumulatorManager on the registry
+  const openerAddr = process.env.OPENER_ADDR || owner.address;
+  await (await (registry as any).connect(owner).setAccumulatorManager(openerAddr, true)).wait();
+
   console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
   console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
   console.log(`export REGISTRY_CONTRACT=${await registry.getAddress()}`);
   console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
+  console.log(`export ACC_CONTRACT=${await accumulator.getAddress()}`);
+  console.log(`export OPENER_ADDR=${openerAddr}`);
   console.log(`export CHAIN_ID=31337`);
   console.log(`export ETH_WS=ws://127.0.0.1:8545`);
 }

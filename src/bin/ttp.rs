@@ -220,6 +220,7 @@ async fn main() -> anyhow::Result<()> {
         lines.push_str(&format!("THRESHOLD={}\n", t));
         lines.push_str(&format!("TOTAL={}\n", n));
         lines.push_str(&format!("OPENER_YBAR_128=0x{}\n", hex::encode(&ybar_bytes)));
+        // Avoid clashing with EOA private-key env var name; export G2 public key under an explicit name
         lines.push_str(&format!("OPENER_PK_G2_256=0x{}\n", hex::encode(&opener_pk_bytes)));
         
         use std::fs::OpenOptions;

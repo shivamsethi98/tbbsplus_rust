@@ -5864,6 +5864,7 @@ dependencies = [
  "test_utils",
  "thiserror 1.0.69",
  "tokio",
+ "vb_accumulator",
 ]
 
 [[package]]

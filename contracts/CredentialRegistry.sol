@@ -313,6 +313,5 @@ contract CredentialRegistry {
     // no-op
 }
 
-// VerifyPair library removed; using Verify library from Verify.sol
 
 

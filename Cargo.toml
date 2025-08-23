@@ -40,6 +40,7 @@ base64 = "0.21"
 rand = "0.8"
 futures = "0.3"
 ethers = { version = "2", default-features = false, features = ["abigen", "ws", "rustls"] }
+vb_accumulator = { path = "crypto/vb_accumulator" }
 
 [features]
 mpc = ["libp2p"]
@@ -100,3 +101,7 @@ path = "examples/bbs_proof_system_demo.rs"
 [[bin]]
 name = "cred_status"
 path = "src/bin/cred_status.rs"
+
+[[bin]]
+name = "opener"
+path = "src/bin/opener.rs"

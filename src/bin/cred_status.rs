@@ -23,13 +23,14 @@ fn decode_status(s: u8) -> &'static str {
     }
 }
 
-fn parse_args() -> anyhow::Result<(String, u64, bool, bool, bool)> {
+fn parse_args() -> anyhow::Result<(String, u64, bool, bool, bool, bool)> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let mut name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
     let mut sid: Option<u64> = env::var("SID").ok().and_then(|v| v.parse().ok());
     let mut watch = env::var("WATCH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let mut confirm = env::var("CONFIRM").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let mut debug = env::var("DEBUG").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let mut acc = env::var("ACC").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
 
     let mut i = 0;
     while i < args.len() {
@@ -56,6 +57,10 @@ fn parse_args() -> anyhow::Result<(String, u64, bool, bool, bool)> {
                 debug = true;
                 i += 1;
             }
+            "--acc" => {
+                acc = true;
+                i += 1;
+            }
             v if sid.is_none() && v.chars().all(|c| c.is_ascii_digit()) => {
                 sid = Some(v.parse()?);
                 i += 1;
@@ -68,7 +73,7 @@ fn parse_args() -> anyhow::Result<(String, u64, bool, bool, bool)> {
     }
 
     let sid = sid.ok_or_else(|| anyhow::anyhow!("sid not provided (use --sid <n> or SID env)"))?;
-    Ok((name, sid, watch, confirm, debug))
+    Ok((name, sid, watch, confirm, debug, acc))
 }
 
 async fn load_registry_contract<M: Middleware>(
@@ -236,11 +241,24 @@ fn read_local_signature(name: &str, sid: u64) -> Option<(Vec<u8>, Vec<u8>, Vec<u
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let ws_url = env::var("ETH_WS").unwrap_or_else(|_| "ws://127.0.0.1:8545".into());
-    let (name, sid, watch, confirm, debug) = parse_args()?;
+    let (name, sid, watch, confirm, debug, acc_mode) = parse_args()?;
 
     let provider = Provider::<Ws>::connect(ws_url.clone()).await?;
     let provider = std::sync::Arc::new(provider);
     let (registry, _addr) = load_registry_contract(provider.clone()).await?;
+
+    // Optional Accumulator
+    let accumulator_opt: Option<Contract<_>> = env::var("ACC_CONTRACT")
+        .ok()
+        .and_then(|s| s.parse::<Address>().ok())
+        .and_then(|addr| {
+            let art_path = "artifacts/contracts/Accumulator.sol/Accumulator.json";
+            let art_json = std::fs::read_to_string(art_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&art_json).ok()?;
+            let abi_val = v.get("abi")?.clone();
+            let abi: Abi = serde_json::from_value(abi_val).ok()?;
+            Some(Contract::new(addr, abi, provider.clone()))
+        });
 
     // Optional VerifyWrapper
     let verify_contract_opt: Option<Contract<_>> = env::var("VERIFY_CONTRACT")
@@ -287,6 +305,35 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut last = read_once().await?;
+
+    // If --acc, try membership verification using Accumulator (requires ACC_CONTRACT)
+    if acc_mode {
+        if let Some(acc) = accumulator_opt.as_ref() {
+            // Need e for this sid
+            let (_A_b, e_u, _s_u, _st): (EthBytes, U256, U256, u8) = registry
+                .method("getSignature", (name.clone(), U256::from(sid)))?
+                .call()
+                .await?;
+            // Try fetching witness from accumulator and verify
+            let wit: EthBytes = acc
+                .method("getWitness", (name.clone(), e_u))?
+                .call()
+                .await
+                .unwrap_or_else(|_| EthBytes::from_static(&[]));
+            if wit.0.len() == 128 {
+                let ok: bool = acc
+                    .method("verifyMembership", (name.clone(), e_u, wit.clone()))?
+                    .call()
+                    .await
+                    .unwrap_or(false);
+                println!("[acc] verifyMembership(name='{}', e=0x{:x}) -> {}", name, e_u, ok);
+            } else {
+                println!("[acc] witness not found on-chain (len={})", wit.0.len());
+            }
+        } else {
+            println!("[acc] ACC_CONTRACT missing; skip membership check");
+        }
+    }
 
     // Debug: reconstruct B'' off-chain using precompiles and verify pairing
     if debug {
