@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         }
         if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens (T1={}, T2={})", t1.len(), t2.len()); continue; }
         // Interactive prompt
-        println!("ServiceProvider: PresentationVerified received. Open now? [y/N]");
+        println!("ServiceProvider: PresentationVerified received (T1.len={}, T2.len={}). Open now? [y/N]", t1.len(), t2.len());
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).ok();
         if matches!(ans.trim(), "y"|"Y"|"yes"|"YES") {

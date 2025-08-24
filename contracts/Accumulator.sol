@@ -112,6 +112,7 @@ contract Accumulator {
     function deleteMember(string calldata name, uint256 e, bytes calldata newDelta128) external onlyOpener {
         require(newDelta128.length == 128, "bad delta len");
         bytes32 k = _key(name);
+        require(!revoked[k][e], "already revoked");
         deltas[k] = newDelta128;
         revoked[k][e] = true;
         emit MemberRevoked(name, e, newDelta128);

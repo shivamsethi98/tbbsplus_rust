@@ -964,30 +964,7 @@ async fn persist_and_optionally_present(
             let v = messages[*ix as usize];
             fr_to_u256(&v)
         }).collect();
-        // Optional debug tamper for verifyPok: set VERIFYPOK_TAMPER=1 and optionally VERIFYPOK_TAMPER_IDX=<u32>
-        if let Ok(tamper) = std::env::var("VERIFYPOK_TAMPER") {
-            let t = tamper.to_ascii_lowercase();
-            if !(t.is_empty() || t == "0" || t == "false") {
-                let idx_to_tamper = std::env::var("VERIFYPOK_TAMPER_IDX").ok().and_then(|s| s.parse::<u32>().ok());
-                let pos_opt = if let Some(ix) = idx_to_tamper {
-                    revealed_idx.iter().position(|i| *i == ix)
-                } else if !revealed_idx.is_empty() { Some(0usize) } else { None };
-                if let Some(pos) = pos_opt {
-                    let old = revealed_vals_u256[pos];
-                    let mut be = [0u8; 32];
-                    old.to_big_endian(&mut be);
-                    be[31] ^= 1; // flip low bit
-                    let new = U256::from_big_endian(&be);
-                    revealed_vals_u256[pos] = new;
-                    println!(
-                        "[present debug] VERIFYPOK_TAMPER: changed revealed value at idx {} from {} to {}",
-                        revealed_idx[pos], old, new
-                    );
-                } else {
-                    println!("[present debug] VERIFYPOK_TAMPER set but no revealed indices to tamper");
-                }
-            }
-        }
+
         let revealed_t = (revealed_idx.clone(), revealed_vals_u256);
         let p1_t_t1 = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
         check_len("p1.T1", &p1_t_t1, 128)?;
@@ -1008,9 +985,10 @@ async fn persist_and_optionally_present(
 
 
         // Encryption extras from proof
-        let t1_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
+        let t1_b    = EthBytes::from(g1_to_eip2537_bytes(proof.T1_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T1_enc"))?).to_vec()); // <- use T1_enc
         let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
         let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
+        // respA3/respK unchanged (come from sc_resp_enc)
         let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
         let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
         let params_addr_u8: [u8; 20] = params_contract.address().into();

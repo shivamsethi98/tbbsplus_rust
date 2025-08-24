@@ -48,7 +48,9 @@ async function main() {
   await accumulator.waitForDeployment();
 
   // Gate: set opener account as accumulatorManager on the registry
-  const openerAddr = process.env.OPENER_ADDR || owner.address;
+  // Prefer explicit OPENER_ADDR, else derive from OPENER_PK, else fallback to owner
+  const OPENER_PK = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+  const openerAddr = new ethers.Wallet(OPENER_PK).address;
   await (await (registry as any).connect(owner).setAccumulatorManager(openerAddr, true)).wait();
 
   // Set Service Provider on Accumulator (callable by opener)

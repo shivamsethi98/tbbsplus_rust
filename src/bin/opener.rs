@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Derive opener secret deterministically (must match ttp.rs derivation) or read from .runtime.openers.json
     let derived_opener_sk = derive_opener_secret::<Fr>(&cred_name);
+
     let opener_sk: Fr = match std::fs::read_to_string(".runtime.openers.json") {
         Ok(s) => {
             use base64::Engine as _;
@@ -117,6 +118,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(_) => derived_opener_sk,
     };
+    println!("opener: opener secret: {:?}", opener_sk);
+    println!("opener: derived opener secret: {:?}", derived_opener_sk);
     let accum_sk = AccumSecretKey::<Fr>(opener_sk);
 
     // Initialize local accumulator state from on-chain Delta if present
@@ -143,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         .topic1(ValueOrArray::Value(name_topic))
         .from_block(BlockNumber::Latest);
     let mut stream = client.provider().subscribe_logs(&filter).await?;
-    println!("opener: listening for Confirmed events for '{}'...", cred_name);
+    println!("opener: listening for Confirmed and OpenRequested events for '{}'...", cred_name);
 
     // Spawn open loop in background to handle Accumulator.OpenRequested events
     {
@@ -196,6 +199,11 @@ async fn main() -> anyhow::Result<()> {
             .send()
             .await?
             .await?;
+        println!(
+            "opener/mapping: keccak(A)={}, e=0x{:x}",
+            hex::encode(ethers::utils::keccak256(&A_bytes.0)),
+            e_u
+        );
         println!("opener: updated Delta and published witness for e=0x{:x}", e_u);
     }
 
@@ -289,6 +297,7 @@ async fn run_open_loop(
         }
         if t1_b.len() != 128 || t2_b.len() != 128 { continue; }
         let (_tbar_b, a_b) = compute_tbar_and_a(&t1_b, &t2_b, opener_sk).await?;
+        println!("opener/open: recovered A (keccak={})", hex::encode(ethers::utils::keccak256(&a_b.0)));
         // Optional: publish recovered A
         let _ = accumulator
             .method::<_, ()>("publishOpenResult", (cred_name.clone(), ethers::types::Bytes::from(a_b.clone())))?
@@ -300,7 +309,20 @@ async fn run_open_loop(
             .method("getEByA", (cred_name.clone(), ethers::types::Bytes::from(a_b.clone())))?
             .call()
             .await?;
-        if e_u.is_zero() { continue; }
+        if e_u.is_zero() {
+            println!("opener/open: no A→e mapping found; skipping revocation");
+            continue;
+        }
+        // Skip if already revoked
+        let already: bool = accumulator
+            .method("isRevoked", (cred_name.clone(), e_u))?
+            .call()
+            .await
+            .unwrap_or(false);
+        if already {
+            println!("opener/open: e=0x{:x} already revoked; skipping", e_u);
+            continue;
+        }
         // Fetch current Delta and compute new after removal
         let delta_bytes: ethers::types::Bytes = accumulator
             .method("getDelta", (cred_name.clone(),))?
@@ -313,12 +335,17 @@ async fn run_open_loop(
         let e_fr: Fr = u256_to_fr::<Fr>(&e_u);
         let new_delta_aff = acc_local.compute_new_post_remove(&e_fr, &accum_sk);
         let new_delta_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&new_delta_aff).to_vec());
+        let new_delta_b_print = new_delta_b.clone();
         let _ = accumulator
             .method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b))?
             .send()
             .await?
             .await?;
-        println!("opener: opened and revoked e=0x{:x}", e_u);
+        println!(
+            "opener: opened and revoked e=0x{:x}; updated Delta (keccak={})",
+            e_u,
+            hex::encode(ethers::utils::keccak256(&new_delta_b_print.0))
+        );
     }
     Ok(())
 }
