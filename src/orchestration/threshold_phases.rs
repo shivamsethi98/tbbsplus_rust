@@ -171,7 +171,7 @@ impl Phase1Coordinator {
                 zero_share_commitments: zero_commitments_map,
             });
             if let Some(handle) = &self.mesh_handle {
-                handle.publish("threshold-phase1", &msg).await?;
+                handle.broadcast("threshold-phase1", serde_json::to_vec(&msg)?).await?;
             }
         }
 
@@ -245,7 +245,7 @@ impl Phase1Coordinator {
                     zero_shares: zero_shares_bytes,
                 });
                 if let Some(handle) = &self.mesh_handle {
-                    handle.publish("threshold-phase1", &msg).await?;
+                    handle.broadcast("threshold-phase1", serde_json::to_vec(&msg)?).await?;
                 }
             }
         }
@@ -387,7 +387,7 @@ impl Phase2Coordinator {
                     message: msg_bytes,
                 });
                 if let Some(handle) = &self.mesh_handle {
-                    handle.publish("threshold-phase2", &threshold_msg).await?;
+                    handle.broadcast("threshold-phase2", serde_json::to_vec(&threshold_msg)?).await?;
                 }
             }
         }
@@ -436,7 +436,7 @@ impl Phase2Coordinator {
                             message: msg2_bytes,
                         });
                         if let Some(handle) = &self.mesh_handle {
-                            handle.publish("threshold-phase2", &threshold_msg).await?;
+                            handle.broadcast("threshold-phase2", serde_json::to_vec(&threshold_msg)?).await?;
                         }
                     }
                 }
@@ -684,7 +684,7 @@ impl ThresholdSigningOrchestrator {
                 share: share_bytes,
             };
             if let Some(handle) = &self.mesh_handle {
-                handle.publish("threshold-signatures", &msg).await?;
+                handle.broadcast("threshold-signatures", serde_json::to_vec(&msg)?).await?;
             }
         }
 
