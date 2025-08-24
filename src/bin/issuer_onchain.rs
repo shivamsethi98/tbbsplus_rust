@@ -27,7 +27,7 @@ use tokio::time::{sleep, Duration};
 use oblivious_transfer_protocols::ot_based_multiplication::dkls18_mul_2p::MultiplicationOTEParams;
 use test_utils::ot::do_pairwise_base_ot;
 
-use tbbsplus_rust::orchestration::mesh_v2_simple::p2p::Mesh;
+use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 use tbbsplus_rust::orchestration::threshold_phases::{BASE_OT_KEY_SIZE, KAPPA, STATISTICAL_SECURITY_PARAMETER};
 
 abigen!(

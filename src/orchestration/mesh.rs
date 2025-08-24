@@ -1,204 +1,393 @@
-use serde::{Deserialize, Serialize};
+// Simplified hybrid mesh network without Kademlia DHT
+use std::collections::HashMap;
+use std::time::Duration;
+use anyhow::{Result, anyhow};
+use serde::{Serialize, Deserialize};
+use tokio::sync::{mpsc::{channel, Sender, Receiver}, oneshot};
 
 #[cfg(feature = "mpc")]
 pub mod p2p {
     use super::*;
-    use libp2p::futures::StreamExt;
-    use libp2p::{dns, gossipsub, identity, noise, tcp, yamux, Multiaddr, Transport as _};
-    use serde::de::DeserializeOwned;
-    use std::collections::HashMap;
-    use tokio::sync::mpsc::{channel, Receiver, Sender};
-    use tokio::sync::oneshot;
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    pub struct MeshMsg<T> {
-        pub topic: String,
-        pub payload: T,
+    use libp2p::{
+        gossipsub::{self, MessageId, MessageAuthenticity, Topic, TopicHash, Sha256Topic as MyTopic},
+        identity::Keypair,
+        mdns,
+        noise,
+        request_response::{self, ProtocolSupport},
+        swarm::{NetworkBehaviour, SwarmEvent},
+        tcp,
+        yamux,
+        Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
+    };
+    use futures::StreamExt;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // Protocol for direct messages
+    const DIRECT_PROTOCOL: &str = "/threshold-bbs/direct/1.0.0";
+    
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DirectMessage {
+        pub from: u16,
+        pub to: u16,
+        pub data: Vec<u8>,
+        pub nonce: u64,
     }
-
+    
+    // Combined network behaviour without Kademlia
+    #[derive(NetworkBehaviour)]
+    struct MeshBehaviour {
+        gossipsub: gossipsub::Behaviour,
+        request_response: request_response::cbor::Behaviour<Vec<u8>, Vec<u8>>,
+        mdns: mdns::tokio::Behaviour,
+    }
+    
     enum Command {
-        Publish { topic: String, bytes: Vec<u8> },
-        Dial(Multiaddr),
-        AwaitPeers { min: usize, respond_to: oneshot::Sender<()> },
+        Broadcast {
+            topic: String,
+            data: Vec<u8>,
+        },
+        SendDirect {
+            to: u16,
+            data: Vec<u8>,
+            respond_to: oneshot::Sender<Result<()>>,
+        },
+        RegisterPeer {
+            participant_id: u16,
+            peer_id: PeerId,
+        },
     }
-
+    
     pub struct Mesh {
-        swarm: libp2p::swarm::Swarm<gossipsub::Behaviour>,
-    sinks: HashMap<gossipsub::TopicHash, Sender<Vec<u8>>>,
+        local_peer_id: PeerId,
+        participant_id: u16,
+        swarm: libp2p::Swarm<MeshBehaviour>,
         cmd_tx: Sender<Command>,
         cmd_rx: Option<Receiver<Command>>,
+        broadcast_sinks: HashMap<TopicHash, Sender<Vec<u8>>>,
+        direct_sink: Option<Sender<DirectMessage>>,
+        participant_to_peer: HashMap<u16, PeerId>,
+        peer_to_participant: HashMap<PeerId, u16>,
     }
-
+    
     #[derive(Clone)]
     pub struct MeshHandle {
         cmd_tx: Sender<Command>,
+        participant_id: u16,
     }
-
+    
     impl Mesh {
-        pub async fn new(listen: Option<Multiaddr>) -> anyhow::Result<Self> {
-            let local_key = identity::Keypair::generate_ed25519();
-            let peer_id = local_key.public().to_peer_id();
-            let transport = dns::tokio::Transport::system(tcp::tokio::Transport::new(tcp::Config::default()))
-                .map_err(|e| anyhow::anyhow!(e))?
-                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-                .authenticate(noise::Config::new(&local_key)?)
-                .multiplex(yamux::Config::default())
-                .boxed();
-
-            let gs = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(local_key.clone()),
-                gossipsub::Config::default(),
-            )
-            .map_err(anyhow::Error::msg)?;
-
-            let mut swarm = libp2p::swarm::Swarm::new(
-                transport,
-                gs,
-                peer_id,
-                libp2p::swarm::Config::with_tokio_executor(),
-            );
-            if let Some(addr) = listen {
-                libp2p::swarm::Swarm::listen_on(&mut swarm, addr)?;
-            }
-            let (tx, rx) = channel(64);
-            Ok(Self {
-                swarm,
-                sinks: HashMap::new(),
-                cmd_tx: tx,
-                cmd_rx: Some(rx),
-            })
-        }
-
-        pub async fn publish<T: Serialize>(&mut self, topic: &str, payload: &T) -> anyhow::Result<()> {
-            let topic = gossipsub::IdentTopic::new(topic);
-            self.swarm.behaviour_mut().subscribe(&topic)?;
-            let bytes = serde_json::to_vec(payload)?;
-            self.swarm.behaviour_mut().publish(topic, bytes)?;
-            Ok(())
-        }
-
-        pub async fn publish_json<T: Serialize>(&mut self, topic: &str, payload: &T) -> anyhow::Result<()> {
-            self.publish(topic, payload).await
-        }
-
-        pub async fn subscribe_raw(&mut self, topic: &str) -> anyhow::Result<Receiver<Vec<u8>>> {
-            let topic = gossipsub::IdentTopic::new(topic);
-            self.swarm.behaviour_mut().subscribe(&topic)?;
-            let (tx, rx) = channel(64);
-            self.sinks.insert(topic.hash().clone(), tx);
-            Ok(rx)
-        }
-
-        pub async fn subscribe<T: DeserializeOwned + Send + 'static>(
-            &mut self,
-            topic: &str,
-        ) -> anyhow::Result<Receiver<T>> {
-            let mut raw = self.subscribe_raw(topic).await?;
-            let (tx, rx) = channel::<T>(64);
-            tokio::spawn(async move {
-                while let Some(bytes) = raw.recv().await {
-                    if let Ok(msg) = serde_json::from_slice::<T>(&bytes) {
-                        let _ = tx.send(msg).await;
-                    }
+        pub async fn new(
+            participant_id: u16,
+            listen_addr: Option<Multiaddr>,
+            bootstrap_peers: Vec<(u16, Multiaddr)>,
+        ) -> Result<Self> {
+            // Generate deterministic keypair
+            let keypair = {
+                let mut bytes = [0u8; 32];
+                bytes[0] = participant_id as u8;
+                bytes[1] = (participant_id >> 8) as u8;
+                // Fill rest with deterministic pattern
+                for i in 2..32 {
+                    bytes[i] = ((participant_id as usize + i) % 256) as u8;
                 }
-            });
-            Ok(rx)
+                Keypair::ed25519_from_bytes(bytes)?
+            };
+            
+            let local_peer_id = PeerId::from(keypair.public());
+            
+            // Configure gossipsub
+            let message_id_fn = |message: &gossipsub::Message| {
+                let mut hasher = DefaultHasher::new();
+                message.data.hash(&mut hasher);
+                MessageId::from(hasher.finish().to_string())
+            };
+            
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .message_id_fn(message_id_fn)
+                .build()
+                .map_err(|e| anyhow!("gossipsub config error: {}", e))?;
+            
+            let gossipsub = gossipsub::Behaviour::new(
+                MessageAuthenticity::Signed(keypair.clone()),
+                gossipsub_config,
+            ).map_err(|e| anyhow!("Failed to create gossipsub: {}", e))?;
+            
+            // Configure request-response using CBOR
+            let request_response = request_response::cbor::Behaviour::new(
+                [(StreamProtocol::new(DIRECT_PROTOCOL), ProtocolSupport::Full)],
+                request_response::Config::default(),
+            );
+            
+            // Configure mDNS
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+            
+            // Build swarm using SwarmBuilder for libp2p 0.54
+            let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+                .with_tokio()
+                .with_tcp(
+                    tcp::Config::default(),
+                    noise::Config::new,
+                    yamux::Config::default,
+                )?
+                .with_dns()?
+                .with_behaviour(|_keypair| {
+                    Ok(MeshBehaviour {
+                        gossipsub,
+                        request_response,
+                        mdns,
+                    })
+                })?
+                .build();
+            
+            // Listen on provided address
+            if let Some(addr) = listen_addr {
+                swarm.listen_on(addr)?;
+            }
+            
+            // Create command channel
+            let (cmd_tx, cmd_rx) = channel(100);
+            
+            // Create mesh instance
+            let mut mesh = Self {
+                local_peer_id,
+                participant_id,
+                swarm,
+                cmd_tx: cmd_tx.clone(),
+                cmd_rx: Some(cmd_rx),
+                broadcast_sinks: HashMap::new(),
+                direct_sink: None,
+                participant_to_peer: HashMap::new(),
+                peer_to_participant: HashMap::new(),
+            };
+            
+            // Register self
+            mesh.participant_to_peer.insert(participant_id, local_peer_id);
+            mesh.peer_to_participant.insert(local_peer_id, participant_id);
+            
+            // Dial bootstrap peers
+            for (_pid, addr) in bootstrap_peers {
+                mesh.swarm.dial(addr)?;
+                // Note: peer_id will be discovered via mDNS or when they connect
+            }
+            
+            Ok(mesh)
         }
 
+        pub fn local_peer_id(&self) -> PeerId {
+            self.local_peer_id
+        }
+        
+        pub async fn subscribe_broadcast(&mut self, topic: &str) -> Result<Receiver<Vec<u8>>> {
+            let topic = MyTopic::new(topic);
+            self.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+            
+            let (tx, rx) = channel(64);
+            self.broadcast_sinks.insert(topic.hash(), tx);
+            Ok(rx)
+        }
+        
+        pub async fn subscribe_direct(&mut self) -> Result<Receiver<DirectMessage>> {
+            let (tx, rx) = channel(64);
+            self.direct_sink = Some(tx);
+            Ok(rx)
+        }
+        
         pub fn run_background(mut self) -> MeshHandle {
-            let mut cmd_rx = self.cmd_rx.take().expect("mesh background already running");
+            let mut cmd_rx = self.cmd_rx.take().expect("already running");
             let handle = MeshHandle {
                 cmd_tx: self.cmd_tx.clone(),
+                participant_id: self.participant_id,
             };
+            
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        maybe_evt = self.swarm.next() => {
-                            match maybe_evt {
-                                Some(libp2p::swarm::SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. })) => {
-                                    println!("[mesh] rx gossipsub on topic {:?}, {} bytes", message.topic, message.data.len());
-                                    let key = message.topic.clone();
-                                    if let Some(sink) = self.sinks.get(&key) {
-                                        let _ = sink.send(message.data.clone()).await;
+                        event = self.swarm.select_next_some() => {
+                            match event {
+                                SwarmEvent::Behaviour(MeshBehaviourEvent::Gossipsub(
+                                    gossipsub::Event::Message { message, .. }
+                                )) => {
+                                    if let Some(sink) = self.broadcast_sinks.get(&message.topic) {
+                                        let _ = sink.send(message.data).await;
                                     }
                                 }
-                                Some(_) => {}
-                                None => break,
+                                
+                                SwarmEvent::Behaviour(MeshBehaviourEvent::RequestResponse(
+                                    request_response::Event::Message { peer, message }
+                                )) => {
+                                    match message {
+                                        request_response::Message::Request { request, channel, .. } => {
+                                            // Try to deserialize as DirectMessage
+                                            if let Ok(msg) = serde_json::from_slice::<DirectMessage>(&request) {
+                                                // Learn mapping from incoming message
+                                                // This allows peers to discover participant_id -> peer_id mapping lazily
+                                                // and enables subsequent direct sends without prior registration.
+                                                // Safe to overwrite to keep most recent mapping.
+                                                // Note: no authentication of mapping beyond transport channel.
+                                                self.participant_to_peer.insert(msg.from, peer);
+                                                self.peer_to_participant.insert(peer, msg.from);
+                                                if let Some(sink) = &self.direct_sink {
+                                                    let _ = sink.send(msg).await;
+                                                }
+                                            }
+                                            
+                                            // Send acknowledgment
+                                            let _ = self.swarm.behaviour_mut().request_response
+                                                .send_response(channel, b"ACK".to_vec());
+                                        }
+                                        request_response::Message::Response { .. } => {}
+                                    }
+                                }
+                                
+                                SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(
+                                    mdns::Event::Discovered(peers)
+                                )) => {
+                                    for (peer_id, addr) in peers {
+                                        // Auto-discover peers via mDNS and proactively dial
+                                        // so that direct request-response channels can be established.
+                                        let _ = self.swarm.dial(addr);
+                                        // Note: participant_id mapping is learned lazily from incoming
+                                        // direct messages or explicit registration at higher layers.
+                                        let _ = peer_id; // suppress unused warning if addr move fails
+                                    }
+                                }
+                                
+                                SwarmEvent::NewListenAddr { address, .. } => {
+                                    println!("Listening on {}", address);
+                                }
+                                
+                                _ => {}
                             }
                         }
-                        maybe_cmd = cmd_rx.recv() => {
-                            match maybe_cmd {
-                                Some(Command::Publish { topic, bytes }) => {
-                                    println!("[mesh] tx gossipsub topic {}, {} bytes", topic, bytes.len());
-                                    let topic = gossipsub::IdentTopic::new(&topic);
-                                    let _ = self.swarm.behaviour_mut().subscribe(&topic);
-                                    let _ = self.swarm.behaviour_mut().publish(topic, bytes);
+                        
+                        Some(cmd) = cmd_rx.recv() => {
+                            match cmd {
+                                Command::Broadcast { topic, data } => {
+                                    let topic = MyTopic::new(&topic);
+                                    let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                    let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, data);
                                 }
-                                Some(Command::Dial(addr)) => {
-                                    let _ = libp2p::swarm::Swarm::dial(&mut self.swarm, addr);
-                                }
-                                Some(Command::AwaitPeers { min, respond_to }) => {
-                                    let peers = self.swarm.connected_peers().count();
-                                    if peers >= min {
-                                        let _ = respond_to.send(());
+                                
+                                Command::SendDirect { to, data, respond_to } => {
+                                    if let Some(peer_id) = self.participant_to_peer.get(&to) {
+                                        let msg = DirectMessage {
+                                            from: self.participant_id,
+                                            to,
+                                            data: data.clone(),
+                                            nonce: rand::random(),
+                                        };
+                                        
+                                        let serialized = serde_json::to_vec(&msg).unwrap();
+                                        let _request_id = self.swarm.behaviour_mut().request_response
+                                            .send_request(peer_id, serialized);
+                                        
+                                        let _ = respond_to.send(Ok(()));
                                     } else {
-                                        // Requeue check after a short delay by spawning a tiny watchdog
-                                        let tx = self.cmd_tx.clone();
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                            let _ = tx.send(Command::AwaitPeers { min, respond_to }).await;
-                                        });
+                                        let _ = respond_to.send(Err(anyhow!("Unknown participant: {}", to)));
                                     }
                                 }
-                                None => break,
+                                
+                                Command::RegisterPeer { participant_id, peer_id } => {
+                                    self.participant_to_peer.insert(participant_id, peer_id);
+                                    self.peer_to_participant.insert(peer_id, participant_id);
+                                }
                             }
                         }
                     }
                 }
             });
+            
             handle
         }
-
-        pub fn listeners(&self) -> Vec<Multiaddr> {
-            self.swarm.listeners().cloned().collect()
-        }
     }
-
+    
     impl MeshHandle {
-        pub async fn publish<T: Serialize>(&self, topic: &str, payload: &T) -> anyhow::Result<()> {
-            let bytes = serde_json::to_vec(payload)?;
-            self.cmd_tx
-                .send(Command::Publish { topic: topic.to_string(), bytes })
-                .await
-                .map_err(|e| anyhow::anyhow!(e))
+        pub async fn broadcast(&self, topic: &str, data: Vec<u8>) -> Result<()> {
+            self.cmd_tx.send(Command::Broadcast {
+                topic: topic.to_string(),
+                data,
+            }).await?;
+            Ok(())
         }
-
-        pub async fn dial(&self, addr: Multiaddr) -> anyhow::Result<()> {
-            self.cmd_tx
-                .send(Command::Dial(addr))
-                .await
-                .map_err(|e| anyhow::anyhow!(e))
-        }
-
-        pub async fn await_peers(&self, min: usize) -> anyhow::Result<()> {
+        
+        pub async fn send_to(&self, participant_id: u16, data: Vec<u8>) -> Result<()> {
             let (tx, rx) = oneshot::channel();
-            self.cmd_tx
-                .send(Command::AwaitPeers { min, respond_to: tx })
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            rx.await.map_err(|e| anyhow::anyhow!(e))
+            self.cmd_tx.send(Command::SendDirect {
+                to: participant_id,
+                data,
+                respond_to: tx,
+            }).await?;
+            rx.await?
+        }
+        
+        pub async fn register_peer(&self, participant_id: u16, peer_id: PeerId) -> Result<()> {
+            self.cmd_tx.send(Command::RegisterPeer {
+                participant_id,
+                peer_id,
+            }).await?;
+            Ok(())
+        }
+        
+        pub fn participant_id(&self) -> u16 {
+            self.participant_id
         }
     }
 }
 
+// Stub for non-MPC builds
 #[cfg(not(feature = "mpc"))]
 pub mod p2p {
     use super::*;
-    use tokio::sync::mpsc::{channel, Receiver};
+    
     pub struct Mesh;
+    pub struct MeshHandle;
+    
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DirectMessage {
+        pub from: u16,
+        pub to: u16,
+        pub data: Vec<u8>,
+        pub nonce: u64,
+    }
+    
     impl Mesh {
-        pub async fn new(_listen: Option<()>) -> anyhow::Result<Self> { Ok(Self) }
-        pub async fn publish<T: Serialize>(&mut self, _topic: &str, _payload: &T) -> anyhow::Result<()> { Ok(()) }
-        pub async fn subscribe<T: for<'a> Deserialize<'a>>(&mut self, _topic: &str) -> anyhow::Result<Receiver<T>> { let (_tx, rx) = channel(1); Ok(rx) }
+        pub async fn new(
+            _participant_id: u16,
+            _listen_addr: Option<()>,
+            _bootstrap_peers: Vec<(u16, ())>,
+        ) -> Result<Self> {
+            Ok(Self)
+        }
+        
+        pub async fn subscribe_broadcast(&mut self, _topic: &str) -> Result<Receiver<Vec<u8>>> {
+            let (_tx, rx) = channel(1);
+            Ok(rx)
+        }
+        
+        pub async fn subscribe_direct(&mut self) -> Result<Receiver<DirectMessage>> {
+            let (_tx, rx) = channel(1);
+            Ok(rx)
+        }
+        
+        pub fn run_background(self) -> MeshHandle {
+            MeshHandle
+        }
+    }
+    
+    impl MeshHandle {
+        pub async fn broadcast(&self, _topic: &str, _data: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        
+        pub async fn send_to(&self, _participant_id: u16, _data: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+        
+        pub fn participant_id(&self) -> u16 {
+            0
+        }
     }
 }
