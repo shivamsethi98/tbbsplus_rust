@@ -1,6 +1,4 @@
 use std::env;
-use std::fs;
-use std::path::PathBuf;
 use ethers::prelude::*;
 use ethers::providers::{Provider, Ws};
 use ethers::abi::{Abi, RawLog};
@@ -69,8 +67,8 @@ async fn main() -> anyhow::Result<()> {
         let raw = RawLog { topics: log.topics.clone(), data: log.data.to_vec() };
         let parsed = match ev.parse_log(raw) { Ok(p) => p, Err(e) => { eprintln!("parse err: {:?}", e); continue; } };
         // params: name (indexed), prover (indexed), T1 (bytes), T2 (bytes)
-        let name_topic = log.topics.get(1).cloned().unwrap_or_default();
-        let prover = log.topics.get(2).cloned().unwrap_or_default();
+        let _name_topic = log.topics.get(1).cloned().unwrap_or_default();
+        let _prover = log.topics.get(2).cloned().unwrap_or_default();
         let mut t1: Vec<u8> = Vec::new();
         let mut t2: Vec<u8> = Vec::new();
         for p in &parsed.params {

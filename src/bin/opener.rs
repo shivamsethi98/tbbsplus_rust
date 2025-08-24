@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
         // topic2 is sid; decode it
         let sid_h = _log.topics.get(2).cloned().unwrap_or_default();
         let sid_u = U256::from_big_endian(sid_h.as_bytes());
-        let (A_bytes, e_u, _s_u, _st): (ethers::types::Bytes, U256, U256, u8) = registry
+        let (a_bytes, e_u, _s_u, _st): (ethers::types::Bytes, U256, U256, u8) = registry
             .method("getSignature", (cred_name.clone(), sid_u))?
             .call()
             .await?;
@@ -195,13 +195,13 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         // Publish A -> e mapping for opening
         let _ = accumulator
-            .method::<_, ()>("publishMapping", (cred_name.clone(), sid_u, A_bytes.clone(), e_u))?
+            .method::<_, ()>("publishMapping", (cred_name.clone(), sid_u, a_bytes.clone(), e_u))?
             .send()
             .await?
             .await?;
         println!(
             "opener/mapping: keccak(A)={}, e=0x{:x}",
-            hex::encode(ethers::utils::keccak256(&A_bytes.0)),
+            hex::encode(ethers::utils::keccak256(&a_bytes.0)),
             e_u
         );
         println!("opener: updated Delta and published witness for e=0x{:x}", e_u);

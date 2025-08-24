@@ -7,37 +7,31 @@
 use std::env;
 use std::io::{self, Write};
 
-use ark_bls12_381::{Bls12_381, Fr, Fq};
+use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{rand::{rngs::StdRng, SeedableRng}, UniformRand};
 use bbs_plus::prelude::*;
 use blake2::Blake2b512;
-use ark_ff::PrimeField;
-use schnorr_pok::{SchnorrChallengeContributor, pok_generalized_pedersen::{SchnorrCommitment, compute_random_oracle_challenge}};
+
 use ethers::contract::abigen;
 use ethers::prelude::*;
 use ethers::contract::Contract;
 use ethers::abi::Abi;
 use ethers::types::Bytes as EthBytes;
 use ethers::providers::{Provider, Ws};
-use ethers::types::TxHash;
+
 use ethers::types::H256;
 use futures::StreamExt;
 
 // Bring solidity helpers into scope directly
 use tbbsplus_rust::orchestration::helpers::{
     decode_commitment_pok_for_onchain,
-    persist_share,
-    load_persisted_shares,
     persist_request_meta,
     u256_to_fr,
     build_commitment_pok,
     fr_to_u256,
     keccak_to_fr,
-    fq_to_be64,
     g1_to_eip2537_bytes,
-    fq2_to_be64_pair,
-    g2_to_eip2537_bytes,
     eip2537_g1_to_affine,
     eip2537_g2_to_affine,
 };
@@ -158,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     // Note: RELAY_CONTRACT deprecated; using CredentialRegistry events and getters
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-    let t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
+    let _t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
     let mcount: u32 = env::var("MESSAGE_COUNT").unwrap_or_else(|_| "5".into()).parse()?;
     // Parse mode/args
     enum Mode {
@@ -287,9 +281,9 @@ async fn main() -> anyhow::Result<()> {
             let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
             let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
             let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.clone()).call().await?;
-            let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
-            for hb in h_bytes { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
-            let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
+            let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+            for hb in h_bytes { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
+            let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
 
             // Ensure index 0 is revealed and equals sid
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) {
@@ -431,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
 
                         use std::fs;
                         use std::path::PathBuf;
-                        use ark_ec::AffineRepr;
+
                         let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
                         let _ = fs::create_dir_all(&base);
 
@@ -450,10 +444,10 @@ async fn main() -> anyhow::Result<()> {
                         fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
 
                         // Persist aggregated signature from registry
-                        let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                        let a = eip2537_g1_to_affine(&abytes.0[..])?;
                         let e = u256_to_fr::<Fr>(&e_u);
                         let s = u256_to_fr::<Fr>(&s_u);
-                        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
                         let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
                         let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
                         let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
@@ -531,7 +525,7 @@ async fn main() -> anyhow::Result<()> {
 
                     use std::fs;
                     use std::path::PathBuf;
-                    use ark_ec::AffineRepr;
+
                     let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
                     let _ = fs::create_dir_all(&base);
 
@@ -544,10 +538,10 @@ async fn main() -> anyhow::Result<()> {
                     let params_obj = serde_json::json!({ "cred_name": cred_name, "messageCount": onchain_mcount, "t": onchain_t, "n": onchain_n });
                     fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
 
-                    let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                    let a = eip2537_g1_to_affine(&abytes.0[..])?;
                     let e = u256_to_fr::<Fr>(&e_u);
                     let s = u256_to_fr::<Fr>(&s_u);
-                    let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                    let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
                     let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
                     let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
                     let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
@@ -598,17 +592,17 @@ async fn main() -> anyhow::Result<()> {
                                     if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; }
                                 }
                             }
-                            use std::fs; use std::path::PathBuf; use ark_ec::AffineRepr;
+                            use std::fs; use std::path::PathBuf;
                             let base: PathBuf = [".runtime", "users", &user_id, &cred_name, &format!("sid_{}", sid)].iter().collect();
                             let _ = fs::create_dir_all(&base);
                             let msgs_hex: Vec<String> = messages.iter().map(|f| { let mut be = Vec::new(); ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap(); format!("0x{}", hex::encode(be)) }).collect();
                             fs::write(base.join("messages.json"), serde_json::to_vec_pretty(&msgs_hex)?)?;
                             let params_obj = serde_json::json!({ "cred_name": cred_name, "messageCount": onchain_mcount, "t": onchain_t, "n": onchain_n });
                             fs::write(base.join("params.json"), serde_json::to_vec_pretty(&params_obj)?)?;
-                            let A = eip2537_g1_to_affine(&abytes.0[..])?;
+                            let a = eip2537_g1_to_affine(&abytes.0[..])?;
                             let e = u256_to_fr::<Fr>(&e_u);
                             let s = u256_to_fr::<Fr>(&s_u);
-                            let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+                            let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
                             let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
                             let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
                             let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
@@ -632,10 +626,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn verify_with_shares(
     params_contract: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     cred_name: &str,
-    mcount: u32,
+    _mcount: u32,
     sid: u64,
     shares: Vec<Vec<u8>>,
     blinding: Option<Fr>,
@@ -689,13 +684,13 @@ async fn persist_and_optionally_present(
     client: &std::sync::Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     params_contract: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     cred_name: &str,
-    mcount: u32,
+    _mcount: u32,
     sid: u64,
     shares: Vec<Vec<u8>>,
 ) -> anyhow::Result<()> {
     use std::fs;
     use std::path::PathBuf;
-    use ark_ec::AffineRepr;
+
     let pc = params_contract.get_params_by_name(cred_name.to_string()).call().await?;
     let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
     let onchain_t: u16 = pc.t.as_u64() as u16;
@@ -757,10 +752,10 @@ async fn persist_and_optionally_present(
         let a_hex = v.get("A").and_then(|x| x.as_str()).ok_or_else(|| anyhow::anyhow!("sig.A missing"))?;
         let e_hex = v.get("e").and_then(|x| x.as_str()).ok_or_else(|| anyhow::anyhow!("sig.e missing"))?;
         let s_hex = v.get("s").and_then(|x| x.as_str()).ok_or_else(|| anyhow::anyhow!("sig.s missing"))?;
-        let A = <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine::deserialize_compressed(&hex::decode(a_hex.trim_start_matches("0x"))?[..])?;
+        let a = <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine::deserialize_compressed(&hex::decode(a_hex.trim_start_matches("0x"))?[..])?;
         let e = Fr::deserialize_compressed(&hex::decode(e_hex.trim_start_matches("0x"))?[..])?;
         let s = Fr::deserialize_compressed(&hex::decode(s_hex.trim_start_matches("0x"))?[..])?;
-        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A, e, s };
+        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
         (messages, signature)
     };
 
@@ -813,14 +808,14 @@ async fn persist_and_optionally_present(
             let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
             let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
             let vb_params = vb_accumulator::setup::SetupParams::<Bls12_381> { P: g1, P_tilde: g2 };
-            let pkG2_b = params_contract.get_opener_pk_g2_by_name(cred_name.to_string()).call().await?;
-            let pk_acc = vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pkG2_b.0[..])?);
+            let pk_g2_b = params_contract.get_opener_pk_g2_by_name(cred_name.to_string()).call().await?;
+            let pk_acc = vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pk_g2_b.0[..])?);
             // Verify membership off-chain
             let delta_b: ethers::types::Bytes = acc.method("getDelta", (cred_name.to_string(),))?.call().await?;
             if delta_b.0.len() != 128 { println!("[witness] no Delta on-chain"); continue; }
-            let V = eip2537_g1_to_affine(&delta_b.0[..])?;
+            let v = eip2537_g1_to_affine(&delta_b.0[..])?;
             use vb_accumulator::positive::Accumulator as _;
-            let acc_view = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::from_accumulated(V);
+            let acc_view = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::from_accumulated(v);
             let wit_aff = eip2537_g1_to_affine(&wit.0[..])?;
             let mw = vb_accumulator::witness::MembershipWitness::<ark_bls12_381::G1Affine>(wit_aff);
             let ok = vb_accumulator::positive::Accumulator::verify_membership::<Bls12_381>(&acc_view, &e_fr, &mw, &pk_acc, &vb_params);
@@ -888,9 +883,9 @@ async fn persist_and_optionally_present(
         let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
         let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
         let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.to_string()).call().await?;
-        let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
-        for hb in h_bytes { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
-        let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
+        let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+        for hb in h_bytes { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
+        let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
         // Use in-memory aggregated signature; try to unblind using persisted blinding if available
         let sig_struct = {
             // Attempt to read blinding from known locations
@@ -943,7 +938,7 @@ async fn persist_and_optionally_present(
         let ctx_g1 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.g1).to_vec());
         let ctx_h0 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.h_0).to_vec());
         let ctx_h: Vec<EthBytes> = params_bbs.h.iter().map(|h| EthBytes::from(g1_to_eip2537_bytes(h).to_vec())).collect();
-        let ctx_h_len_dbg = ctx_h.len();
+        let _ctx_h_len_dbg = ctx_h.len();
         let sig_ap = EthBytes::from(g1_to_eip2537_bytes(&proof.A_prime).to_vec());
         let sig_ab = EthBytes::from(g1_to_eip2537_bytes(&proof.A_bar).to_vec());
         let sig_d  = EthBytes::from(g1_to_eip2537_bytes(&proof.d).to_vec());
@@ -960,7 +955,7 @@ async fn persist_and_optionally_present(
         check_len("sig.d", &sig_d, 128)?;
         let ctx_t = (onchain_mcount, ctx_g1, ctx_h0, ctx_h);
     let sig_t = (sig_ap.clone(), sig_ab.clone(), sig_d);
-        let mut revealed_vals_u256: Vec<U256> = revealed_idx.iter().map(|ix| {
+        let revealed_vals_u256: Vec<U256> = revealed_idx.iter().map(|ix| {
             let v = messages[*ix as usize];
             fr_to_u256(&v)
         }).collect();
@@ -973,7 +968,7 @@ async fn persist_and_optionally_present(
         let sc2 = proof.sc_resp_2.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_2"))?;
         let undis_count = (onchain_mcount as usize) - revealed_idx.len();
         let resp_msgs: Vec<U256> = sc2.0.iter().take(undis_count).map(fr_to_u256).collect();
-        let resp_msgs_len_dbg = resp_msgs.len();
+        let _resp_msgs_len_dbg = resp_msgs.len();
         let resp_r3 = fr_to_u256(&sc2.0[undis_count]);
         let resp_sprime = fr_to_u256(&sc2.0[undis_count + 1]);
         if resp_msgs.len() != undis_count { anyhow::bail!("respMsgs length {} != undisclosed count {}", resp_msgs.len(), undis_count); }

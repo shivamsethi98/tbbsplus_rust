@@ -24,7 +24,7 @@ fn decode_status(s: u8) -> &'static str {
 }
 
 fn parse_args() -> anyhow::Result<(String, u64, bool, bool, bool, bool)> {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let args = env::args().skip(1).collect::<Vec<_>>();
     let mut name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
     let mut sid: Option<u64> = env::var("SID").ok().and_then(|v| v.parse().ok());
     let mut watch = env::var("WATCH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
@@ -198,7 +198,7 @@ async fn pairing_call(provider: &std::sync::Arc<Provider<Ws>>, g1_1: &[u8], g2_1
 }
 
 fn fr_to_u256(fr: &Fr) -> U256 {
-    use ark_ff::BigInteger;
+    
     let bi = fr.into_bigint();
     let limbs: [u64; 4] = bi.0;
     let mut le32 = [0u8; 32];
@@ -224,18 +224,18 @@ fn read_user_blinding(name: &str, sid: u64) -> Option<Fr> {
     Some(fr)
 }
 
-fn read_local_signature(name: &str, sid: u64) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let addr_hex_opt = env::var("CLIENT_PK").ok().and_then(|pk| pk.parse::<LocalWallet>().ok()).map(|w| format!("{:x}", w.address()));
-    let id = addr_hex_opt.or_else(|| env::var("USER_ID").ok()).unwrap_or_else(|| "default".into());
-    let p = format!(".runtime/users/{}/{}/sid_{}/agg_signature.json", id, name, sid);
-    let data = std::fs::read(&p).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let a_hex = v.get("A")?.as_str()?; let e_hex = v.get("e")?.as_str()?; let s_hex = v.get("s")?.as_str()?;
-    let a = hex::decode(a_hex.trim_start_matches("0x")).ok()?;
-    let e = hex::decode(e_hex.trim_start_matches("0x")).ok()?;
-    let s = hex::decode(s_hex.trim_start_matches("0x")).ok()?;
-    Some((a, e, s))
-}
+// fn read_local_signature(name: &str, sid: u64) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+//     let addr_hex_opt = env::var("CLIENT_PK").ok().and_then(|pk| pk.parse::<LocalWallet>().ok()).map(|w| format!("{:x}", w.address()));
+//     let id = addr_hex_opt.or_else(|| env::var("USER_ID").ok()).unwrap_or_else(|| "default".into());
+//     let p = format!(".runtime/users/{}/{}/sid_{}/agg_signature.json", id, name, sid);
+//     let data = std::fs::read(&p).ok()?;
+//     let v: serde_json::Value = serde_json::from_slice(&data).ok()?;
+//     let a_hex = v.get("A")?.as_str()?; let e_hex = v.get("e")?.as_str()?; let s_hex = v.get("s")?.as_str()?;
+//     let a = hex::decode(a_hex.trim_start_matches("0x")).ok()?;
+//     let e = hex::decode(e_hex.trim_start_matches("0x")).ok()?;
+//     let s = hex::decode(s_hex.trim_start_matches("0x")).ok()?;
+//     Some((a, e, s))
+// }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -310,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
     if acc_mode {
         if let Some(acc) = accumulator_opt.as_ref() {
             // Need e for this sid
-            let (_A_b, e_u, _s_u, _st): (EthBytes, U256, U256, u8) = registry
+            let (_a_b, e_u, _s_u, _st): (EthBytes, U256, U256, u8) = registry
                 .method("getSignature", (name.clone(), U256::from(sid)))?
                 .call()
                 .await?;
@@ -337,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Debug: reconstruct B'' off-chain using precompiles and verify pairing
     if debug {
-        if let (Some(params), Some(verify_opt)) = (params_contract_opt.as_ref(), verify_contract_opt.as_ref()) {
+        if let (Some(params), Some(_verify_opt)) = (params_contract_opt.as_ref(), verify_contract_opt.as_ref()) {
             // Load params and request data
             let (g1_b, h0_b, g2_base): (EthBytes, EthBytes, EthBytes) = params
                 .method("getG1H0G2ByName", (name.clone(),))?
@@ -347,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
                 .method("getPkG2ByName", (name.clone(),))?
                 .call()
                 .await?;
-            let H: Vec<EthBytes> = params
+            let h: Vec<EthBytes> = params
                 .method("getHByName", (name.clone(),))?
                 .call()
                 .await?;
@@ -355,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
                 .method("getRequestData", (name.clone(), U256::from(sid)))?
                 .call()
                 .await?;
-            let (A_b, e_u, s_u, _st): (EthBytes, U256, U256, u8) = registry
+            let (a_b, e_u, s_u, _st): (EthBytes, U256, U256, u8) = registry
                 .method("getSignature", (name.clone(), U256::from(sid)))?
                 .call()
                 .await?;
@@ -372,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut scs: Vec<U256> = Vec::with_capacity(ridx.len());
                 for i in 0..ridx.len() {
                     let j = ridx[i].as_usize();
-                    if j < H.len() { pts.push(&H[j].0); scs.push(rvals[i]); }
+                    if j < h.len() { pts.push(&h[j].0); scs.push(rvals[i]); }
                 }
                 let sum_rev = g1msm_many_call(&provider, &pts, &scs).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
                 bpp = g1add_call(&provider, &bpp, &sum_rev).await.unwrap_or(bpp);
@@ -383,16 +383,16 @@ async fn main() -> anyhow::Result<()> {
             }
             let g1_plus_bpp = g1add_call(&provider, &g1_b, &bpp).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
             keccak.update(&g1_plus_bpp.0); let g1bpp_h = keccak.finalize_reset();
-            keccak.update(&A_b.0); let A_h = keccak.finalize_reset();
+            keccak.update(&a_b.0); let a_h = keccak.finalize_reset();
             keccak.update(&pk_g2.0); let pk_h = keccak.finalize_reset();
-            println!("[debug] hashes: g1+Bpp={}, A={}, pkG2={}", hex::encode(g1bpp_h), hex::encode(A_h), hex::encode(pk_h));
+            println!("[debug] hashes: g1+Bpp={}, A={}, pkG2={}", hex::encode(g1bpp_h), hex::encode(a_h), hex::encode(pk_h));
 
             // Recompute B' locally from user blinding and on-chain H for hidden set, compare to registry B'
             if let Some(r_fr) = read_user_blinding(&name, sid) {
                 // Hidden set = all indices except revealed
                 // fetch messageCount by counting H length
-                let mc = H.len();
-                // Build MSM input: include h0^r and all hidden H[i]^m[i] with m[i] default 100+i, or sid for i=0 if hidden
+                let mc = h.len();
+                // Build MSM input: include h0^r and all hidden h[i]^m[i] with m[i] default 100+i, or sid for i=0 if hidden
                 // Start with h0^r
                 let r_u = fr_to_u256(&r_fr);
                 let mut pts: Vec<&[u8]> = vec![&h0_b.0];
@@ -404,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
                     if i==0 { continue; }
                     if is_revealed[i] { continue; }
                     // hidden index i
-                    pts.push(&H[i].0);
+                    pts.push(&h[i].0);
                     let m_val = U256::from(100u64 + i as u64);
                     scs.push(m_val);
                 }
@@ -429,22 +429,22 @@ async fn main() -> anyhow::Result<()> {
             // Pairing via VerifyWrapper or precompile 0x0f (with pk+e*g2base)
             let ok_with_e = if let Some(verify) = verify_contract_opt.as_ref() {
                 verify
-                    .method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
+                    .method::<_, bool>("verifyPairing", (a_b.clone(), pk_plus_eg2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
                     .call()
                     .await
                     .unwrap_or(false)
             } else {
-                pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
+                pairing_call(&provider, &a_b.0, &pk_plus_eg2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
             };
             // Also check without the e term for comparison
             let ok_pk_only = if let Some(verify) = verify_contract_opt.as_ref() {
                 verify
-                    .method::<_, bool>("verifyPairing", (A_b.clone(), pk_g2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
+                    .method::<_, bool>("verifyPairing", (a_b.clone(), pk_g2.clone(), neg_g1_plus_bpp.clone(), g2_base.clone()))?
                     .call()
                     .await
                     .unwrap_or(false)
             } else {
-                pairing_call(&provider, &A_b.0, &pk_g2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
+                pairing_call(&provider, &a_b.0, &pk_g2.0, &neg_g1_plus_bpp.0, &g2_base.0).await.unwrap_or(false)
             };
             println!("[debug] off-chain reconstructed pairing -> with_e={} pk_only={}", ok_with_e, ok_pk_only);
 
@@ -454,14 +454,14 @@ async fn main() -> anyhow::Result<()> {
                 let sum_rev_only = if !ridx.is_empty() {
                     let mut pts: Vec<&[u8]> = Vec::with_capacity(ridx.len());
                     let mut scs: Vec<U256> = Vec::with_capacity(ridx.len());
-                    for i in 0..ridx.len() { let j = ridx[i].as_usize(); if j < H.len() { pts.push(&H[j].0); scs.push(rvals[i]); } }
+                    for i in 0..ridx.len() { let j = ridx[i].as_usize(); if j < h.len() { pts.push(&h[j].0); scs.push(rvals[i]); } }
                     g1msm_many_call(&provider, &pts, &scs).await.unwrap_or_else(|_| EthBytes::from_static(&[]))
                 } else { EthBytes::from_static(&[0u8;128]) };
                 let bpp_noh0s = if sum_rev_only.0.is_empty() || sum_rev_only.0.len()!=128 { bprime.clone() } else { g1add_call(&provider, &bprime, &sum_rev_only).await.unwrap_or(bprime.clone()) };
                 g1add_call(&provider, &g1_b, &bpp_noh0s).await.unwrap_or_else(|_| EthBytes::from_static(&[]))
             };
             let neg_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, EthBytes>("g1neg", (g1_plus_bpp_noh0s.clone(),))?.call().await.unwrap_or_else(|_| EthBytes::from_static(&[])) } else { g1neg_eip(&g1_plus_bpp_noh0s.0) };
-            let ok_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_noh0s.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_noh0s.0, &g2_base.0).await.unwrap_or(false) };
+            let ok_noh0s = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (a_b.clone(), pk_plus_eg2.clone(), neg_noh0s.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &a_b.0, &pk_plus_eg2.0, &neg_noh0s.0, &g2_base.0).await.unwrap_or(false) };
 
             // 2) Treat B' as hidden-only: subtract h0^r if we can read r, then add h0^s
             let mut ok_hidden = false;
@@ -474,13 +474,13 @@ async fn main() -> anyhow::Result<()> {
                 let bpp_hidden_plus_rev = if !ridx.is_empty() {
                     let mut pts: Vec<&[u8]> = Vec::with_capacity(ridx.len());
                     let mut scs: Vec<U256> = Vec::with_capacity(ridx.len());
-                    for i in 0..ridx.len() { let j = ridx[i].as_usize(); if j < H.len() { pts.push(&H[j].0); scs.push(rvals[i]); } }
+                    for i in 0..ridx.len() { let j = ridx[i].as_usize(); if j < h.len() { pts.push(&h[j].0); scs.push(rvals[i]); } }
                     let sum_rev = g1msm_many_call(&provider, &pts, &scs).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
                     g1add_call(&provider, &bpp_hidden, &sum_rev).await.unwrap_or(bpp_hidden)
                 } else { bpp_hidden };
                 let g1_plus_bpp_hidden = g1add_call(&provider, &g1_b, &bpp_hidden_plus_rev).await.unwrap_or_else(|_| EthBytes::from_static(&[]));
                 let neg_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, EthBytes>("g1neg", (g1_plus_bpp_hidden.clone(),))?.call().await.unwrap_or_else(|_| EthBytes::from_static(&[])) } else { g1neg_eip(&g1_plus_bpp_hidden.0) };
-                ok_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (A_b.clone(), pk_plus_eg2.clone(), neg_hidden.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &A_b.0, &pk_plus_eg2.0, &neg_hidden.0, &g2_base.0).await.unwrap_or(false) };
+                ok_hidden = if let Some(verify) = verify_contract_opt.as_ref() { verify.method::<_, bool>("verifyPairing", (a_b.clone(), pk_plus_eg2.clone(), neg_hidden.clone(), g2_base.clone()))?.call().await.unwrap_or(false) } else { pairing_call(&provider, &a_b.0, &pk_plus_eg2.0, &neg_hidden.0, &g2_base.0).await.unwrap_or(false) };
             }
             println!("[debug] pairing variants: with_e={} no_h0s={} hidden_only+add_h0s={}", ok_with_e, ok_noh0s, ok_hidden);
             // Optional: could decode full CredParams here to cross-check messageCount; skipped for brevity

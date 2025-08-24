@@ -9,9 +9,9 @@ use std::str::FromStr;
 
 use base64::Engine;
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
+use ark_serialize::CanonicalSerialize;
 use ark_ff::PrimeField;
-use std::io::Read;
+
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use bbs_plus::prelude::*;
 use ethers::contract::abigen;
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let onchain_mcount: u32 = pc0.message_count.as_u64() as u32;
     if onchain_mcount != message_count { eprintln!("[issuer] WARNING: MESSAGE_COUNT env {} != on-chain {}", message_count, onchain_mcount); }
     let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(cred_name.clone()).call().await?;
-    let mut H_bytes: Vec<ethers::types::Bytes> = params.get_h_by_name(cred_name.clone()).call().await?;
+    let mut h_bytes: Vec<ethers::types::Bytes> = params.get_h_by_name(cred_name.clone()).call().await?;
     let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
     let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
     let g2 = {
@@ -147,9 +147,9 @@ async fn main() -> anyhow::Result<()> {
         use tbbsplus_rust::orchestration::helpers::eip2537_g2_to_affine as decode_g2;
         decode_g2(&g2_b.0[..])?
     };
-    let mut H: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(H_bytes.len());
-    for hb in H_bytes.drain(..) { H.push(eip2537_g1_to_affine(&hb.0[..])?); }
-    let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h: H };
+    let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+    for hb in h_bytes.drain(..) { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
+    let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
     let shares_file = env::var("SHARES_FILE").unwrap_or_else(|_| ".runtime.shares.json".into());
     let data = std::fs::read(&shares_file)
         .map_err(|e| anyhow::anyhow!("failed to read shares file {shares_file}: {:?}", e))?;
@@ -598,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
         tmp_pairs.push((idx, u256_to_fr::<Fr>(v)));
     }
     if !sid_ok { tmp_pairs.push((0usize, Fr::from(sid))); }
-    let mut values_store: Vec<Fr> = tmp_pairs.iter().map(|(_, fr)| fr.clone()).collect();
+    let values_store: Vec<Fr> = tmp_pairs.iter().map(|(_, fr)| fr.clone()).collect();
     let mut uncommitted: BTreeMap<usize, &Fr> = BTreeMap::new();
     for (k, (idx, _)) in tmp_pairs.iter().enumerate() {
         let fr_ref: &Fr = &values_store[k];
@@ -701,8 +701,6 @@ fn fr_to_u256(fr: &ark_bls12_381::Fr) -> U256 {
 
 fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
     use ark_bls12_381::Fq;
-    use ark_ec::AffineRepr;
-    use ark_ec::CurveGroup;
     if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
     let mut x_be48 = [0u8; 48];
     let mut y_be48 = [0u8; 48];
@@ -729,7 +727,7 @@ fn verify_commitment_pok_from_fields(
 ) -> anyhow::Result<()> {
     use blake2::Blake2b512;
     use schnorr_pok::pok_generalized_pedersen::{SchnorrResponse, compute_random_oracle_challenge};
-    use ark_ec::AffineRepr;
+
     let t = eip2537_g1_to_affine(t_eip)?;
     // Build bases and y
     let mut bases = Vec::with_capacity(1 + hidden_idx.len());

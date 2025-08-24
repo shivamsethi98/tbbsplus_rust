@@ -1,6 +1,6 @@
 
 use ark_bls12_381::{Bls12_381, Fr, Fq};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::CanonicalSerialize;
 use ark_std::{rand::{rngs::StdRng, SeedableRng}, UniformRand};
 use bbs_plus::prelude::*;
 use blake2::Blake2b512;
@@ -107,8 +107,8 @@ pub fn build_commitment_pok(
     revealed_vals: &Vec<U256>,
     context: &Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
-    use ark_ec::AffineRepr;
-    use std::collections::BTreeMap;
+    
+    
 
     // Bases for Schnorr: [h_0] for blinding, and [h_i] for each hidden i
     let mut bases = Vec::with_capacity(1 + hidden_msgs.len());
@@ -238,7 +238,7 @@ pub fn fq2_to_be64_pair(x_c0: &Fq, x_c1: &Fq) -> [u8; 128] {
 }
 
 pub fn g2_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine) -> [u8; 256] {
-    use ark_bls12_381::Fq2;
+    
     let (x, y) = (p.x, p.y);
     let mut out = [0u8; 256];
     let xbe = fq2_to_be64_pair(&x.c0, &x.c1);
@@ -249,7 +249,7 @@ pub fn g2_to_eip2537_bytes(p: &<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine
 }
 
 pub fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
-    use ark_ec::AffineRepr;
+    
     if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
     let mut x_be48 = [0u8; 48];
     let mut y_be48 = [0u8; 48];
@@ -263,7 +263,7 @@ pub fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark
 
 pub fn eip2537_g2_to_affine(bytes256: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G2Affine> {
     use ark_bls12_381::{Fq2, G2Affine};
-    use ark_ec::AffineRepr;
+    
     if bytes256.len() != 256 { anyhow::bail!("bad g2 len"); }
     // bytes are (x.c0||x.c1||y.c0||y.c1), each limb 64 bytes with left pad
     let mut x0_be48 = [0u8; 48];

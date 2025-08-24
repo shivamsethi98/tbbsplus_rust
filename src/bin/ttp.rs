@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Context;
-use ark_bls12_381::{Bls12_381, Fr, Fq};
+use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::SeedableRng;
 use base64::Engine;
@@ -20,9 +20,7 @@ use ark_ff::PrimeField;
 use blake2::Blake2b512;
 use bbs_plus::prelude::*;
 use tbbsplus_rust::orchestration::helpers::{
-    g1_to_eip2537_bytes,
     g2_to_eip2537_bytes,
-    fq_to_be64,
     fq2_pair_to_be,
 };
 
@@ -176,8 +174,8 @@ async fn main() -> anyhow::Result<()> {
     // g1/h0/H from label-derived params
     let g1_b = g1_to_eip2537_bytes(&params_bbs.g1).to_vec();
     let h0_b = g1_to_eip2537_bytes(&params_bbs.h_0).to_vec();
-    let mut H_bytes: Vec<Vec<u8>> = Vec::with_capacity(params_bbs.h.len());
-    for h in params_bbs.h.iter() { H_bytes.push(g1_to_eip2537_bytes(h).to_vec()); }
+    let mut h_bytes: Vec<Vec<u8>> = Vec::with_capacity(params_bbs.h.len());
+    for h in params_bbs.h.iter() { h_bytes.push(g1_to_eip2537_bytes(h).to_vec()); }
 
     params
         .set_g1h0g2(
@@ -192,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
     params
         .set_h_by_name(
             cred_name.clone(),
-            H_bytes.clone().into_iter().map(ethers::types::Bytes::from).collect(),
+            h_bytes.clone().into_iter().map(ethers::types::Bytes::from).collect(),
         )
         .send()
         .await?

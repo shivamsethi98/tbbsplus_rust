@@ -23,7 +23,7 @@ use oblivious_transfer_protocols::ot_based_multiplication::{
 };
 
 #[cfg(feature = "mpc")]
-use crate::orchestration::mesh::p2p::{Mesh, MeshHandle};
+use crate::orchestration::mesh::p2p::MeshHandle;
 
 // Constants for the MPC protocol
 pub const BASE_OT_KEY_SIZE: u16 = 128;

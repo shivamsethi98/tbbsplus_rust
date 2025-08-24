@@ -1,15 +1,16 @@
 // Simplified hybrid mesh network without Kademlia DHT
+use anyhow::{anyhow, Result};
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::time::Duration;
-use anyhow::{Result, anyhow};
-use serde::{Serialize, Deserialize};
-use tokio::sync::{mpsc::{channel, Sender, Receiver}, oneshot};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
 
 #[cfg(feature = "mpc")]
 pub mod p2p {
     use super::*;
     use libp2p::{
-        gossipsub::{self, MessageId, MessageAuthenticity, Topic, TopicHash, Sha256Topic as MyTopic},
+        gossipsub::{self, MessageId, MessageAuthenticity, TopicHash, Sha256Topic as MyTopic},
         identity::Keypair,
         mdns,
         noise,

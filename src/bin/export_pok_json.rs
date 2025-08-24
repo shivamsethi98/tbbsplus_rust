@@ -1,7 +1,6 @@
 use ark_bls12_381::{Bls12_381 as E, Fq, Fr, G1Affine};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{PrimeField, UniformRand};
-use ark_serialize::CanonicalSerialize;
 use bbs_plus::prelude::*;
 use blake2::Blake2b512;
 use dock_crypto_utils::signature::MessageOrBlinding;
@@ -14,30 +13,30 @@ use secret_sharing_and_dkg::shamir_ss::deal_random_secret;
 
 #[derive(Serialize)]
 struct PokJson {
-    messageCount: usize,
+    message_count: usize,
     g1: String,
     h0: String,
-    H: Vec<String>,
-    APrime: String,
-    ABar: String,
+    h: Vec<String>,
+    aprime: String,
+    abar: String,
     d: String,
-    T1: String,
-    T2: String,
-    revealedIdx: Vec<usize>,
-    revealedVals: Vec<String>,
+    t1: String,
+    t2: String,
+    revealed_idx: Vec<usize>,
+    revealed_vals: Vec<String>,
     challenge: String,
-    respA: String,
-    respH0: String,
-    respR3: String,
-    respSPrime: String,
-    respMsgs: Vec<String>,
+    resp_a: String,
+    resp_h0: String,
+    resp_r3: String,
+    resp_sprime: String,
+    resp_msgs: Vec<String>,
     // Optional encryption relation
-    Ybar: Option<String>,
-    T1enc: Option<String>,
-    T2enc: Option<String>,
-    Tenc: Option<String>,
-    respA3: Option<String>,
-    respK: Option<String>,
+    ybar: Option<String>,
+    t1enc: Option<String>,
+    t2enc: Option<String>,
+    tenc: Option<String>,
+    resp_a3: Option<String>,
+    resp_k: Option<String>,
 }
 
 fn keccak_to_fr(bytes: &[u8]) -> Fr {
@@ -139,7 +138,7 @@ fn main() -> Result<()> {
 
     // Extract responses/order (borrow to avoid moving out of `proof`)
     let resp1_ref = &proof.sc_resp_1; // contains t (T1) and 2 responses
-    let (respA_ref, respH0_ref) = (&resp1_ref.response1, &resp1_ref.response2);
+    let (resp_a_ref, resp_h0_ref) = (&resp1_ref.response1, &resp1_ref.response2);
 
     // bases_2 order: undisclosed H (in param index order), then d, then h0
     let mut resp_msgs = vec![];
@@ -179,29 +178,29 @@ fn main() -> Result<()> {
             );
         }
         let pj = PokJson {
-            messageCount: m,
+            message_count: m,
             g1: g1_hex(&params.g1),
             h0: g1_hex(&params.h_0),
-            H: params.h.iter().map(g1_hex).collect(),
-            APrime: g1_hex(&proof.A_prime),
-            ABar: g1_hex(&proof.A_bar),
+            h: params.h.iter().map(g1_hex).collect(),
+            aprime: g1_hex(&proof.A_prime),
+            abar: g1_hex(&proof.A_bar),
             d: g1_hex(&proof.d),
-            T1: g1_hex(&resp1_ref.t),
-            T2: g1_hex(&proof.T2),
-            revealedIdx: revealed_idx.clone(),
-            revealedVals: revealed_idx.iter().map(|i| fr_to_be32_hex(&msgs[*i])).collect(),
+            t1: g1_hex(&resp1_ref.t),
+            t2: g1_hex(&proof.T2),
+            revealed_idx: revealed_idx.clone(),
+            revealed_vals: revealed_idx.iter().map(|i| fr_to_be32_hex(&msgs[*i])).collect(),
             challenge: fr_to_be32_hex(&c),
-            respA: fr_to_be32_hex(respA_ref),
-            respH0: fr_to_be32_hex(respH0_ref),
-            respR3: fr_to_be32_hex(resp_r3),
-            respSPrime: fr_to_be32_hex(resp_sprime),
-            respMsgs: resp_msgs,
-            Ybar: y_hex,
-            T1enc: t1e_hex,
-            T2enc: t2e_hex,
-            Tenc: tenc_hex,
-            respA3: resp_a3_hex,
-            respK: resp_k_hex,
+            resp_a: fr_to_be32_hex(resp_a_ref),
+            resp_h0: fr_to_be32_hex(resp_h0_ref),
+            resp_r3: fr_to_be32_hex(resp_r3),
+            resp_sprime: fr_to_be32_hex(resp_sprime),
+            resp_msgs: resp_msgs,
+            ybar: y_hex,
+            t1enc: t1e_hex,
+            t2enc: t2e_hex,
+            tenc: tenc_hex,
+            resp_a3: resp_a3_hex,
+            resp_k: resp_k_hex,
         };
         let json = serde_json::to_string_pretty(&pj)?;
         let p = PathBuf::from(out_path);
