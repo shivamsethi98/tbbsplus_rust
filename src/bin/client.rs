@@ -764,9 +764,9 @@ async fn persist_and_optionally_present(
         (messages, signature)
     };
 
-    // Action loop: verify off-chain, present on-chain, or exit
+    // Action loop: verify off-chain, present on-chain, fetch-witness, or exit
     loop {
-        println!("Choose action: [v]erify off-chain, [p]resent on-chain, [e]xit (default: verify)");
+        println!("Choose action: [v]erify off-chain, [p]resent on-chain, [w]itness check, [e]xit (default: verify)");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         let choice = line.trim().to_lowercase();
@@ -793,6 +793,38 @@ async fn persist_and_optionally_present(
                 Ok(()) => println!("[local] aggregated signature verification: OK"),
                 Err(e) => println!("[local] aggregated signature verification FAILED: {:?}", e),
             }
+            continue;
+        } else if choice == "w" || choice == "witness" {
+            // Fetch witness and verify membership off-chain
+            let acc_addr: Address = env::var("ACC_CONTRACT").expect("ACC_CONTRACT").parse()?;
+            let art = std::fs::read("artifacts/contracts/Accumulator.sol/Accumulator.json")?;
+            let v: serde_json::Value = serde_json::from_slice(&art)?;
+            let abi: Abi = serde_json::from_value(v.get("abi").cloned().ok_or_else(|| anyhow::anyhow!("abi missing"))?)?;
+            let acc = Contract::new(acc_addr, abi, client.clone());
+            // Load signature e and Delta
+            let sig_v: serde_json::Value = serde_json::from_slice(&std::fs::read(base.join("agg_signature.json"))?)?;
+            let e_hex = sig_v.get("e").and_then(|x| x.as_str()).ok_or_else(|| anyhow::anyhow!("sig.e missing"))?;
+            let e_fr = Fr::deserialize_compressed(&hex::decode(e_hex.trim_start_matches("0x"))?[..])?;
+            let e_u = fr_to_u256(&e_fr);
+            let wit: ethers::types::Bytes = acc.method("getWitness", (cred_name.to_string(), e_u))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+            if wit.0.is_empty() { println!("[witness] not available yet"); continue; }
+            // Rebuild accumulator params and pkAcc
+            let (g1_b, _h0_b, g2_b) = params_contract.get_g1h0g2_by_name(cred_name.to_string()).call().await?;
+            let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
+            let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
+            let vb_params = vb_accumulator::setup::SetupParams::<Bls12_381> { P: g1, P_tilde: g2 };
+            let pkG2_b = params_contract.get_opener_pk_g2_by_name(cred_name.to_string()).call().await?;
+            let pk_acc = vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pkG2_b.0[..])?);
+            // Verify membership off-chain
+            let delta_b: ethers::types::Bytes = acc.method("getDelta", (cred_name.to_string(),))?.call().await?;
+            if delta_b.0.len() != 128 { println!("[witness] no Delta on-chain"); continue; }
+            let V = eip2537_g1_to_affine(&delta_b.0[..])?;
+            use vb_accumulator::positive::Accumulator as _;
+            let acc_view = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::from_accumulated(V);
+            let wit_aff = eip2537_g1_to_affine(&wit.0[..])?;
+            let mw = vb_accumulator::witness::MembershipWitness::<ark_bls12_381::G1Affine>(wit_aff);
+            let ok = vb_accumulator::positive::Accumulator::verify_membership::<Bls12_381>(&acc_view, &e_fr, &mw, &pk_acc, &vb_params);
+            println!("[witness] membership {}", if ok { "OK" } else { "FAIL" });
             continue;
         } else if choice == "p" || choice == "present" {
         // Resolve VerifyWrapper address: prefer VERIFY_CONTRACT env; prompt if missing/invalid.
@@ -975,137 +1007,18 @@ async fn persist_and_optionally_present(
 
 
 
-        // First call: plain PoK verification (no pairing)
-        match contract
+        // Encryption extras from proof
+        let t1_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
+        let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
+        let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
+        let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
+        let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
+        let params_addr_u8: [u8; 20] = params_contract.address().into();
+        let params_addr_eth: Address = Address::from(params_addr_u8);
+        // Single call that does full verification and emits PresentationVerified(T1,T2)
+        let call = contract
             .method::<_, bool>(
-                "verifyPok",
-                (sig_t.clone(), ctx_t.clone(), revealed_t.clone(), challenge_u256, p1_t.clone(), p2_t.clone()),
-            )?
-            .call()
-            .await
-        {
-            Ok(ok) => {
-                println!("[present debug] verifyPok -> {}", ok);
-            }
-            Err(e) => {
-                let dbg = format!(
-                    "verifyPok error: {:?}\n[debug] ctx.H len={}, revealedIdx len={}, respMsgs len={} (expected undisclosed={})\n",
-                    e, ctx_h_len_dbg, revealed_idx.len(), resp_msgs_len_dbg, undis_count
-                );
-                print!("{}", dbg);
-                let _ = std::fs::write("client.log", dbg.clone());
-            }
-        }
-
-        // Pairing diagnostics (if pkG2 present):
-        //  - call verifyPairing in both orders
-        //  - direct eth_call to pairing precompile and print raw 32-byte outputs
-        let pk_g2_opt: Option<ethers::types::Bytes> = {
-            // Read pkG2 bytes from Params
-            let pc2 = params_contract.get_params_by_name(cred_name.to_string()).call().await?;
-            let pk = pc2.pk_g2; // abigen-generated field name
-            if pk.0.is_empty() { None } else { Some(pk) }
-        };
-        if let Some(pk_g2) = pk_g2_opt {
-            let g2_base = g2_to_eip2537_bytes(&params_bbs.g2);
-            // Compute negations via contract helper to ensure on-chain semantics
-            let neg_abar: ethers::types::Bytes = contract
-                .method::<_, ethers::types::Bytes>("g1neg", sig_ab.clone())?
-                .call()
-                .await
-                .unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-            let neg_aprime: ethers::types::Bytes = contract
-                .method::<_, ethers::types::Bytes>("g1neg", sig_ap.clone())?
-                .call()
-                .await
-                .unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-
-            // Try verifyPairing in both equivalent orders
-            let ok_pair_1 = contract
-                .method::<_, bool>(
-                    "verifyPairing",
-                    (sig_ap.clone(), pk_g2.clone(), neg_abar.clone(), ethers::types::Bytes::from(g2_base.to_vec())),
-                )?
-                .call()
-                .await
-                .unwrap_or(false);
-            let ok_pair_2 = contract
-                .method::<_, bool>(
-                    "verifyPairing",
-                    (sig_ab.clone(), ethers::types::Bytes::from(g2_base.to_vec()), neg_aprime.clone(), pk_g2.clone()),
-                )?
-                .call()
-                .await
-                .unwrap_or(false);
-            println!("[present debug] verifyPairing variants -> ok1={} ok2={}", ok_pair_1, ok_pair_2);
-
-            // Derive pkG2 locally using the same deterministic secret as TTP for comparison
-            let mut rng_sk = StdRng::seed_from_u64(42);
-            let (secret, _shares_d, _poly_d) = secret_sharing_and_dkg::shamir_ss::deal_random_secret::<_, Fr>(&mut rng_sk, onchain_t, onchain_n)
-                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
-            use ark_ec::{CurveGroup, AffineRepr};
-            let pk_proj = params_bbs.g2.mul_bigint(secret.into_bigint());
-            let pk_aff = pk_proj.into_affine();
-            let pk_derived = g2_to_eip2537_bytes(&pk_aff);
-            // Try pairing with derived pk as well
-            let ok_pair_derived_1 = contract
-                .method::<_, bool>(
-                    "verifyPairing",
-                    (sig_ap.clone(), ethers::types::Bytes::from(pk_derived.to_vec()), neg_abar.clone(), ethers::types::Bytes::from(g2_base.to_vec())),
-                )?
-                .call()
-                .await
-                .unwrap_or(false);
-            let ok_pair_derived_2 = contract
-                .method::<_, bool>(
-                    "verifyPairing",
-                    (sig_ab.clone(), ethers::types::Bytes::from(g2_base.to_vec()), neg_aprime.clone(), ethers::types::Bytes::from(pk_derived.to_vec())),
-                )?
-                .call()
-                .await
-                .unwrap_or(false);
-
-            // Direct precompile eth_call for raw output bytes
-            let pair_addr: ethers::types::Address = "0x000000000000000000000000000000000000000f".parse()?;
-            let mut inp1 = Vec::with_capacity(128+256+128+256);
-            inp1.extend_from_slice(&sig_ap);
-            inp1.extend_from_slice(&pk_g2);
-            inp1.extend_from_slice(&neg_abar);
-            inp1.extend_from_slice(&g2_base);
-            let call_req1 = serde_json::json!([{ "to": format!("0x{:040x}", pair_addr), "data": format!("0x{}", hex::encode(&inp1)) }, "latest"]);
-            let out1: String = client.provider().request("eth_call", call_req1).await.unwrap_or_else(|_| "0x".to_string());
-
-            let mut inp2 = Vec::with_capacity(128+256+128+256);
-            inp2.extend_from_slice(&sig_ab);
-            inp2.extend_from_slice(&g2_base);
-            inp2.extend_from_slice(&neg_aprime);
-            inp2.extend_from_slice(&pk_g2);
-            let call_req2 = serde_json::json!([{ "to": format!("0x{:040x}", pair_addr), "data": format!("0x{}", hex::encode(&inp2)) }, "latest"]);
-            let out2: String = client.provider().request("eth_call", call_req2).await.unwrap_or_else(|_| "0x".to_string());
-
-            // Input digests to quickly compare exact bytes being used
-            use sha3::Digest as _;
-            let mut keccak = sha3::Keccak256::new(); keccak.update(&sig_ap); let ap_h = keccak.finalize_reset();
-            keccak.update(&sig_ab); let ab_h = keccak.finalize_reset();
-            keccak.update(&pk_g2); let pk_h = keccak.finalize_reset();
-            keccak.update(&g2_base); let g2_h = keccak.finalize_reset();
-            keccak.update(&pk_derived); let pkd_h = keccak.finalize_reset();
-            println!(
-                "[present debug] hashes: A'={}, Ā={}, pkG2={}, g2={}, pkDerived={}",
-                hex::encode(ap_h), hex::encode(ab_h), hex::encode(pk_h), hex::encode(g2_h), hex::encode(pkd_h)
-            );
-            println!("[present debug] verifyPairing with derived pk -> ok1={} ok2={}", ok_pair_derived_1, ok_pair_derived_2);
-
-            // Encryption extras from proof
-            let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
-            let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
-            let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
-            let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
-            let params_addr_u8: [u8; 20] = params_contract.address().into();
-            let params_addr_eth: Address = Address::from(params_addr_u8);
-            match contract
-                .method::<_, bool>(
-                    "verifyPokEncWithPairingFromParams",
+                "verifyPokEncWithPairingFromParamsEmit",
                     (
                         sig_t,
                         ctx_t,
@@ -1113,33 +1026,25 @@ async fn persist_and_optionally_present(
                         challenge_u256,
                         p1_t,
                         p2_t,
-                        t2enc_b,
-                        t_enc_b,
-                        resp_a3_u,
-                        resp_k_u,
-                        cred_name.to_string(),
-                        params_addr_eth,
-                    ),
-                )?
-                .call()
-                .await
-            {
-                Ok(ok) => {
-                    println!("[present debug] verifyPokWithPairing -> {}", ok);
-                    println!("[present debug] pairing precompile raw out1={} out2={}", out1, out2);
-                }
-                Err(e) => {
-                    let dbg = format!(
-                        "verifyPokWithPairing error: {:?}\n[debug] ctx.H len={}, revealedIdx len={}, respMsgs len={} (expected undisclosed={})\n",
-                        e, ctx_h_len_dbg, revealed_idx.len(), resp_msgs_len_dbg, undis_count
-                    );
-                    print!("{}", dbg);
-                    let _ = std::fs::write("client.log", dbg.clone());
-                }
+                    t1_b,
+                    t2enc_b,
+                    t_enc_b,
+                    resp_a3_u,
+                    resp_k_u,
+                    cred_name.to_string(),
+                    params_addr_eth,
+                ),
+            )?;
+        let pending_tx = call.send().await?;
+        let rcpt = pending_tx.await?;
+        let topic = H256::from(ethers::utils::keccak256(b"PresentationVerified(string,address,bytes,bytes)"));
+        let mut ok = false;
+        if let Some(r) = rcpt.as_ref() {
+            for lg in &r.logs {
+                if lg.address == verify_addr && !lg.topics.is_empty() && lg.topics[0] == topic { ok = true; break; }
             }
-        } else {
-            println!("[present debug] pkG2 not set in Params; skipping pairing check");
         }
+        println!("Client: presentation {}", if ok { "succeeded" } else { "failed (no event)" });
     } else if choice == "e" || choice == "exit" {
         break;
     } else {

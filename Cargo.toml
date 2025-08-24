@@ -105,3 +105,7 @@ path = "src/bin/cred_status.rs"
 [[bin]]
 name = "opener"
 path = "src/bin/opener.rs"
+
+[[bin]]
+name = "service_provider"
+path = "src/bin/service_provider.rs"

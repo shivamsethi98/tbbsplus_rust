@@ -51,12 +51,22 @@ async function main() {
   const openerAddr = process.env.OPENER_ADDR || owner.address;
   await (await (registry as any).connect(owner).setAccumulatorManager(openerAddr, true)).wait();
 
+  // Set Service Provider on Accumulator (callable by opener)
+  const spAddr = process.env.SP_ADDR || "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720";
+  try {
+    const openerSigner = await ethers.getSigner(openerAddr);
+    await (await (accumulator as any).connect(openerSigner).setServiceProvider(spAddr)).wait();
+  } catch (e) {
+    console.warn("setServiceProvider failed:", e);
+  }
+
   console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
   console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
   console.log(`export REGISTRY_CONTRACT=${await registry.getAddress()}`);
   console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
   console.log(`export ACC_CONTRACT=${await accumulator.getAddress()}`);
   console.log(`export OPENER_ADDR=${openerAddr}`);
+  console.log(`export SP_ADDR=${spAddr}`);
   console.log(`export CHAIN_ID=31337`);
   console.log(`export ETH_WS=ws://127.0.0.1:8545`);
 }

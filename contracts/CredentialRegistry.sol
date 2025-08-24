@@ -182,6 +182,35 @@ contract CredentialRegistry {
             emit Aggregated(name, sid, A128, p.e, p.s);
             // cleanup pending
             delete pendings[k];
+
+            // Auto-confirm if B' available
+            if (srec.Bprime.length == 128) {
+                (bytes memory g1, bytes memory h0, bytes memory g2base) = params.getG1H0G2ByName(name);
+                bytes memory pkG2 = params.getPkG2ByName(name);
+                require(g1.length == 128 && h0.length == 128 && g2base.length == 256 && pkG2.length == 256, "params unset");
+                bytes memory h0s = Bls12381.g1msm(Bls12381.concatMSM(_oneArray(h0), _oneScalar(srec.s)));
+                bytes memory Bpp = Bls12381.g1add(srec.Bprime, h0s);
+                uint32[] storage ridx2 = revealedIdxs[k];
+                uint256[] storage rvals2 = revealedVals[k];
+                if (ridx2.length > 0) {
+                    Params.CredParams memory cp2 = params.getParamsByName(name);
+                    bytes[] memory H = params.getHByName(name);
+                    require(H.length == cp2.messageCount, "H len");
+                    bytes[] memory pts = new bytes[](ridx2.length);
+                    uint256[] memory scs = new uint256[](ridx2.length);
+                    for (uint256 i = 0; i < ridx2.length; i++) { pts[i] = H[uint256(ridx2[i])]; scs[i] = rvals2[i]; }
+                    bytes memory sumRevealed = Bls12381.g1msm(Bls12381.concatMSM(pts, scs));
+                    Bpp = Bls12381.g1add(Bpp, sumRevealed);
+                }
+                bytes memory g1PlusBpp = Bls12381.g1add(g1, Bpp);
+                uint256[] memory sc_one = _oneScalar(srec.e);
+                bytes[] memory g2_one = new bytes[](1); g2_one[0] = g2base;
+                bytes memory eg2 = Bls12381.g2msm(Bls12381.concatMSM_G2(g2_one, sc_one));
+                bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
+                bytes memory neg_g1_plus_bpp = Bls12381.g1neg(g1PlusBpp);
+                bool ok = Verify.verifyPairing(srec.A, pk_plus_eg2, neg_g1_plus_bpp, g2base);
+                if (ok) { srec.status = Status.Verified; emit Confirmed(name, sid); }
+            }
         }
     }
 

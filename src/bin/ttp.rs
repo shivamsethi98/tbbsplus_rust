@@ -210,6 +210,24 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .await?;
 
+    // Persist opener secret shares for openers to read (single opener v1: index 1)
+    {
+        use ark_serialize::CanonicalSerialize as _;
+        let mut sk_bytes = Vec::new();
+        opener_sk.serialize_compressed(&mut sk_bytes)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sk_bytes);
+        let out = serde_json::json!({
+            "openers": {
+                "1": { "y_b64": b64 }
+            }
+        });
+        let data = serde_json::to_vec_pretty(&out)?;
+        let tmp = ".runtime.openers.json.tmp";
+        fs::write(tmp, &data)?;
+        fs::rename(tmp, ".runtime.openers.json")?;
+        println!("TTP: wrote opener secret to .runtime.openers.json (index 1)");
+    }
+
     // Write a .runtime.env for tests/clients to source
     {
         use std::io::Write as _;

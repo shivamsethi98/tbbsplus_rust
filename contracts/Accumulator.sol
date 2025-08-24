@@ -15,6 +15,7 @@ interface ICredentialRegistryLike {
 contract Accumulator {
     Params public immutable params;
     ICredentialRegistryLike public immutable registry;
+    address public serviceProvider;
 
     constructor(Params _params, ICredentialRegistryLike _registry) {
         params = _params;
@@ -23,6 +24,11 @@ contract Accumulator {
 
     modifier onlyOpener() {
         require(registry.accumulatorManagers(msg.sender), "not opener");
+        _;
+    }
+
+    modifier onlyServiceProvider() {
+        require(msg.sender == serviceProvider, "not sp");
         _;
     }
 
@@ -35,9 +41,22 @@ contract Accumulator {
     mapping(bytes32 => bytes) private deltas;
     // Per-name mapping from element e (Fr) to membership witness (G1, 128 bytes)
     mapping(bytes32 => mapping(uint256 => bytes)) private witnesses;
+    // Per-name mapping from keccak256(A128) to element e (revocation tag)
+    mapping(bytes32 => mapping(bytes32 => uint256)) private AhashToE;
+    // Per-name revocation flags for element e
+    mapping(bytes32 => mapping(uint256 => bool)) private revoked;
 
     event AccumulatorUpdated(string indexed name, bytes delta);
     event WitnessAvailable(string indexed name, uint256 indexed e, bytes witness, bytes delta);
+    event MappingPublished(string indexed name, uint256 indexed sid, bytes32 Ahash, uint256 e);
+    event MemberRevoked(string indexed name, uint256 indexed e, bytes newDelta);
+    event OpenRequested(string indexed name, address indexed requester, bytes T1, bytes T2);
+    event Opened(string indexed name, bytes A);
+
+    function setServiceProvider(address sp) external onlyOpener {
+        require(sp != address(0), "bad sp");
+        serviceProvider = sp;
+    }
 
     /// @notice Set or update accumulator anchor for credential `name`
     function setDelta(string calldata name, bytes calldata delta128) external onlyOpener {
@@ -61,6 +80,63 @@ contract Accumulator {
 
     function getWitness(string calldata name, uint256 e) external view returns (bytes memory) {
         return witnesses[_key(name)][e];
+    }
+
+    /// @notice Publish mapping from signature component A (G1) to element e (Fr) for credential `name`
+    /// @dev Stores keccak256(A) -> e; `A128` must be 128-byte uncompressed G1. `sid` is advisory for indexing.
+    function publishMapping(
+        string calldata name,
+        uint256 sid,
+        bytes calldata A128,
+        uint256 e
+    ) external onlyOpener {
+        require(A128.length == 128, "bad A len");
+        bytes32 k = _key(name);
+        bytes32 ah = keccak256(A128);
+        // Do not overwrite if already set with a different value
+        uint256 existing = AhashToE[k][ah];
+        if (existing == 0) {
+            AhashToE[k][ah] = e;
+        }
+        emit MappingPublished(name, sid, ah, e);
+    }
+
+    /// @notice Lookup e by A for a credential name. Returns 0 if not found
+    function getEByA(string calldata name, bytes calldata A128) external view returns (uint256) {
+        if (A128.length != 128) return 0;
+        bytes32 k = _key(name);
+        return AhashToE[k][keccak256(A128)];
+    }
+
+    /// @notice Mark element `e` as revoked and update accumulator anchor to `newDelta128`
+    function deleteMember(string calldata name, uint256 e, bytes calldata newDelta128) external onlyOpener {
+        require(newDelta128.length == 128, "bad delta len");
+        bytes32 k = _key(name);
+        deltas[k] = newDelta128;
+        revoked[k][e] = true;
+        emit MemberRevoked(name, e, newDelta128);
+        emit AccumulatorUpdated(name, newDelta128);
+    }
+
+    /// @notice Check if element `e` has been revoked for credential `name`
+    function isRevoked(string calldata name, uint256 e) external view returns (bool) {
+        return revoked[_key(name)][e];
+    }
+
+    /// @notice Consumers can request credential opening by submitting encryption (T1, T2)
+    function requestOpen(
+        string calldata name,
+        bytes calldata T1,
+        bytes calldata T2
+    ) external onlyServiceProvider {
+        require(T1.length == 128 && T2.length == 128, "bad T len");
+        emit OpenRequested(name, msg.sender, T1, T2);
+    }
+
+    /// @notice Opener may publish the recovered A for transparency/auditing
+    function publishOpenResult(string calldata name, bytes calldata A128) external onlyOpener {
+        require(A128.length == 128, "bad A len");
+        emit Opened(name, A128);
     }
 
     /// @notice Verify membership e \in Acc(name) with witness; uses Params openerPkG2 as pkAcc

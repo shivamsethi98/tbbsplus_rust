@@ -75,6 +75,8 @@ library Verify {
 contract VerifyWrapper {
     using Verify for BbsPlusPokVerify.PublicSignatureParts;
 
+    event PresentationVerified(string indexed name, address indexed prover, bytes T1, bytes T2);
+
     function verifyPok(
         BbsPlusPokVerify.PublicSignatureParts memory sig,
         BbsPlusPokVerify.VerificationContext memory ctx,
@@ -150,6 +152,44 @@ contract VerifyWrapper {
         if (keccak256(lhs) != keccak256(rhs)) return false;
         // Finally, pairing: e(A', pk) == e(Abar, g2)
         return Verify.verifyPairing(sig.APrime, pkG2, Bls12381.g1neg(sig.ABar), g2base);
+    }
+
+    /// @notice Verify all relations as above and emit an event carrying T1,T2 for opening
+    function verifyPokEncWithPairingFromParamsEmit(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+        // Extras for encryption and opening
+        bytes calldata T1,
+        bytes calldata T2enc,
+        bytes calldata Tenc,
+        uint256 respA3,
+        uint256 respK,
+        string calldata name,
+        address paramsAddr
+    ) external returns (bool) {
+        Params p = Params(paramsAddr);
+        ( , , bytes memory g2base) = p.getG1H0G2ByName(name);
+        bytes memory pkG2 = p.getPkG2ByName(name);
+        bytes memory ybar = p.getOpenerYbarByName(name);
+        require(pkG2.length == 256 && g2base.length == 256 && ybar.length == 128, "bad params");
+        // Core PoK
+        require(Verify.verifyPok(sig, ctx, revealed, challenge, p1, p2), "pok fail");
+        // Encryption relation
+        require(T1.length == 128 && T2enc.length == 128 && Tenc.length == 128, "bad T len");
+        bytes memory lhsA3 = this.msm1(sig.APrime, respA3);
+        bytes memory lhsK  = this.msm1(ybar,     respK);
+        bytes memory lhs   = this.g1add(lhsA3, lhsK);
+        bytes memory rhsC  = this.msm1(T2enc,    challenge);
+        bytes memory rhs   = this.g1add(Tenc, rhsC);
+        require(keccak256(lhs) == keccak256(rhs), "enc fail");
+        // Pairing
+        require(Verify.verifyPairing(sig.APrime, pkG2, Bls12381.g1neg(sig.ABar), g2base), "pair fail");
+        emit PresentationVerified(name, msg.sender, T1, T2enc);
+        return true;
     }
 
     function verifyPairing(
