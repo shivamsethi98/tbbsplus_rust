@@ -1,8 +1,9 @@
 use std::env;
 use ethers::prelude::*;
 use ethers::providers::{Provider, Ws};
-use ethers::abi::{Abi, RawLog};
+use ethers::abi::RawLog;
 use futures::StreamExt;
+use tbbsplus_rust::orchestration::chain::clients::{VerifyClient, AccumulatorClient};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,20 +28,8 @@ async fn main() -> anyhow::Result<()> {
     if verify_addrs.is_empty() { anyhow::bail!("POK_VERIFY_WRAPPER/VERIFY_CONTRACT env missing or invalid"); }
     let acc_addr: Address = env::var("ACC_CONTRACT")?.parse()?;
 
-    // Load ABIs dynamically
-    let verify_abi: Abi = {
-        let v = std::fs::read("artifacts/contracts/Verify.sol/VerifyWrapper.json")?;
-        let j: serde_json::Value = serde_json::from_slice(&v)?;
-        serde_json::from_value(j.get("abi").cloned().expect("abi"))?
-    };
-    let acc_abi: Abi = {
-        let v = std::fs::read("artifacts/contracts/Accumulator.sol/Accumulator.json")?;
-        let j: serde_json::Value = serde_json::from_slice(&v)?;
-        serde_json::from_value(j.get("abi").cloned().expect("abi"))?
-    };
-
-    let verify = Contract::new(verify_addrs[0], verify_abi.clone(), client.clone());
-    let accumulator = Contract::new(acc_addr, acc_abi.clone(), client.clone());
+    let verify = VerifyClient::new(verify_addrs[0], client.clone())?;
+    let accumulator = AccumulatorClient::new(acc_addr, client.clone())?;
 
     // No persistent modes; only interactive
 
@@ -54,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let mut stream = client.provider().subscribe_logs(&filter).await?;
 
     // Decode helper
-    let ev = verify.abi().event("PresentationVerified")?;
+    let ev = verify.contract.abi().event("PresentationVerified")?;
     // Also subscribe to Accumulator events for status reporting
     use ethers::types::{Filter, ValueOrArray, H256, BlockNumber};
     let acc_addr_h = acc_addr;
@@ -84,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
             let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
             let t1b = ethers::types::Bytes::from(t1);
             let t2b = ethers::types::Bytes::from(t2);
-            let call = accumulator.method::<_, ()>("requestOpen", (name_env, t1b, t2b))?;
+            let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env, t1b, t2b))?;
             let pending = call.send().await?;
             let rcpt = pending.await?;
             println!("ServiceProvider: requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));

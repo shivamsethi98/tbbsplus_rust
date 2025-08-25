@@ -290,7 +290,7 @@ pub fn eip2537_g2_to_affine(bytes256: &[u8]) -> anyhow::Result<<Bls12_381 as ark
 //     g2_to_eip2537_bytes(&gen)
 // }
 //USED BY ISSUER ONCHAIN
-fn verify_commitment_pok_from_fields(
+pub fn verify_commitment_pok_from_fields(
     params: &SignatureParamsG1<Bls12_381>,
     commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
     sid: u64,

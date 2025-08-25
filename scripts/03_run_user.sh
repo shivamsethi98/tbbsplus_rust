@@ -25,4 +25,4 @@ PARAMS_CONTRACT=$PARAMS_CONTRACT \
 CRED_NAME=$CRED_NAME \
 MESSAGE_COUNT=$MESSAGE_COUNT \
 THRESHOLD=$THRESHOLD \
-cargo run --bin client --features mpc
+cargo run --bin client --features mpc,interactive

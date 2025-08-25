@@ -5,3 +5,10 @@ pub mod helpers;
 pub mod mpc;
 pub mod threshold_phases;
 
+// Phase 0 scaffolding: new modular boundaries (no behavior changes yet)
+pub mod config;
+pub mod persistence;
+pub mod onchain;
+pub mod chain;
+pub mod crypto;
+

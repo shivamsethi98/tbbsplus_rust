@@ -12,15 +12,51 @@ MESSAGE_COUNT=${MESSAGE_COUNT:-5}
 CRED_NAME=${CRED_NAME:-ANON_CRED}
 SHARES_FILE=${SHARES_FILE:-.runtime.shares.json}
 
-echo "[00] Clean runtime caches"
+
+echo "[00] Check whether anvil is running with hardfork=prague on port ${ANVIL_PORT:-8545}"
+
+get_listener_pid() {
+  local port=$1
+  local pid=""
+  if command -v lsof >/dev/null 2>&1; then
+    pid=$(lsof -n -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+  fi
+  if [ -z "$pid" ] && command -v ss >/dev/null 2>&1; then
+    pid=$(ss -ltnp "( sport = :$port )" 2>/dev/null | awk -F',' '/LISTEN/ { for(i=1;i<=NF;i++) if ($i ~ /pid=/) { sub("pid=","",$i); split($i,a," "); print a[1]; exit } }')
+  fi
+  if [ -z "$pid" ] && command -v netstat >/dev/null 2>&1; then
+    pid=$(netstat -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p { match($0, /pid=[0-9]+/); if (RSTART) { pidstr=substr($0,RSTART,RLENGTH); sub("pid=","",pidstr); print pidstr; exit } }')
+  fi
+  echo "$pid"
+}
+
+ANVIL_PID=$(get_listener_pid "$ANVIL_PORT")
+
+if [ -z "$ANVIL_PID" ]; then
+  echo "ERROR: No process is listening on port $ANVIL_PORT. Anvil is not running on that port."
+  echo "Please start anvil with: anvil --hardfork=prague -p $ANVIL_PORT"
+  exit 1
+fi
+
+ANVIL_CMD=$(ps -o args= -p "$ANVIL_PID" 2>/dev/null || true)
+
+if printf '%s\n' "$ANVIL_CMD" | grep -iq 'anvil' && printf '%s\n' "$ANVIL_CMD" | grep -iq 'prague'; then
+  echo "Found anvil (pid=$ANVIL_PID) running with hardfork prague."
+  export ANVIL_PID
+else
+  echo "ERROR: Port $ANVIL_PORT is in use by pid $ANVIL_PID: $ANVIL_CMD"
+  echo "But it is not an anvil process launched with '--hardfork prague'."
+  echo "Please start/replace the process with: anvil --hardfork=prague -p $ANVIL_PORT"
+  exit 1
+fi
+
+
+
+echo "[01] Clean runtime caches"
 rm -rf .runtime/sids .runtime/users .runtime.g2_base.hex .runtime.pk_g2.hex .runtime/pok.json || true
 rm -f "$SHARES_FILE" || true
 
-echo "[01] Start anvil"
-anvil --port "$ANVIL_PORT" --hardfork prague > anvil.log 2>&1 &
-ANVIL_PID=$!
-trap 'kill $ANVIL_PID 2>/dev/null || true' EXIT
-sleep 1
+
 
 echo "[02] Compile"
 npx hardhat clean >/dev/null 2>&1 || true

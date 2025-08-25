@@ -16,11 +16,11 @@ use ark_std::rand::{rngs::StdRng, SeedableRng};
 use bbs_plus::prelude::*;
 use ethers::contract::abigen;
 use ethers::contract::Contract;
-use ethers::abi::Abi;
 use ethers::prelude::*;
 use ethers::signers::{coins_bip39::English, MnemonicBuilder};
 use ethers::providers::{Provider, Ws};
 use futures::StreamExt;
+use tracing::{info, warn, error, instrument};
 // use secret_sharing_and_dkg::shamir_ss::deal_random_secret; // now loaded from TTP shares file
 use tokio::time::{sleep, Duration};
 
@@ -30,7 +30,11 @@ use test_utils::ot::do_pairwise_base_ot;
 use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 use tbbsplus_rust::orchestration::threshold_phases::{BASE_OT_KEY_SIZE, KAPPA, STATISTICAL_SECURITY_PARAMETER};
 
-use tbbsplus_rust::orchestration::helpers::{eip2537_g1_to_affine, eip2537_g2_to_affine, u256_to_fr,fr_to_u256, verify_commitment_pok_from_fields};
+use tbbsplus_rust::orchestration::crypto:: encoding::{eip2537_g1_to_affine, eip2537_g2_to_affine, u256_to_fr,fr_to_u256, g1_to_eip2537_bytes};
+use tbbsplus_rust::orchestration::chain::clients::RegistryClient;
+use tbbsplus_rust::orchestration::chain::clients::ParamsClient;
+use tbbsplus_rust::orchestration::crypto::commitment_pok;
+use tbbsplus_rust::orchestration::crypto::{seeds, shares};
 
 abigen!(
     RequestCredential,
@@ -46,6 +50,8 @@ abigen!(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // init tracing
+    let _ = tracing_subscriber::fmt::try_init();
     // --- Config ---
     dotenvy::dotenv().ok();
     let ws_url = env::var("ETH_WS").unwrap_or_else(|_| "ws://127.0.0.1:8545".into());
@@ -79,17 +85,12 @@ async fn main() -> anyhow::Result<()> {
     let client = std::sync::Arc::new(client);
 
     let req = RequestCredential::new(req_addr, client.clone());
-    // Dynamic contract for CredentialRegistry
-    let reg_art_path = "artifacts/contracts/CredentialRegistry.sol/CredentialRegistry.json";
-    let reg_art_str = std::fs::read_to_string(reg_art_path)
-        .map_err(|e| anyhow::anyhow!("read {} failed: {:?}", reg_art_path, e))?;
-    let reg_v: serde_json::Value = serde_json::from_str(&reg_art_str)?;
-    let reg_abi_val = reg_v.get("abi").ok_or_else(|| anyhow::anyhow!("abi missing in {}", reg_art_path))?.clone();
-    let reg_abi: Abi = serde_json::from_value(reg_abi_val)?;
-    let registry = Contract::new(registry_addr, reg_abi, client.clone());
+    // Typed client for CredentialRegistry (prefers embedded ABI)
+    let registry = RegistryClient::new(registry_addr, client.clone())?;
     // Params for multiaddr discovery
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let params = Params::new(params_addr, client.clone());
+    let params_client = ParamsClient::new(params_addr, client.clone())?;
 
     // Top up balance on local anvil, if needed
     if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
@@ -112,14 +113,14 @@ async fn main() -> anyhow::Result<()> {
     // Proactively dial peers based on on-chain multiaddrs from Params
     let mut peers = Vec::new();
     // Enumerate all issuers and map their libp2p addrs; fall back to local tcp range
-    let issuers: Vec<Address> = params.get_issuers().call().await.unwrap_or_default();
+    let issuers: Vec<Address> = params_client.get_issuers().await.unwrap_or_default();
     for issuer in issuers {
-    let allowed: bool = params.issuer_allowed(issuer).call().await.unwrap_or(false);
+        let allowed: bool = params_client.issuer_allowed(issuer).await.unwrap_or(false);
         if !allowed { continue; }
-    let idx: u16 = params.issuer_index(issuer).call().await.unwrap_or(0);
+        let idx: u16 = params_client.issuer_index(issuer).await.unwrap_or(0);
         if idx == 0 || idx == participant_id { continue; }
         // Prefer on-chain multiaddrs
-    let addrs: Vec<String> = params.get_issuer_multiaddrs(issuer).call().await.unwrap_or_default();
+        let addrs: Vec<String> = params_client.get_issuer_multiaddrs(issuer).await.unwrap_or_default();
         if let Some(addr) = addrs.get(0) {
             if let Ok(ma) = addr.parse() { peers.push((idx, ma)); continue; }
         }
@@ -137,11 +138,10 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Load TTP-dealt key share and construct params ---
     // Fetch BBS+ params directly from Params to avoid local derivation
-    let pc0 = params.get_params_by_name(cred_name.clone()).call().await?;
-    let onchain_mcount: u32 = pc0.message_count.as_u64() as u32;
+    let onchain_mcount: u32 = params_client.get_message_count_cached(cred_name.clone()).await?;
     if onchain_mcount != message_count { eprintln!("[issuer] WARNING: MESSAGE_COUNT env {} != on-chain {}", message_count, onchain_mcount); }
-    let (g1_b, h0_b, g2_b) = params.get_g1h0g2_by_name(cred_name.clone()).call().await?;
-    let mut h_bytes: Vec<ethers::types::Bytes> = params.get_h_by_name(cred_name.clone()).call().await?;
+    let (g1_b, h0_b, g2_b) = params_client.get_g1h0g2_cached(cred_name.clone()).await?;
+    let mut h_bytes: Vec<ethers::types::Bytes> = params_client.get_h_cached(cred_name.clone()).await?;
     let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
     let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
     let g2 = {
@@ -153,19 +153,7 @@ async fn main() -> anyhow::Result<()> {
     for hb in h_bytes.drain(..) { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
     let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
     let shares_file = env::var("SHARES_FILE").unwrap_or_else(|_| ".runtime.shares.json".into());
-    let data = std::fs::read(&shares_file)
-        .map_err(|e| anyhow::anyhow!("failed to read shares file {shares_file}: {:?}", e))?;
-    let v: serde_json::Value = serde_json::from_slice(&data)?;
-    let shares_obj = v.get("shares").and_then(|s| s.as_object()).ok_or_else(|| anyhow::anyhow!("shares missing in {shares_file}"))?;
-    let key_b64 = shares_obj
-        .get(&participant_id.to_string())
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no share for PID {} in {shares_file}", participant_id))?;
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(key_b64)
-        .map_err(|e| anyhow::anyhow!("bad base64 in shares file: {:?}", e))?;
-    let mut rdr = &key_bytes[..];
-    let my_share: Fr = ark_serialize::CanonicalDeserialize::deserialize_compressed(&mut rdr)?;
+    let my_share: Fr = shares::load_share_from_file(&shares_file, participant_id)?;
     let key_shares: Vec<Fr> = {
         // Build a vec with my index set; others unused for this participant
         let mut v = vec![Fr::from(0u64); total as usize];
@@ -179,17 +167,7 @@ async fn main() -> anyhow::Result<()> {
     // from fixed domain separation + credential name + TOTAL + KAPPA + SSP so each issuer
     // computes identical BaseOTOutput set locally and then selects its own index.
     let ote = MultiplicationOTEParams::<KAPPA, STATISTICAL_SECURITY_PARAMETER> {};
-    let mut seed_hasher = blake2::Blake2b512::new();
-    use blake2::Digest;
-    seed_hasher.update(b"TBBS+_BASE_OT_SEED_v1");
-    seed_hasher.update(cred_name.as_bytes());
-    seed_hasher.update(total.to_be_bytes());
-    seed_hasher.update(KAPPA.to_be_bytes());
-    seed_hasher.update(STATISTICAL_SECURITY_PARAMETER.to_be_bytes());
-    let seed_bytes = seed_hasher.finalize();
-    let mut seed_arr = [0u8; 8];
-    seed_arr.copy_from_slice(&seed_bytes[..8]);
-    let shared_seed = u64::from_be_bytes(seed_arr);
+    let shared_seed = seeds::base_ot_seed(&cred_name, total, KAPPA as usize, STATISTICAL_SECURITY_PARAMETER as usize);
     let mut rng = StdRng::seed_from_u64(shared_seed);
     let party_set = (1..=total).collect::<BTreeSet<_>>();
     let base_ot = do_pairwise_base_ot::<BASE_OT_KEY_SIZE>(&mut rng, ote.num_base_ot(), total, party_set);
@@ -210,25 +188,26 @@ async fn main() -> anyhow::Result<()> {
         .event::<request_credential::SigReqBBSPlusVerifiedFilter>()
         .from_block(from_block);
     let mut stream = event_builder.stream().await?;
-    println!(
-        "issuer_onchain PID={} listening for SigReqBBSPlusVerified from block {}...",
-        participant_id,
-        current_block_u64 + 1
-    );
+    info!(pid=%participant_id, from_block=%(current_block_u64 + 1), "listening for SigReqBBSPlusVerified");
 
     // Avoid processing the same sid more than once in this run
-    let mut processed_sids: HashSet<u64> = HashSet::new();
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SidState { WaitingP1, P1Done, P2Done, ShareSubmitted }
+    let mut sessions: std::collections::BTreeMap<u64, SidState> = std::collections::BTreeMap::new();
+
+    // Simple session deadline map
+    use std::time::{Instant};
+    let mut deadlines: std::collections::BTreeMap<u64, Instant> = std::collections::BTreeMap::new();
 
     while let Some(ev) = stream.next().await {
         let ev = ev?;
         let sid = ev.sid.as_u64();
         // Note: `name` is indexed in the event and comes as a topic hash (H256), not the raw string.
         // We don't gate on name to avoid topic/string mismatch; we dedup purely by sid.
-        if processed_sids.contains(&sid) {
-            // Already processed in this run
-            continue;
+        if let Some(state) = sessions.get(&sid) {
+            if matches!(state, SidState::ShareSubmitted) { continue; }
         }
-    println!("[event] SigReqBBSPlusVerified: sid={}", sid);
+    info!(pid=%participant_id, sid, "SigReqBBSPlusVerified");
 
 
     let commitment: <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine = eip2537_g1_to_affine(ev.commitment_b.as_ref())?;
@@ -237,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let c_fr: Fr = u256_to_fr(&ev.challenge);
     let resp_fr: Vec<Fr> = ev.responses.iter().map(u256_to_fr::<Fr>).collect();
     // Fallback off-chain PoK check mirroring on-chain verification (double-check; cheap)
-    let pok_res = verify_commitment_pok_from_fields(
+    let pok_res = commitment_pok::verify_from_fields(
         &params_bbs,
         &commitment,
         sid,
@@ -252,19 +231,12 @@ async fn main() -> anyhow::Result<()> {
     );
     match pok_res {
         Ok(()) => {
-            println!(
-                "[pok] PID={} sid={} OK (revealed={}, ctx_len={})",
-                participant_id,
-                sid,
-                ev.revealed_idx.len(),
-                ev.context.len()
-            );
+            info!(pid=%participant_id, sid, revealed=%ev.revealed_idx.len(), ctx_len=%ev.context.len(), "commitment PoK OK");
+            sessions.insert(sid, SidState::WaitingP1);
+            deadlines.insert(sid, Instant::now() + Duration::from_secs(60));
         }
         Err(e) => {
-            eprintln!(
-                "[pok] PID={} sid={} FAILED: {} — skipping event",
-                participant_id, sid, e
-            );
+            warn!(pid=%participant_id, sid, error=?e, "commitment PoK FAILED; skipping");
             continue;
         }
     }
@@ -287,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
                 others.insert(j);
             }
         }
-        let mut prng = StdRng::seed_from_u64(42 + participant_id as u64 * 1000 + sid);
+    let mut prng = StdRng::seed_from_u64(seeds::phase1_seed(participant_id, sid));
     let (mut p1, comm, comm_zero) = Phase1::<Fr, 256>::init_for_bbs_plus::<_, Blake2b512>(
             &mut prng,
             1,
@@ -298,10 +270,7 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("phase1 init failed: {:?}", e))?;
 
         // Broadcast our commitment along with our libp2p peer id for mapping
-        println!(
-            "[phase1] PID={} sid={} broadcasting commitments to peers {:?}",
-            participant_id, sid, others
-        );
+    info!(pid=%participant_id, sid, ?others, "phase1 broadcast commitments");
         let mut comm_bytes = Vec::new();
         comm.serialize_compressed(&mut comm_bytes)?;
         let mut zc_map = BTreeMap::new();
@@ -352,11 +321,9 @@ async fn main() -> anyhow::Result<()> {
                                     .receive_commitment(from, comm, zc_for_me)
                                     .map_err(|e| anyhow::anyhow!("receive_commitment from {} failed: {:?}", from, e))?;
                                 commitments_got.insert(from);
-                                println!("[phase1] PID={} sid={} received commitment from {}", participant_id, sid, from);
+                                info!(pid=%participant_id, sid, from, "phase1 got commitment");
                             }
-                            None => {
-                                eprintln!("[phase1] PID={} sid={} missing zero_commitment for me from {}; skipping for now", participant_id, sid, from);
-                            }
+                            None => { warn!(pid=%participant_id, sid, from, "phase1 missing zero_commitment for me") }
                         }
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -369,17 +336,11 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_millis(20)).await;
         }
     if (commitments_got.len() as u16) < threshold - 1 {
-            eprintln!(
-                "[phase1] PID={} sid={} timed out waiting for commitments: got {:?}",
-                participant_id, sid, commitments_got
-            );
+            warn!(pid=%participant_id, sid, ?commitments_got, "phase1 timeout waiting for commitments");
         }
 
         // Broadcast our shares to others
-        println!(
-            "[phase1] PID={} sid={} broadcasting shares to: {:?}",
-            participant_id, sid, others
-        );
+    info!(pid=%participant_id, sid, ?others, "phase1 broadcast shares");
     for to in others.iter().copied() {
             let s = p1.get_comm_shares_and_salts();
             let zs = p1.get_comm_shares_and_salts_for_zero_sharing_protocol_with_other(&to);
@@ -424,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
                             .receive_shares::<blake2::Blake2b512>(from, shares, zero)
                             .map_err(|e| anyhow::anyhow!("receive_shares from {} failed: {:?}", from, e))?;
                         shares_got.insert(from);
-                        println!("[phase1] PID={} sid={} received shares from {}", participant_id, sid, from);
+                        info!(pid=%participant_id, sid, from, "phase1 got shares");
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(_) => break,
@@ -436,16 +397,14 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_millis(20)).await;
         }
     if (shares_got.len() as u16) < threshold - 1 {
-            eprintln!(
-                "[phase1] PID={} sid={} timed out waiting for shares: got {:?}",
-                participant_id, sid, shares_got
-            );
+            warn!(pid=%participant_id, sid, ?shares_got, "phase1 timeout waiting for shares");
         }
 
         // Finalize Phase 1 for our participant
-        let phase1_output = p1
+    let phase1_output = p1
             .finish_for_bbs_plus::<blake2::Blake2b512>(&key_shares[(participant_id - 1) as usize])
             .map_err(|e| anyhow::anyhow!("phase1 finish failed for PID={} sid={}: {:?}", participant_id, sid, e))?;
+    sessions.insert(sid, SidState::P1Done);
 
         // Phase 2 for our participant
         use blake2::Blake2b512 as B2b;
@@ -455,12 +414,12 @@ async fn main() -> anyhow::Result<()> {
             b"threshold-bbs-plus-gadget",
         );
 
-        let others_set = phase1_output
+    let others_set = phase1_output
             .others
             .iter()
             .copied()
             .collect::<BTreeSet<u16>>();
-        let mut r = StdRng::seed_from_u64(42 + participant_id as u64 * 2000 + sid);
+    let mut r = StdRng::seed_from_u64(seeds::phase2_seed(participant_id, sid));
     let (mut p2, msgs) = bbs_plus::threshold::multiplication_phase::Phase2::<
             Fr,
             KAPPA,
@@ -496,10 +455,7 @@ async fn main() -> anyhow::Result<()> {
                 match handle.send_to(to, payload.clone()).await {
                     Ok(_) => break,
                     Err(e) if attempts < 5 => {
-                        eprintln!(
-                            "[direct] send R1 {}->{} retry {}: {:?}",
-                            participant_id, to, attempts, e
-                        );
+                        warn!(pid=%participant_id, to, attempts, error=?e, "direct send R1 retry");
                         sleep(Duration::from_millis(100)).await;
                     }
                     Err(e) => return Err(anyhow::anyhow!("send R1 failed: {:?}", e)),
@@ -534,7 +490,7 @@ async fn main() -> anyhow::Result<()> {
                             let m2 = p2
                                 .receive_message1::<B2b, Shake256>(from, m1, &gadget)
                                 .map_err(|e| anyhow::anyhow!(
-                                    "[phase2] PID={} sid={} recv1 from {} failed: {:?}",
+                                    "[phase2] pid={} sid={} recv1 from {} failed: {:?}",
                                     participant_id, sid, from, e
                                 ))?;
                             if exp_r1.contains(&from) {
@@ -553,13 +509,10 @@ async fn main() -> anyhow::Result<()> {
                             let mut attempts = 0;
                             loop {
                                 attempts += 1;
-                                match handle.send_to(from, payload.clone()).await {
+                match handle.send_to(from, payload.clone()).await {
                                     Ok(_) => break,
                                     Err(e) if attempts < 5 => {
-                                        eprintln!(
-                                            "[direct] send R2 {}->{} retry {}: {:?}",
-                                            participant_id, from, attempts, e
-                                        );
+                    warn!(pid=%participant_id, from, attempts, error=?e, "direct send R2 retry");
                                         sleep(Duration::from_millis(100)).await;
                                     }
                                     Err(e) => return Err(anyhow::anyhow!("send R2 failed: {:?}", e)),
@@ -570,10 +523,7 @@ async fn main() -> anyhow::Result<()> {
                             let m2 = CanonicalDeserialize::deserialize_compressed(&mut r2)?;
                             p2
                                 .receive_message2::<B2b>(from, m2, &gadget)
-                                .map_err(|e| anyhow::anyhow!(
-                                    "[phase2] PID={} sid={} recv2 from {} failed: {:?}",
-                                    participant_id, sid, from, e
-                                ))?;
+                                .map_err(|e| anyhow::anyhow!("[phase2] recv2 failed pid={} sid={} from {}: {:?}", participant_id, sid, from, e))?;
                             if exp_r2.contains(&from) {
                                 got_r2.insert(from);
                             }
@@ -589,7 +539,8 @@ async fn main() -> anyhow::Result<()> {
             sleep(Duration::from_millis(20)).await;
         }
 
-        let phase2_output = p2.finish();
+    let phase2_output = p2.finish();
+    sessions.insert(sid, SidState::P2Done);
 
     // Create our signature share using blind commitment: uncommitted messages are revealed pairs
     let mut tmp_pairs: Vec<(usize, Fr)> = Vec::new();
@@ -625,20 +576,16 @@ async fn main() -> anyhow::Result<()> {
         let e_u256 = fr_to_u256(&share.e);
         let s_u256 = fr_to_u256(&share.s);
         // Fetch threshold t from Params (authoritative)
-        let pc = params.get_params_by_name(cred_name.clone()).call().await?;
-        let onchain_t: u16 = pc.t.as_u64() as u16;
-        let mut call = registry.method::<_, ()>(
-            "submitShare",
-            (
-                cred_name.clone(),
-                U256::from(sid),
-                participant_id,
-                r_bytes128,
-                u_u256,
-                e_u256,
-                s_u256,
-                onchain_t,
-            ),
+    let onchain_t: u16 = params_client.get_threshold_cached(cred_name.clone()).await?;
+        let mut call = registry.submit_share_call(
+            cred_name.clone(),
+            U256::from(sid),
+            participant_id,
+            r_bytes128,
+            u_u256,
+            e_u256,
+            s_u256,
+            params_client.get_threshold_cached(cred_name.clone()).await.unwrap_or(onchain_t),
         )?;
         if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
             call = call.gas_price(U256::from(1_000_000_000u64));
@@ -647,13 +594,22 @@ async fn main() -> anyhow::Result<()> {
         match send_res {
             Ok(pend) => {
                 let rcpt = pend.await?.ok_or_else(|| anyhow::anyhow!("no receipt"))?;
-                println!("[registry] submitShare ok: tx={:?}", rcpt.transaction_hash);
-                processed_sids.insert(sid);
+                info!(pid=%participant_id, sid, tx=?rcpt.transaction_hash, "submitShare ok");
+                sessions.insert(sid, SidState::ShareSubmitted);
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("submitShare failed: {:?}", e));
             }
         }
+        // prune stale sessions occasionally
+        let now = Instant::now();
+        deadlines.retain(|sid_k, dl| {
+            if *dl < now {
+                warn!(sid=%sid_k, "session deadline elapsed; pruning");
+                sessions.remove(sid_k);
+                false
+            } else { true }
+        });
     }
 
     Ok(())

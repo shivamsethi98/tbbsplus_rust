@@ -41,9 +41,14 @@ rand = "0.8"
 futures = "0.3"
 ethers = { version = "2", default-features = false, features = ["abigen", "ws", "rustls"] }
 vb_accumulator = { path = "crypto/vb_accumulator" }
+once_cell = "1.19"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [features]
 mpc = ["libp2p"]
+interactive = []
 
 [[bin]]
 name = "issuer_onchain"
@@ -52,7 +57,7 @@ required-features = ["mpc"]
 
 [[bin]]
 name = "client"
-path = "src/bin/client.rs"
+path = "src/bin/client/main.rs"
 required-features = ["mpc"]
 
 
@@ -65,36 +70,6 @@ path = "src/bin/ttp.rs"
 [[bin]]
 name = "export_pok_json"
 path = "src/bin/export_pok_json.rs"
-
-
-# Examples
-[[example]]
-name = "basic_credential"
-path = "examples/basic_credential.rs"
-
-[[example]]
-name = "blind_credential"
-path = "examples/blind_credential.rs"
-
-[[example]]
-name = "selective_disclosure"
-path = "examples/selective_disclosure.rs"
-
-[[example]]
-name = "threshold_demo_simple"
-path = "examples/threshold_system/threshold_demo_simple.rs"
-
-[[example]]
-name = "threshold_demo1"
-path = "examples/threshold_system/threshold_demo1.rs"
-
-[[example]]
-name = "hybrid_onchain_verification"
-path = "examples/hybrid_onchain_verification.rs"
-
-[[example]]
-name = "bbs_proof_system_demo"
-path = "examples/bbs_proof_system_demo.rs"
 
 
 [[bin]]
