@@ -30,10 +30,10 @@ use test_utils::ot::do_pairwise_base_ot;
 use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 use tbbsplus_rust::orchestration::threshold_phases::{BASE_OT_KEY_SIZE, KAPPA, STATISTICAL_SECURITY_PARAMETER};
 
-use tbbsplus_rust::orchestration::crypto:: encoding::{eip2537_g1_to_affine, eip2537_g2_to_affine, u256_to_fr,fr_to_u256, g1_to_eip2537_bytes};
+use tbbsplus_rust::orchestration::crypto::encoding::{eip2537_g1_to_affine, eip2537_g2_to_affine, u256_to_fr, fr_to_u256, g1_to_eip2537_bytes};
 use tbbsplus_rust::orchestration::chain::clients::RegistryClient;
 use tbbsplus_rust::orchestration::chain::clients::ParamsClient;
-use tbbsplus_rust::orchestration::crypto::commitment_pok;
+use tbbsplus_rust::orchestration::crypto::pok;
 use tbbsplus_rust::orchestration::crypto::{seeds, shares};
 
 abigen!(
@@ -144,11 +144,7 @@ async fn main() -> anyhow::Result<()> {
     let mut h_bytes: Vec<ethers::types::Bytes> = params_client.get_h_cached(cred_name.clone()).await?;
     let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
     let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
-    let g2 = {
-        // Simple G2 decode aligned with helpers.rs if available here; fallback not needed as we only need params type
-        use tbbsplus_rust::orchestration::helpers::eip2537_g2_to_affine as decode_g2;
-        decode_g2(&g2_b.0[..])?
-    };
+    let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
     let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
     for hb in h_bytes.drain(..) { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
     let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
@@ -216,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
     let c_fr: Fr = u256_to_fr(&ev.challenge);
     let resp_fr: Vec<Fr> = ev.responses.iter().map(u256_to_fr::<Fr>).collect();
     // Fallback off-chain PoK check mirroring on-chain verification (double-check; cheap)
-    let pok_res = commitment_pok::verify_from_fields(
+    let pok_res = pok::verify_commitment_pok_from_fields(
         &params_bbs,
         &commitment,
         sid,

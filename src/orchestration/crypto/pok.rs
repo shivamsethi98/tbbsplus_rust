@@ -13,7 +13,7 @@ use ethers::types::U256;
 pub use bbs_plus::proof::PoKOfSignatureG1Proof as PokProof;
 
 
-use crate::orchestration::crypto::encoding::{fr_to_u256, g1_to_eip2537_bytes};
+use crate::orchestration::crypto::encoding::{fr_to_u256, g1_to_eip2537_bytes, keccak_to_fr, eip2537_g1_to_affine};
 
 pub struct EncExtras {
     pub t1_b: EthBytes,
@@ -43,7 +43,7 @@ pub fn build_pok_and_proof(
     let mut transcript = Vec::new();
     pok.challenge_contribution(&revealed_msgs, params_bbs, &mut transcript)
         .map_err(|e| anyhow::anyhow!("challenge contrib failed: {:?}", e))?;
-    let c_fr = crate::orchestration::helpers::keccak_to_fr(&transcript);
+    let c_fr = keccak_to_fr(&transcript);
     let proof = pok.gen_proof(&c_fr).map_err(|e| anyhow::anyhow!("gen_proof failed: {:?}", e))?;
     Ok((proof, c_fr, revealed_idx.clone()))
 }
@@ -66,7 +66,7 @@ pub fn build_presentation_tuples(
         EncExtras,
     ),
 > {
-    use crate::orchestration::helpers::{g1_to_eip2537_bytes, fr_to_u256};
+    use crate::orchestration::crypto::encoding::{g1_to_eip2537_bytes, fr_to_u256};
     fn check_len(label: &str, b: &EthBytes, exp: usize) -> anyhow::Result<()> { if b.len() != exp { anyhow::bail!("{}: expected {} bytes, got {}", label, exp, b.len()); } Ok(()) }
     let ctx_g1 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.g1).to_vec());
     let ctx_h0 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.h_0).to_vec());
@@ -215,4 +215,49 @@ pub fn build_commitment_pok(
         rj.serialize_compressed(&mut out)?;
     }
     Ok(out)
+}
+
+// Verify commitment PoK from on-chain fields (moved from helpers; canonical version here)
+pub fn verify_commitment_pok_from_fields(
+    params: &SignatureParamsG1<Bls12_381>,
+    commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
+    sid: u64,
+    cred_name: &str,
+    revealed_idx: &Vec<u32>,
+    revealed_vals: &Vec<U256>,
+    context: &[u8],
+    hidden_idx: Vec<u32>,
+    t_eip: &[u8],
+    c: &Fr,
+    responses: &Vec<Fr>,
+) -> anyhow::Result<()> {
+    use blake2::Blake2b512;
+    use schnorr_pok::pok_generalized_pedersen::{SchnorrResponse, compute_random_oracle_challenge};
+
+    let t = eip2537_g1_to_affine(t_eip)?;
+    // Bases and y
+    let mut bases = Vec::with_capacity(1 + hidden_idx.len());
+    bases.push(params.h_0);
+    for i in hidden_idx.iter() { bases.push(params.h[*i as usize]); }
+    let y = *commitment;
+    let resp = SchnorrResponse::<ark_bls12_381::G1Affine>(responses.clone());
+    // Recompute challenge transcript
+    let mut chal_bytes = Vec::new();
+    chal_bytes.extend_from_slice(b"TBBS+_Blind_PoK_v1");
+    chal_bytes.extend_from_slice(&sid.to_be_bytes());
+    chal_bytes.extend_from_slice(&(params.h.len() as u64).to_be_bytes());
+    chal_bytes.extend_from_slice(cred_name.as_bytes());
+    let mut pairs: Vec<(u32, &U256)> = revealed_idx.iter().cloned().zip(revealed_vals.iter()).collect();
+    pairs.sort_by_key(|(i, _)| *i);
+    for (i, v) in pairs.into_iter() { chal_bytes.extend_from_slice(&i.to_be_bytes()); let mut be=[0u8;32]; v.to_big_endian(&mut be); chal_bytes.extend_from_slice(&be); }
+    for i in hidden_idx.iter() { chal_bytes.extend_from_slice(&i.to_be_bytes()); }
+    commitment.serialize_compressed(&mut chal_bytes)?;
+    let mut t_ser = Vec::new();
+    t.serialize_compressed(&mut t_ser)?;
+    chal_bytes.extend_from_slice(&t_ser);
+    chal_bytes.extend_from_slice(context);
+    let c_check: Fr = compute_random_oracle_challenge::<Fr, Blake2b512>(&chal_bytes);
+    if *c != c_check { anyhow::bail!("commitment PoK challenge mismatch"); }
+    // Verify Schnorr relation
+    resp.is_valid(&bases, &y, &t, c).map_err(|e| anyhow::anyhow!("invalid PoK: {:?}", e))
 }

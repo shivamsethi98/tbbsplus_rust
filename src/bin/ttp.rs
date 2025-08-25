@@ -19,7 +19,7 @@ use ark_ec::{CurveGroup, AffineRepr};
 use ark_ff::PrimeField;
 use blake2::Blake2b512;
 use bbs_plus::prelude::*;
-use tbbsplus_rust::orchestration::helpers::{
+use tbbsplus_rust::orchestration::crypto::encoding::{
     g2_to_eip2537_bytes,
     fq2_pair_to_be,
 };

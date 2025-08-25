@@ -27,7 +27,6 @@ mod args;
 use args as clap_args;
 #[cfg(feature = "interactive")]
 mod ui;
-#[cfg(feature = "interactive")]
 mod session;
 
 // Keep abigen bindings here (unchanged behavior)

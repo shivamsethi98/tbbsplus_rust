@@ -16,7 +16,7 @@ use vb_accumulator::persistence::State;
 use vb_accumulator::positive::{Accumulator as _, PositiveAccumulator};
 use vb_accumulator::setup::{SecretKey as AccumSecretKey, SetupParams as AccumSetupParams};
 
-use tbbsplus_rust::orchestration::helpers::{
+use tbbsplus_rust::orchestration::crypto::encoding::{
     eip2537_g1_to_affine,
     eip2537_g2_to_affine,
     g1_to_eip2537_bytes,

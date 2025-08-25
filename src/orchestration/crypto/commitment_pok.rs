@@ -1,7 +1,7 @@
 use ark_bls12_381::{Bls12_381, Fr};
 
-/// Verify commitment PoK from on-chain fields using the shared implementation.
-/// Thin re-export to keep call sites stable while we phase out helpers.
+/// Verify commitment PoK from on-chain fields using the canonical implementation in crypto::pok.
+/// Thin re-export to keep call sites stable while we phase out legacy helpers and shims.
 pub fn verify_from_fields(
     params_bbs: &bbs_plus::prelude::SignatureParamsG1<Bls12_381>,
     commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
@@ -15,7 +15,7 @@ pub fn verify_from_fields(
     c_fr: &Fr,
     resp_fr: &[Fr],
 ) -> anyhow::Result<()> {
-    crate::orchestration::helpers::verify_commitment_pok_from_fields(
+    crate::orchestration::crypto::pok::verify_commitment_pok_from_fields(
         params_bbs,
         commitment,
         sid,
