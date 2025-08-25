@@ -30,6 +30,8 @@ use test_utils::ot::do_pairwise_base_ot;
 use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 use tbbsplus_rust::orchestration::threshold_phases::{BASE_OT_KEY_SIZE, KAPPA, STATISTICAL_SECURITY_PARAMETER};
 
+use tbbsplus_rust::orchestration::helpers::{eip2537_g1_to_affine, eip2537_g2_to_affine, u256_to_fr,fr_to_u256, verify_commitment_pok_from_fields};
+
 abigen!(
     RequestCredential,
     "artifacts/contracts/RequestCredential.sol/RequestCredential.json"
@@ -227,8 +229,8 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
     println!("[event] SigReqBBSPlusVerified: sid={}", sid);
-    // Parse commitment and PoK fields from verified event
-    // TODO: check if this is correct
+
+
     let commitment: <Bls12_381 as ark_ec::pairing::Pairing>::G1Affine = eip2537_g1_to_affine(ev.commitment_b.as_ref())?;
     let hidden_idx: Vec<u32> = ev.hidden_idx.clone();
     let t_eip: Vec<u8> = ev.t.to_vec();
@@ -657,102 +659,4 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn u256_to_fr<F: ark_ff::PrimeField>(v: &U256) -> F {
-    let mut be = [0u8; 32];
-    v.to_big_endian(&mut be);
-    F::from_be_bytes_mod_order(&be)
-}
 
-fn fq_to_be64(x: &ark_bls12_381::Fq) -> [u8; 64] {
-    let bi = x.into_bigint();
-    let limbs: [u64; 6] = bi.0;
-    let mut le48 = [0u8; 48];
-    for (i, limb) in limbs.iter().enumerate() {
-        le48[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    let mut be48 = [0u8; 48];
-    for i in 0..48 { be48[i] = le48[47 - i]; }
-    let mut out = [0u8; 64];
-    out[16..].copy_from_slice(&be48);
-    out
-}
-
-fn g1_to_eip2537_bytes(p: &<ark_bls12_381::Bls12_381 as ark_ec::pairing::Pairing>::G1Affine) -> [u8; 128] {
-    let (x, y) = (p.x, p.y);
-    let xb = fq_to_be64(&x);
-    let yb = fq_to_be64(&y);
-    let mut out = [0u8; 128];
-    out[..64].copy_from_slice(&xb);
-    out[64..].copy_from_slice(&yb);
-    out
-}
-
-fn fr_to_u256(fr: &ark_bls12_381::Fr) -> U256 {
-    let bi = fr.into_bigint();
-    let limbs: [u64; 4] = bi.0;
-    let mut le32 = [0u8; 32];
-    for (i, limb) in limbs.iter().enumerate() {
-        le32[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
-    }
-    let mut be32 = [0u8; 32];
-    for i in 0..32 { be32[i] = le32[31 - i]; }
-    U256::from_big_endian(&be32)
-}
-
-fn eip2537_g1_to_affine(bytes128: &[u8]) -> anyhow::Result<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> {
-    use ark_bls12_381::Fq;
-    if bytes128.len() != 128 { anyhow::bail!("bad g1 len"); }
-    let mut x_be48 = [0u8; 48];
-    let mut y_be48 = [0u8; 48];
-    x_be48.copy_from_slice(&bytes128[16..64]);
-    y_be48.copy_from_slice(&bytes128[80..128]);
-    let x = Fq::from_be_bytes_mod_order(&x_be48);
-    let y = Fq::from_be_bytes_mod_order(&y_be48);
-    let p = ark_bls12_381::G1Affine::new(x, y);
-    Ok(p)
-}
-
-fn verify_commitment_pok_from_fields(
-    params: &SignatureParamsG1<Bls12_381>,
-    commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
-    sid: u64,
-    cred_name: &str,
-    revealed_idx: &Vec<u32>,
-    revealed_vals: &Vec<U256>,
-    context: &[u8],
-    hidden_idx: Vec<u32>,
-    t_eip: &[u8],
-    c: &Fr,
-    responses: &Vec<Fr>,
-) -> anyhow::Result<()> {
-    use blake2::Blake2b512;
-    use schnorr_pok::pok_generalized_pedersen::{SchnorrResponse, compute_random_oracle_challenge};
-
-    let t = eip2537_g1_to_affine(t_eip)?;
-    // Build bases and y
-    let mut bases = Vec::with_capacity(1 + hidden_idx.len());
-    bases.push(params.h_0);
-    for i in hidden_idx.iter() { bases.push(params.h[*i as usize]); }
-    let y = *commitment;
-    let resp = SchnorrResponse::<ark_bls12_381::G1Affine>(responses.clone());
-    // Recompute challenge transcript
-    let mut chal_bytes = Vec::new();
-    chal_bytes.extend_from_slice(b"TBBS+_Blind_PoK_v1");
-    chal_bytes.extend_from_slice(&sid.to_be_bytes());
-    chal_bytes.extend_from_slice(&(params.h.len() as u64).to_be_bytes());
-    chal_bytes.extend_from_slice(cred_name.as_bytes());
-    let mut pairs: Vec<(u32, &U256)> = revealed_idx.iter().cloned().zip(revealed_vals.iter()).collect();
-    pairs.sort_by_key(|(i, _)| *i);
-    for (i, v) in pairs.into_iter() { chal_bytes.extend_from_slice(&i.to_be_bytes()); let mut be=[0u8;32]; v.to_big_endian(&mut be); chal_bytes.extend_from_slice(&be); }
-    for i in hidden_idx.iter() { chal_bytes.extend_from_slice(&i.to_be_bytes()); }
-    commitment.serialize_compressed(&mut chal_bytes)?;
-    // commitment t (use EIP-2537 form by converting back to affine and reserialize compressed)
-    let mut t_ser = Vec::new();
-    t.serialize_compressed(&mut t_ser)?;
-    chal_bytes.extend_from_slice(&t_ser);
-    chal_bytes.extend_from_slice(context);
-    let c_check: Fr = compute_random_oracle_challenge::<Fr, Blake2b512>(&chal_bytes);
-    if *c != c_check { anyhow::bail!("commitment PoK challenge mismatch"); }
-    // Verify Schnorr relation
-    resp.is_valid(&bases, &y, &t, c).map_err(|e| anyhow::anyhow!("invalid PoK: {:?}", e))
-}

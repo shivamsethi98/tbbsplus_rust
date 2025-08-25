@@ -23,6 +23,176 @@ use ethers::providers::{Provider, Ws};
 use ethers::types::H256;
 use futures::StreamExt;
 
+use dock_crypto_utils::signature::MessageOrBlinding;
+
+// Small bundle for on-chain params used across request/verify/present
+#[derive(Clone)]
+struct ParamsBundle {
+    params_bbs: SignatureParamsG1<Bls12_381>,
+    mcount: u32,
+    t: u16,
+    n: u16,
+}
+
+async fn fetch_params_bundle(
+    params_contract: &Params<SignerMiddleware<Provider<Ws>, LocalWallet>>,
+    cred_name: &str,
+) -> anyhow::Result<ParamsBundle> {
+    let pc = params_contract
+        .get_params_by_name(cred_name.to_string())
+        .call()
+        .await?;
+    let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
+    let onchain_t: u16 = pc.t.as_u64() as u16;
+    let onchain_n: u16 = pc.n.as_u64() as u16;
+    let (g1_b, h0_b, g2_b) = params_contract
+        .get_g1h0g2_by_name(cred_name.to_string())
+        .call()
+        .await?;
+    let h_bytes: Vec<ethers::types::Bytes> = params_contract
+        .get_h_by_name(cred_name.to_string())
+        .call()
+        .await?;
+    let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
+    let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
+    let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
+    let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
+    for hb in h_bytes { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
+    let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
+    Ok(ParamsBundle { params_bbs, mcount: onchain_mcount, t: onchain_t, n: onchain_n })
+}
+
+struct EncExtras {
+    t1_b: EthBytes,
+    t2enc_b: EthBytes,
+    t_enc_b: EthBytes,
+    resp_a3_u: U256,
+    resp_k_u: U256,
+}
+
+fn build_presentation_tuples(
+    params_bbs: &SignatureParamsG1<Bls12_381>,
+    proof: &bbs_plus::proof::PoKOfSignatureG1Proof<Bls12_381>,
+    revealed_idx: &Vec<u32>,
+    messages: &Vec<Fr>,
+    onchain_mcount: u32,
+    c_fr: &Fr,
+) -> anyhow::Result<
+    (
+        (EthBytes, EthBytes, EthBytes),
+        (u32, EthBytes, EthBytes, Vec<EthBytes>),
+        (Vec<u32>, Vec<U256>),
+        U256,
+        (EthBytes, U256, U256),
+        (EthBytes, Vec<U256>, U256, U256),
+        EncExtras,
+    ),
+> {
+    fn check_len(label: &str, b: &EthBytes, exp: usize) -> anyhow::Result<()> {
+        if b.len() != exp { anyhow::bail!("{}: expected {} bytes, got {}", label, exp, b.len()); }
+        Ok(())
+    }
+
+    // Context tuple
+    let ctx_g1 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.g1).to_vec());
+    let ctx_h0 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.h_0).to_vec());
+    let ctx_h: Vec<EthBytes> = params_bbs
+        .h
+        .iter()
+        .map(|h| EthBytes::from(g1_to_eip2537_bytes(h).to_vec()))
+        .collect();
+    check_len("ctx.g1", &ctx_g1, 128)?;
+    check_len("ctx.h0", &ctx_h0, 128)?;
+    for (i, hh) in ctx_h.iter().enumerate() { check_len(&format!("ctx.H[{}]", i), hh, 128)?; }
+    let ctx_t = (onchain_mcount, ctx_g1, ctx_h0, ctx_h);
+
+    // Signature parts
+    let sig_ap = EthBytes::from(g1_to_eip2537_bytes(&proof.A_prime).to_vec());
+    let sig_ab = EthBytes::from(g1_to_eip2537_bytes(&proof.A_bar).to_vec());
+    let sig_d  = EthBytes::from(g1_to_eip2537_bytes(&proof.d).to_vec());
+    check_len("sig.APrime", &sig_ap, 128)?;
+    check_len("sig.ABar", &sig_ab, 128)?;
+    check_len("sig.d", &sig_d, 128)?;
+    let sig_t = (sig_ap.clone(), sig_ab.clone(), sig_d);
+
+    // Revealed tuple
+    let revealed_vals_u256: Vec<U256> = revealed_idx
+        .iter()
+        .map(|ix| fr_to_u256(&messages[*ix as usize]))
+        .collect();
+    let revealed_t = (revealed_idx.clone(), revealed_vals_u256);
+
+    // Challenge
+    let challenge_u256 = fr_to_u256(c_fr);
+
+    // P1 tuple (PoK T1)
+    let p1_t_t1 = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
+    check_len("p1.T1", &p1_t_t1, 128)?;
+    let p1_t = (p1_t_t1, fr_to_u256(&proof.sc_resp_1.response1), fr_to_u256(&proof.sc_resp_1.response2));
+
+    // P2 tuple (PoK T2 + responses)
+    let sc2 = proof.sc_resp_2.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_2"))?;
+    let undis_count = (onchain_mcount as usize) - revealed_idx.len();
+    let resp_msgs: Vec<U256> = sc2.0.iter().take(undis_count).map(fr_to_u256).collect();
+    if resp_msgs.len() != undis_count { anyhow::bail!("respMsgs length {} != undisclosed count {}", resp_msgs.len(), undis_count); }
+    let resp_r3 = fr_to_u256(&sc2.0[undis_count]);
+    let resp_sprime = fr_to_u256(&sc2.0[undis_count + 1]);
+    let p2_t_t2 = EthBytes::from(g1_to_eip2537_bytes(&proof.T2).to_vec());
+    check_len("p2.T2", &p2_t_t2, 128)?;
+    let p2_t = (p2_t_t2, resp_msgs, resp_r3, resp_sprime);
+
+    // Encryption extras (T1_enc/T2_enc and sc_resp_enc)
+    let t1_b    = EthBytes::from(g1_to_eip2537_bytes(proof.T1_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T1_enc"))?).to_vec());
+    let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
+    let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
+    let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
+    let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
+    let enc_extras = EncExtras { t1_b, t2enc_b, t_enc_b, resp_a3_u, resp_k_u };
+
+    Ok((sig_t, ctx_t, revealed_t, challenge_u256, p1_t, p2_t, enc_extras))
+}
+
+fn build_pok_and_proof(
+    params_bbs: &SignatureParamsG1<Bls12_381>,
+    sig_struct: &bbs_plus::signature::SignatureG1<Bls12_381>,
+    messages: &Vec<Fr>,
+    ybar_aff: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
+    revealed_idx: &Vec<u32>,
+) -> anyhow::Result<(
+    bbs_plus::proof::PoKOfSignatureG1Proof<Bls12_381>,
+    Fr,
+    Vec<u32>,
+)> {
+    // Build revealed messages map
+    let mut revealed_msgs = std::collections::BTreeMap::<usize, Fr>::new();
+    for &ix in revealed_idx.iter() {
+        let i = ix as usize;
+        if i < messages.len() {
+            revealed_msgs.insert(i, messages[i]);
+        }
+    }
+    // Build message iterator: reveal or blind randomly
+    let mut rng = StdRng::seed_from_u64(99);
+    let message_iter = messages.iter().enumerate().map(|(i, m)| {
+        if revealed_msgs.contains_key(&i) { MessageOrBlinding::RevealMessage(m) } else { MessageOrBlinding::BlindMessageRandomly(m) }
+    });
+    // Initialize PoK with encryption binding to opener Ybar
+    let pok = bbs_plus::proof::PoKOfSignatureG1Protocol::<Bls12_381>::init_with_encryption(
+        &mut rng,
+        sig_struct,
+        params_bbs,
+        message_iter,
+        ybar_aff,
+    ).map_err(|e| anyhow::anyhow!("pok init_with_encryption failed: {:?}", e))?;
+    // Transcript and challenge (keccak -> Fr)
+    let mut transcript = Vec::new();
+    pok.challenge_contribution(&revealed_msgs, params_bbs, &mut transcript)
+        .map_err(|e| anyhow::anyhow!("challenge contrib failed: {:?}", e))?;
+    let c_fr = keccak_to_fr(&transcript);
+    let proof = pok.gen_proof(&c_fr).map_err(|e| anyhow::anyhow!("gen_proof failed: {:?}", e))?;
+    Ok((proof, c_fr, revealed_idx.clone()))
+}
+
 // Bring solidity helpers into scope directly
 use tbbsplus_rust::orchestration::helpers::{
     decode_commitment_pok_for_onchain,
@@ -152,7 +322,6 @@ async fn main() -> anyhow::Result<()> {
     // Note: RELAY_CONTRACT deprecated; using CredentialRegistry events and getters
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-    let _t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
     let mcount: u32 = env::var("MESSAGE_COUNT").unwrap_or_else(|_| "5".into()).parse()?;
     // Parse mode/args
     enum Mode {
@@ -272,18 +441,10 @@ async fn main() -> anyhow::Result<()> {
                 interactive_local_actions(&user_id, &client, &params_contract, &cred_name, sid).await?;
                 return Ok(());
             }
-            // Fetch on-chain params to know message_count and match params generation
-            let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
-            let mcount_onchain: u32 = pc.message_count.as_u64() as u32;
-            // Rebuild BBS+ params from on-chain values
-            let (g1_b, h0_b, g2_b) = params_contract.get_g1h0g2_by_name(cred_name.clone()).call().await?;
-            let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
-            let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
-            let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
-            let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.clone()).call().await?;
-            let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
-            for hb in h_bytes { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
-            let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
+            // Fetch on-chain params and BBS+ params via shared helper
+            let pb = fetch_params_bundle(&params_contract, &cred_name).await?;
+            let mcount_onchain: u32 = pb.mcount;
+            let params_bbs = pb.params_bbs.clone();
 
             // Ensure index 0 is revealed and equals sid
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) {
@@ -410,10 +571,10 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                         if abytes.0.len() != 128 { anyhow::bail!("registry returned bad A len: {}", abytes.0.len()); }
                         // Build messages and persist artifacts
-                        let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
-                        let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
-                        let onchain_t: u16 = pc.t.as_u64() as u16;
-                        let onchain_n: u16 = pc.n.as_u64() as u16;
+                        let pb2 = fetch_params_bundle(&params_contract, &cred_name).await?;
+                        let onchain_mcount: u32 = pb2.mcount;
+                        let onchain_t: u16 = pb2.t;
+                        let onchain_n: u16 = pb2.n;
 
                         let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
                         if !messages.is_empty() { messages[0] = Fr::from(sid); }
@@ -510,10 +671,10 @@ async fn main() -> anyhow::Result<()> {
                 let (abytes, e_u, s_u, _status_raw) = res;
                 if abytes.0.len() == 128 {
                     // Persist artifacts and enter action loop
-                    let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
-                    let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
-                    let onchain_t: u16 = pc.t.as_u64() as u16;
-                    let onchain_n: u16 = pc.n.as_u64() as u16;
+                    let pb4 = fetch_params_bundle(&params_contract, &cred_name).await?;
+                    let onchain_mcount: u32 = pb4.mcount;
+                    let onchain_t: u16 = pb4.t;
+                    let onchain_n: u16 = pb4.n;
 
                     let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
                     if !messages.is_empty() { messages[0] = Fr::from(sid); }
@@ -581,10 +742,10 @@ async fn main() -> anyhow::Result<()> {
                             // Recurse into same logic by resetting variables
                             let abytes = abytes2; let e_u = e_u2; let s_u = s_u2;
                             // Persist and continue
-                            let pc = params_contract.get_params_by_name(cred_name.clone()).call().await?;
-                            let onchain_mcount: u32 = pc.message_count.as_u64() as u32;
-                            let onchain_t: u16 = pc.t.as_u64() as u16;
-                            let onchain_n: u16 = pc.n.as_u64() as u16;
+                            let pb5 = fetch_params_bundle(&params_contract, &cred_name).await?;
+                            let onchain_mcount: u32 = pb5.mcount;
+                            let onchain_t: u16 = pb5.t;
+                            let onchain_n: u16 = pb5.n;
                             let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
                             if !messages.is_empty() { messages[0] = Fr::from(sid); }
                             if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
@@ -882,16 +1043,9 @@ async fn persist_and_optionally_present(
             rset.split(',').filter_map(|s| s.trim().parse::<u32>().ok()).collect()
         };
 
-        // Rebuild params and signature types
-        // Rebuild BBS+ params from Params
-        let (g1_b, h0_b, g2_b) = params_contract.get_g1h0g2_by_name(cred_name.to_string()).call().await?;
-        let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
-        let h0 = eip2537_g1_to_affine(&h0_b.0[..])?;
-        let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
-        let h_bytes: Vec<ethers::types::Bytes> = params_contract.get_h_by_name(cred_name.to_string()).call().await?;
-        let mut h: Vec<<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine> = Vec::with_capacity(h_bytes.len());
-        for hb in h_bytes { h.push(eip2537_g1_to_affine(&hb.0[..])?); }
-        let params_bbs = SignatureParamsG1::<Bls12_381> { g1, g2, h_0: h0, h };
+        // Rebuild params via helper
+        let pb = fetch_params_bundle(&params_contract, &cred_name).await?;
+        let params_bbs = pb.params_bbs.clone();
         // Use in-memory aggregated signature; try to unblind using persisted blinding if available
         let sig_struct = {
             // Attempt to read blinding from known locations
@@ -926,72 +1080,16 @@ async fn persist_and_optionally_present(
         let message_iter = messages.iter().enumerate().map(|(i, m)| {
             if revealed_msgs.contains_key(&i) { MessageOrBlinding::RevealMessage(m) } else { MessageOrBlinding::BlindMessageRandomly(m) }
         });
-        // Fetch opener Ybar and use init_with_encryption for strict binding with enc relation
+        // Fetch opener Ybar and use it for PoK with encryption binding
         let ybar_bytes = params_contract.get_opener_ybar_by_name(cred_name.to_string()).call().await?;
         if ybar_bytes.0.len() != 128 { anyhow::bail!("opener Ybar missing or wrong length"); }
         let ybar_aff = eip2537_g1_to_affine(&ybar_bytes.0[..])?;
-        let pok = bbs_plus::proof::PoKOfSignatureG1Protocol::<Bls12_381>::init_with_encryption(&mut rng, &sig_struct, &params_bbs, message_iter, &ybar_aff)
-            .map_err(|e| anyhow::anyhow!("pok init_with_encryption failed: {:?}", e))?;
-        // Transcript and challenge (keccak to Fr)
-        let mut transcript = Vec::new();
-        pok.challenge_contribution(&revealed_msgs, &params_bbs, &mut transcript)
-            .map_err(|e| anyhow::anyhow!("challenge contrib failed: {:?}", e))?;
-        let c_fr = keccak_to_fr(&transcript);
-        let proof = pok.gen_proof(&c_fr).map_err(|e| anyhow::anyhow!("gen_proof failed: {:?}", e))?;
-
-        // Pack inputs for VerifyWrapper.verifyPok
-        // Build tuple-shaped args matching ABI
-        let ctx_g1 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.g1).to_vec());
-        let ctx_h0 = EthBytes::from(g1_to_eip2537_bytes(&params_bbs.h_0).to_vec());
-        let ctx_h: Vec<EthBytes> = params_bbs.h.iter().map(|h| EthBytes::from(g1_to_eip2537_bytes(h).to_vec())).collect();
-        let _ctx_h_len_dbg = ctx_h.len();
-        let sig_ap = EthBytes::from(g1_to_eip2537_bytes(&proof.A_prime).to_vec());
-        let sig_ab = EthBytes::from(g1_to_eip2537_bytes(&proof.A_bar).to_vec());
-        let sig_d  = EthBytes::from(g1_to_eip2537_bytes(&proof.d).to_vec());
-        // Preflight length checks (must be 128 bytes each)
-        fn check_len(label: &str, b: &EthBytes, exp: usize) -> anyhow::Result<()> {
-            if b.len() != exp { anyhow::bail!("{}: expected {} bytes, got {}", label, exp, b.len()); }
-            Ok(())
-        }
-        check_len("ctx.g1", &ctx_g1, 128)?;
-        check_len("ctx.h0", &ctx_h0, 128)?;
-        for (i, hh) in ctx_h.iter().enumerate() { check_len(&format!("ctx.H[{}]", i), hh, 128)?; }
-        check_len("sig.APrime", &sig_ap, 128)?;
-        check_len("sig.ABar", &sig_ab, 128)?;
-        check_len("sig.d", &sig_d, 128)?;
-        let ctx_t = (onchain_mcount, ctx_g1, ctx_h0, ctx_h);
-    let sig_t = (sig_ap.clone(), sig_ab.clone(), sig_d);
-        let revealed_vals_u256: Vec<U256> = revealed_idx.iter().map(|ix| {
-            let v = messages[*ix as usize];
-            fr_to_u256(&v)
-        }).collect();
-
-        let revealed_t = (revealed_idx.clone(), revealed_vals_u256);
-        let p1_t_t1 = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_1.t).to_vec());
-        check_len("p1.T1", &p1_t_t1, 128)?;
-        let p1_t = (p1_t_t1, fr_to_u256(&proof.sc_resp_1.response1), fr_to_u256(&proof.sc_resp_1.response2));
-        // responses for undisclosed messages then r3 then s'
-        let sc2 = proof.sc_resp_2.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_2"))?;
-        let undis_count = (onchain_mcount as usize) - revealed_idx.len();
-        let resp_msgs: Vec<U256> = sc2.0.iter().take(undis_count).map(fr_to_u256).collect();
-        let _resp_msgs_len_dbg = resp_msgs.len();
-        let resp_r3 = fr_to_u256(&sc2.0[undis_count]);
-        let resp_sprime = fr_to_u256(&sc2.0[undis_count + 1]);
-        if resp_msgs.len() != undis_count { anyhow::bail!("respMsgs length {} != undisclosed count {}", resp_msgs.len(), undis_count); }
-        let p2_t_t2 = EthBytes::from(g1_to_eip2537_bytes(&proof.T2).to_vec());
-        check_len("p2.T2", &p2_t_t2, 128)?;
-        let p2_t = (p2_t_t2, resp_msgs, resp_r3, resp_sprime);
-        let challenge_u256 = fr_to_u256(&c_fr);
-
-
-
-        // Encryption extras from proof
-        let t1_b    = EthBytes::from(g1_to_eip2537_bytes(proof.T1_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T1_enc"))?).to_vec()); // <- use T1_enc
-        let t2enc_b = EthBytes::from(g1_to_eip2537_bytes(proof.T2_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing T2_enc"))?).to_vec());
-        let t_enc_b = EthBytes::from(g1_to_eip2537_bytes(&proof.sc_resp_enc.as_ref().ok_or_else(|| anyhow::anyhow!("missing sc_resp_enc"))?.t).to_vec());
-        // respA3/respK unchanged (come from sc_resp_enc)
-        let resp_a3_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response1);
-        let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
+        // Build using helpers
+        let (proof, c_fr, revealed_idx2) = build_pok_and_proof(&params_bbs, &sig_struct, &messages, &ybar_aff, &revealed_idx)?;
+        let (sig_t, ctx_t, revealed_t, challenge_u256, p1_t, p2_t, enc_extras) =
+            build_presentation_tuples(&params_bbs, &proof, &revealed_idx2, &messages, pb.mcount, &c_fr)?;
+        let EncExtras { t1_b, t2enc_b, t_enc_b, resp_a3_u, resp_k_u } = enc_extras;
+        // params address for VerifyWrapper
         let params_addr_u8: [u8; 20] = params_contract.address().into();
         let params_addr_eth: Address = Address::from(params_addr_u8);
         // Membership extras: load e and witness
@@ -1006,7 +1104,7 @@ async fn persist_and_optionally_present(
         }
         // Single call that does full verification (pok+enc+pairing+membership) and emits PresentationVerified(T1,T2)
         let call = contract
-            .method::<_, bool>(
+                .method::<_, bool>(
                 "verifyPokEncWithPairingAndMembershipFromParamsEmit",
                     (
                         sig_t,
@@ -1038,8 +1136,8 @@ async fn persist_and_optionally_present(
                                 if lg.address == verify_addr && !lg.topics.is_empty() && lg.topics[0] == topic { ok = true; break; }
                             }
                         }
-                    }
-                    Err(e) => {
+                }
+                Err(e) => {
                         eprintln!("[present] tx await error: {:?}", e);
                     }
                 }
