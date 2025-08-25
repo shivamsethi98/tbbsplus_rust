@@ -9,6 +9,8 @@ import {Params} from "./Params.sol";
 /// @notice Verifies BBS+ PoK using EIP-2537 MSM precompiles and optionally runs a pairing check
 ///         via the PAIRING precompile (0x0f). The pairing inputs must already reflect any required
 ///         negations (e.g., pass -Abar for the second G1 when checking e(A', pk) == e(Abar, g2)).
+
+
 library Verify {
     // EIP-2537 precompile addresses
     address internal constant PAIR = address(0x0f);
@@ -76,6 +78,10 @@ contract VerifyWrapper {
     using Verify for BbsPlusPokVerify.PublicSignatureParts;
 
     event PresentationVerified(string indexed name, address indexed prover, bytes T1, bytes T2);
+
+    // Minimal interface to Accumulator needed for membership verification
+    // Note: interfaces must be top-level in Solidity, but recent compilers allow interfaces inside contracts only as type declarations.
+    // To be maximally compatible, we define the function type inline via an external call, so no separate interface block is required.
 
     function verifyPok(
         BbsPlusPokVerify.PublicSignatureParts memory sig,
@@ -188,6 +194,55 @@ contract VerifyWrapper {
         require(keccak256(lhs) == keccak256(rhs), "enc fail");
         // Pairing
         require(Verify.verifyPairing(sig.APrime, pkG2, Bls12381.g1neg(sig.ABar), g2base), "pair fail");
+        emit PresentationVerified(name, msg.sender, T1, T2enc);
+        return true;
+    }
+
+    /// @notice Verify PoK, encryption relation, pairing, AND accumulator membership
+    /// @dev Reads pk/g2base/Ybar from Params by name, then calls Accumulator.verifyMembership
+    function verifyPokEncWithPairingAndMembershipFromParamsEmit(
+        BbsPlusPokVerify.PublicSignatureParts memory sig,
+        BbsPlusPokVerify.VerificationContext memory ctx,
+        BbsPlusPokVerify.Revealed memory revealed,
+        uint256 challenge,
+        BbsPlusPokVerify.Proof1 memory p1,
+        BbsPlusPokVerify.Proof2 memory p2,
+        // Encryption extras
+        bytes calldata T1,
+        bytes calldata T2enc,
+        bytes calldata Tenc,
+        uint256 respA3,
+        uint256 respK,
+        // Membership and params
+        string calldata name,
+        address paramsAddr,
+        address accumulatorAddr,
+        uint256 e,
+        bytes calldata witness128
+    ) external returns (bool) {
+        Params p = Params(paramsAddr);
+        ( , , bytes memory g2base) = p.getG1H0G2ByName(name);
+        bytes memory pkG2 = p.getPkG2ByName(name);
+        bytes memory ybar = p.getOpenerYbarByName(name);
+        require(pkG2.length == 256 && g2base.length == 256 && ybar.length == 128, "bad params");
+        require(T1.length == 128 && T2enc.length == 128 && Tenc.length == 128, "bad T len");
+        // Core PoK
+        require(Verify.verifyPok(sig, ctx, revealed, challenge, p1, p2), "pok fail");
+        // Encryption relation: lhs = A'*respA3 + Ybar*respK; rhs = Tenc + T2enc*challenge
+        bytes memory lhsA3 = this.msm1(sig.APrime, respA3);
+        bytes memory lhsK  = this.msm1(ybar,     respK);
+        bytes memory lhs   = this.g1add(lhsA3, lhsK);
+        bytes memory rhsC  = this.msm1(T2enc,    challenge);
+        bytes memory rhs   = this.g1add(Tenc, rhsC);
+        require(keccak256(lhs) == keccak256(rhs), "enc fail");
+        // Pairing
+        require(Verify.verifyPairing(sig.APrime, pkG2, Bls12381.g1neg(sig.ABar), g2base), "pair fail");
+        // Membership
+        // Call Accumulator.verifyMembership(name, e, witness)
+        (bool ok, bytes memory ret) = accumulatorAddr.staticcall(abi.encodeWithSignature(
+            "verifyMembership(string,uint256,bytes)", name, e, witness128
+        ));
+        require(ok && ret.length == 32 && ret[31] == 0x01, "acc fail");
         emit PresentationVerified(name, msg.sender, T1, T2enc);
         return true;
     }

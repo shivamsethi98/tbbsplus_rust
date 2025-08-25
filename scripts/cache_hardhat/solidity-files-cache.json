@@ -193,8 +193,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Verify.sol": {
-      "lastModificationDate": 1755949305983,
-      "contentHash": "d13c4da42352c88aecac3314cf8c52e8",
+      "lastModificationDate": 1756099580970,
+      "contentHash": "e3f706485f73d0bb6d88b2fed1458173",
       "sourceName": "contracts/Verify.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -230,6 +230,7 @@
         "^0.8.24"
       ],
       "artifacts": [
+        "IAccumulatorLike",
         "Verify",
         "VerifyWrapper"
       ]
@@ -350,8 +351,8 @@
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CredentialRegistry.sol": {
-      "lastModificationDate": 1755618749037,
-      "contentHash": "b1218eac1238b3d6f87ffdab125b3f31",
+      "lastModificationDate": 1756031161710,
+      "contentHash": "b75ed8916f553bf8596c1074e57bb6f2",
       "sourceName": "contracts/CredentialRegistry.sol",
       "solcConfig": {
         "version": "0.8.27",
@@ -542,6 +543,48 @@
       ],
       "artifacts": [
         "SetupPublicParams"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Accumulator.sol": {
+      "lastModificationDate": 1756099505528,
+      "contentHash": "168b9219f892aaa2d20f1450f58cdd76",
+      "sourceName": "contracts/Accumulator.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [
+        "./Params.sol",
+        "./lib/Bls12381.sol",
+        "./Verify.sol"
+      ],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "Accumulator",
+        "ICredentialRegistryLike"
       ]
     }
   }

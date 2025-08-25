@@ -9,6 +9,9 @@ interface ICredentialRegistryLike {
     function accumulatorManagers(address who) external view returns (bool);
 }
 
+
+
+
 /// @title Positive accumulator anchor and witnesses (single opener v1)
 /// @notice Stores per-credential accumulator anchor (Delta in G1) and membership witnesses
 ///         produced off-chain by the opener. Verifies membership on-chain via pairing.

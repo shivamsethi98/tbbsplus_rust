@@ -865,6 +865,12 @@ async fn persist_and_optionally_present(
         let abi_val = v.get("abi").ok_or_else(|| anyhow::anyhow!("abi missing in artifact"))?.clone();
         let abi: Abi = serde_json::from_value(abi_val)?;
         let contract = Contract::new(verify_addr, abi, client.clone());
+        // Prepare Accumulator contract for witness lookup
+        let acc_addr: Address = env::var("ACC_CONTRACT").expect("ACC_CONTRACT").parse()?;
+        let acc_art = std::fs::read("artifacts/contracts/Accumulator.sol/Accumulator.json")?;
+        let acc_json: serde_json::Value = serde_json::from_slice(&acc_art)?;
+        let acc_abi: Abi = serde_json::from_value(acc_json.get("abi").cloned().ok_or_else(|| anyhow::anyhow!("abi missing"))?)?;
+        let acc = Contract::new(acc_addr, acc_abi, client.clone());
         // Build PoK for selective disclosure like exporter
         // Prompt for revealed set
         println!("Enter revealed indices for presentation (comma-separated, e.g., 0,2). Leave blank for 0 only:");
@@ -988,10 +994,20 @@ async fn persist_and_optionally_present(
         let resp_k_u = fr_to_u256(&proof.sc_resp_enc.as_ref().unwrap().response2);
         let params_addr_u8: [u8; 20] = params_contract.address().into();
         let params_addr_eth: Address = Address::from(params_addr_u8);
-        // Single call that does full verification and emits PresentationVerified(T1,T2)
+        // Membership extras: load e and witness
+        let sig_v: serde_json::Value = serde_json::from_slice(&std::fs::read(base.join("agg_signature.json"))?)?;
+        let e_hex = sig_v.get("e").and_then(|x| x.as_str()).ok_or_else(|| anyhow::anyhow!("sig.e missing"))?;
+        let e_fr = Fr::deserialize_compressed(&hex::decode(e_hex.trim_start_matches("0x"))?[..])?;
+        let e_u = fr_to_u256(&e_fr);
+        let witness_b: ethers::types::Bytes = acc.method("getWitness", (cred_name.to_string(), e_u))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+        if witness_b.0.is_empty() {
+            eprintln!("[present] membership witness missing on-chain; skipping presentation");
+            continue;
+        }
+        // Single call that does full verification (pok+enc+pairing+membership) and emits PresentationVerified(T1,T2)
         let call = contract
             .method::<_, bool>(
-                "verifyPokEncWithPairingFromParamsEmit",
+                "verifyPokEncWithPairingAndMembershipFromParamsEmit",
                     (
                         sig_t,
                         ctx_t,
@@ -1006,18 +1022,33 @@ async fn persist_and_optionally_present(
                     resp_k_u,
                     cred_name.to_string(),
                     params_addr_eth,
+                    acc_addr,
+                    e_u,
+                    witness_b,
                 ),
             )?;
-        let pending_tx = call.send().await?;
-        let rcpt = pending_tx.await?;
         let topic = H256::from(ethers::utils::keccak256(b"PresentationVerified(string,address,bytes,bytes)"));
         let mut ok = false;
-        if let Some(r) = rcpt.as_ref() {
-            for lg in &r.logs {
-                if lg.address == verify_addr && !lg.topics.is_empty() && lg.topics[0] == topic { ok = true; break; }
+        match call.send().await {
+            Ok(pending_tx) => {
+                match pending_tx.await {
+                    Ok(rcpt_opt) => {
+                        if let Some(r) = rcpt_opt.as_ref() {
+                            for lg in &r.logs {
+                                if lg.address == verify_addr && !lg.topics.is_empty() && lg.topics[0] == topic { ok = true; break; }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[present] tx await error: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[present] call reverted: {:?}", e);
             }
         }
-        println!("Client: presentation {}", if ok { "succeeded" } else { "failed (no event)" });
+        println!("Client: presentation {}", if ok { "succeeded" } else { "failed" });
     } else if choice == "e" || choice == "exit" {
         break;
     } else {
