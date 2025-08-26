@@ -290,58 +290,6 @@ contract CredentialRegistry {
         return (Bp, revealedIdxs[k], revealedVals[k]);
     }
 
-    function debugComputeBpp(string calldata name, uint256 sid) external view returns (
-        bytes memory Bpp, bytes memory g1PlusBpp
-    ) {
-        bytes32 k = _key(name, sid);
-        Sig storage srec = sigs[k];
-        bytes memory Bp = srec.Bprime.length == 128 ? srec.Bprime : bprimes[k];
-        require(Bp.length == 128, "B' missing");
-        (bytes memory g1, bytes memory h0, ) = params.getG1H0G2ByName(name);
-        require(g1.length == 128 && h0.length == 128, "params unset");
-        bytes memory h0s = Bls12381.g1msm(Bls12381.concatMSM(_oneArray(h0), _oneScalar(srec.s)));
-        bytes memory base = Bls12381.g1add(Bp, h0s);
-        uint32[] storage ridx = revealedIdxs[k];
-        uint256[] storage rvals = revealedVals[k];
-        if (ridx.length > 0) {
-            bytes[] memory H = params.getHByName(name);
-            bytes[] memory pts = new bytes[](ridx.length);
-            uint256[] memory scs = new uint256[](ridx.length);
-            for (uint256 i = 0; i < ridx.length; i++) { pts[i] = H[uint256(ridx[i])]; scs[i] = rvals[i]; }
-            bytes memory sumRevealed = Bls12381.g1msm(Bls12381.concatMSM(pts, scs));
-            base = Bls12381.g1add(base, sumRevealed);
-        }
-        return (base, Bls12381.g1add(g1, base));
-    }
-
-    function debugVerifyPairing(string calldata name, uint256 sid) external view returns (bool) {
-        bytes32 k = _key(name, sid);
-        Sig storage srec = sigs[k];
-        bytes memory Bp = srec.Bprime.length == 128 ? srec.Bprime : bprimes[k];
-        require(Bp.length == 128, "B' missing");
-        (bytes memory g1, bytes memory h0, bytes memory g2base) = params.getG1H0G2ByName(name);
-        bytes memory pkG2 = params.getPkG2ByName(name);
-        bytes memory h0s = Bls12381.g1msm(Bls12381.concatMSM(_oneArray(h0), _oneScalar(srec.s)));
-        bytes memory base = Bls12381.g1add(Bp, h0s);
-        uint32[] storage ridx = revealedIdxs[k];
-        uint256[] storage rvals = revealedVals[k];
-        if (ridx.length > 0) {
-            bytes[] memory H = params.getHByName(name);
-            bytes[] memory pts = new bytes[](ridx.length);
-            uint256[] memory scs = new uint256[](ridx.length);
-            for (uint256 i = 0; i < ridx.length; i++) { pts[i] = H[uint256(ridx[i])]; scs[i] = rvals[i]; }
-            bytes memory sumRevealed = Bls12381.g1msm(Bls12381.concatMSM(pts, scs));
-            base = Bls12381.g1add(base, sumRevealed);
-        }
-        bytes memory g1PlusBpp = Bls12381.g1add(g1, base);
-        // Include e in debug pairing as well
-        uint256[] memory sc_one = _oneScalar(srec.e);
-        bytes[] memory g2_one = new bytes[](1);
-        g2_one[0] = g2base;
-        bytes memory eg2 = Bls12381.g2msm(Bls12381.concatMSM_G2(g2_one, sc_one));
-        bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
-        return Verify.verifyPairing(srec.A, pk_plus_eg2, Bls12381.g1neg(g1PlusBpp), g2base);
-    }
 
     // --- helpers ---
     function _oneArray(bytes memory p128) private pure returns (bytes[] memory arr) {

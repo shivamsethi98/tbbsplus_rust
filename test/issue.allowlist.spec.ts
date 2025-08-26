@@ -8,9 +8,21 @@ describe("Issue allowlisting", function () {
     const Params = await ethers.getContractFactory("Params");
     const params = await Params.connect(owner).deploy();
     await params.waitForDeployment();
-    await params
-      .connect(owner)
-      .setParamsOnce("ANON_CRED", 5, 2, 3, [1, 2], 6);
+  // Initialize minimal params via setupAll (fixed fields with zeroed blob); H set optional for this test
+  const zeros = (n: number) => "0x" + "00".repeat(n);
+  const blob = ethers.concat([
+    zeros(128), // g1
+    zeros(128), // h0
+    zeros(256), // g2Base
+    zeros(256), // pkG2
+    zeros(128), // openerYbar
+    zeros(256), // openerPkG2
+  ]);
+  await (
+    await (params as any).connect(owner).setupAll(
+      "ANON_CRED", 5, 2, 3, [1, 2], blob, [], []
+    )
+  ).wait();
 
     const Issue = await ethers.getContractFactory("Issue");
     const issue = await Issue.connect(owner).deploy(await params.getAddress());

@@ -9,15 +9,21 @@ describe("AC flow v1 (events-only)", function () {
     const params = await Params.connect(owner).deploy();
     await params.waitForDeployment();
 
-    // set params once
+    // initialize params via setupAll with zeroed blob
+    const zeros = (n: number) => "0x" + "00".repeat(n);
+    const blob = ethers.concat([
+      zeros(128), zeros(128), zeros(256), zeros(256), zeros(128), zeros(256)
+    ]);
     await expect(
-      params.connect(owner).setParamsOnce(
+      (params as any).connect(owner).setupAll(
         "ANON_CRED",
         5, // messageCount
         2, // t
         3, // n
         [1, 2], // public_m_encoding (dummy)
-        6 // hLen
+        blob,
+        [], // indices
+        [] // commitmentsG2
       )
     ).to.emit(params, "ParamsSet");
 

@@ -54,19 +54,6 @@ async fn main() -> anyhow::Result<()> {
             let factory = Params::deploy(client.clone(), ())?;
             let contract = factory.send().await?;
             let addr = contract.address();
-            // Initialize params once
-            contract
-                .set_params_once(
-                    cred_name.clone(),
-                    mcount.into(),
-                    t.into(),
-                    n.into(),
-                    vec![U256::from(1u64), U256::from(2u64)],
-                    mcount.into(),
-                )
-                .send()
-                .await?
-                .await?;
             println!("export PARAMS_CONTRACT={addr:?}");
             addr
         }
@@ -172,16 +159,48 @@ async fn main() -> anyhow::Result<()> {
     let mut h_bytes: Vec<Vec<u8>> = Vec::with_capacity(params_bbs.h.len());
     for h in params_bbs.h.iter() { h_bytes.push(g1_to_eip2537_bytes(h).to_vec()); }
 
+    // Build opener commitments Y_i = g2 * y_i (indices 1..=n)
+    let mut indices: Vec<u16> = Vec::new();
+    let mut commits: Vec<ethers::types::Bytes> = Vec::new();
+    for (idx1, share) in opener_shares.0.iter().enumerate() {
+        let y_i: Fr = share.share;
+        let y_i_g2 = params_bbs.g2.mul_bigint(y_i.into_bigint()).into_affine();
+        let y_i_bytes = g2_to_eip2537_bytes(&y_i_g2).to_vec();
+        indices.push((idx1 as u16) + 1);
+        commits.push(ethers::types::Bytes::from(y_i_bytes));
+    }
+
+    // Build compact blob: g1 || h0 || g2base || pkG2 || openerYbar || openerPkG2 (no H)
+    let mut blob: Vec<u8> = Vec::with_capacity(128 + 128 + 256 + 256 + 128 + 256);
+    blob.extend_from_slice(&g1_b);
+    blob.extend_from_slice(&h0_b);
+    blob.extend_from_slice(&g2base_bytes);
+    blob.extend_from_slice(&pk_bytes);
+    blob.extend_from_slice(&ybar_bytes);
+    blob.extend_from_slice(&opener_pk_bytes);
+
+    // One-shot setup: params scalars, blob, and opener commitments
     params
-        .set_g1h0g2(
+        .setup_all(
             cred_name.clone(),
-            g1_b.clone().into(),
-            h0_b.clone().into(),
-            g2base_bytes.clone().into(),
+            mcount.into(),
+            t.into(),
+            n.into(),
+            vec![U256::from(1u64), U256::from(2u64)],
+            blob.clone().into(),
+            indices.clone(),
+            commits.clone(),
         )
         .send()
         .await?
         .await?;
+
+    // Verify on-chain dataHash matches the blob we set
+    let on_hash: [u8; 32] = params.get_data_hash_by_name(cred_name.clone()).call().await?;
+    let local_hash = ethers::utils::keccak256(&blob);
+    if on_hash != local_hash { println!("WARNING: dataHash mismatch: on-chain {:x?} vs local {:x?}", on_hash, local_hash); }
+
+    // Set H separately (allows future changes per suite)
     params
         .set_h_by_name(
             cred_name.clone(),
@@ -190,55 +209,6 @@ async fn main() -> anyhow::Result<()> {
         .send()
         .await?
         .await?;
-    params
-        .set_pk_g2(cred_name.clone(), pk_bytes.clone().into())
-        .send()
-        .await?
-        .await?;
-
-    // Set opener keys on-chain
-    params
-        .set_opener_keys(cred_name.clone(), ybar_bytes.clone().into(), opener_pk_bytes.clone().into())
-        .send()
-        .await?
-        .await?;
-
-    // Publish opener commitments Y_i = g2 * y_i on-chain
-    {
-        use ark_serialize::CanonicalSerialize as _;
-        use tbbsplus_rust::orchestration::crypto::encoding::g2_to_eip2537_bytes;
-        // Load dynamic ABI to avoid compile-time dependency on regenerated artifacts
-        fn load_abi(path: &str, tag: &str) -> anyhow::Result<Abi> {
-            let art = std::fs::read(path).map_err(|e| anyhow::anyhow!("[ttp] read {} failed: {:?}", path, e))?;
-            let v: serde_json::Value = serde_json::from_slice(&art)
-                .map_err(|e| anyhow::anyhow!("[ttp] parse {} failed: {:?}", path, e))?;
-            let abi_val = v.get("abi").cloned().ok_or_else(|| anyhow::anyhow!("[ttp] {} abi missing in {}", tag, path))?;
-            let abi: Abi = serde_json::from_value(abi_val)
-                .map_err(|e| anyhow::anyhow!("[ttp] {} abi decode failed: {:?}", tag, e))?;
-            Ok(abi)
-        }
-        let params_dyn = {
-            let abi = load_abi("artifacts/contracts/Params.sol/Params.json", "params")?;
-            ethers::contract::Contract::new(params_addr, abi, client.clone())
-        };
-        let mut indices: Vec<u16> = Vec::new();
-        let mut commits: Vec<ethers::types::Bytes> = Vec::new();
-        for (idx1, share) in opener_shares.0.iter().enumerate() {
-            let y_i: Fr = share.share;
-            let y_i_g2 = params_bbs.g2.mul_bigint(y_i.into_bigint()).into_affine();
-            let y_i_bytes = g2_to_eip2537_bytes(&y_i_g2).to_vec();
-            indices.push((idx1 as u16) + 1);
-            commits.push(ethers::types::Bytes::from(y_i_bytes));
-        }
-        let _ = params_dyn
-            .method::<_, ()>(
-                "setOpenerCommitments",
-                (cred_name.clone(), indices.clone(), commits.clone()),
-            )?
-            .send()
-            .await?
-            .await?;
-    }
 
     // Persist opener secret shares for openers to read (t-of-n)
     {

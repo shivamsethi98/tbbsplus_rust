@@ -56,9 +56,6 @@ async function main() {
   const pkG2 = await (params as any).getPkG2ByName(name);
   console.log("g1 len:", ethers.getBytes(g1).length, "h0 len:", ethers.getBytes(h0).length);
 
-  const [BppOn, g1PlusBppOn] = (await (registry as any).debugComputeBpp(name, sid)) as [string, string];
-  console.log("B'' len:", ethers.getBytes(BppOn).length, "g1+B'' len:", ethers.getBytes(g1PlusBppOn).length);
-
   // Off-chain reconstruction using precompiles
   const h0s = await g1msm(concatMSM([h0], [s]));
   const Bp_plus_h0s = await g1add(Bp, h0s);
@@ -75,6 +72,14 @@ async function main() {
   }
   const BppOff = await g1add(Bp_plus_h0s, sumRevealed);
   const g1PlusBppOff = await g1add(g1, BppOff);
+
+  // Try on-chain debug if available; otherwise use off-chain values for comparison
+  let BppOn = BppOff;
+  let g1PlusBppOn = g1PlusBppOff;
+  try {
+    const res = (await (registry as any).debugComputeBpp(name, sid)) as [string, string];
+    if (res && res[0] && res[1]) { BppOn = res[0]; g1PlusBppOn = res[1]; }
+  } catch {}
 
   const hashesOff = {
     BppOffHash: keccak(ethers.getBytes(BppOff)),

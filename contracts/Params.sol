@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity >=0.7.0 <0.9.0;
 
+import {SSTORE2} from "./lib/SSTORE2.sol";
+
 contract Params {
     address private owner;
     constructor() { owner = msg.sender; }
@@ -35,7 +37,85 @@ contract Params {
     }
     mapping(uint256 => CredParams) private paramsById;
 
+    // Pointer to compact params blob stored via SSTORE2 per credential id
+    // Layout (byte offsets) for fixed blob (H is stored separately via setHByName):
+    // 0..127: g1 (128B), 128..255: h0 (128B), 256..511: g2Base (256B),
+    // 512..767: pkG2 (256B), 768..895: openerYbarG1 (128B), 896..1151: openerPkG2 (256B)
+    mapping(uint256 => address) private dataPtr;
+    mapping(uint256 => bytes32) private dataHash;
+
     event ParamsSet(string indexed name, uint256 indexed id, uint256 messageCount, uint256 t, uint256 n);
+
+    // Internal memcpy helper (memory-safe assembly)
+    function _copy(bytes memory dst, uint256 destOffset, bytes memory src, uint256 len) private pure {
+        assembly ("memory-safe") {
+            let dest := add(add(dst, 0x20), destOffset)
+            let s := add(src, 0x20)
+            // copy 32-byte chunks
+            for { let i := 0 } lt(i, len) { i := add(i, 0x20) } {
+                mstore(add(dest, i), mload(add(s, i)))
+            }
+        }
+    }
+
+
+    /// @notice One-shot setup for a credential suite. Initializes all core params in a single transaction
+    /// @dev Preserves existing getters so off-chain and on-chain consumers remain compatible.
+    function setupAll(
+        string memory name,
+        uint256 messageCount,
+        uint256 t,
+        uint256 n,
+        uint256[] memory public_m_encoding,
+        bytes calldata blob,
+        uint16[] calldata indices,
+        bytes[] calldata commitmentsG2
+    ) external onlyOwner {
+        require(bytes(name).length > 0, "bad name");
+        require(t > 0 && n >= t, "bad threshold");
+        // Expect blob length to match exact encoding size (fixed fields only, excludes H[])
+        uint256 expected = 128 + 128 + 256 + 256 + 128 + 256; // 1152 bytes
+        require(blob.length == expected, "bad blob len");
+        require(indices.length == commitmentsG2.length, "len mismatch");
+        for (uint256 i = 0; i < commitmentsG2.length; i++) { require(commitmentsG2[i].length == 256, "bad g2 len"); }
+
+        uint256 id = nameToId[name];
+        bool isNew = false;
+        if (id == 0) { id = nextId++; nameToId[name] = id; isNew = true; }
+        CredParams storage cp = paramsById[id];
+        // If already initialized, enforce consistency
+        if (cp.messageCount != 0) { require(cp.messageCount == messageCount, "mcount mismatch"); }
+        cp.messageCount = messageCount;
+        if (cp.t != 0) { require(cp.t == t, "t mismatch"); }
+        cp.t = t;
+        if (cp.n != 0) { require(cp.n == n, "n mismatch"); }
+        cp.n = n;
+        cp.public_m_encoding = public_m_encoding;
+        // hLen is maintained by setHByName; do not overwrite here
+
+        // Persist compact blob via SSTORE2
+        bytes memory _blob = blob; // move to memory
+        address ptr = SSTORE2.write(_blob);
+        dataPtr[id] = ptr;
+        dataHash[id] = keccak256(_blob);
+
+        // Do not store bulky bytes in storage; keep cp.* bytes as empty; keep cp.H as-is
+        cp.g1 = new bytes(0);
+        cp.h0 = new bytes(0);
+        cp.g2Base = new bytes(0);
+        cp.pkG2 = new bytes(0);
+        cp.openerYbarG1 = new bytes(0);
+        cp.openerPkG2 = new bytes(0);
+
+        // Set opener commitments
+        for (uint256 k = 0; k < indices.length; k++) {
+            openerCommitmentsG2[id][indices[k]] = commitmentsG2[k];
+        }
+
+        emit ParamsSet(name, id, messageCount, t, n);
+        emit ParamsG1H0G2Set(name);
+        if (indices.length > 0) { emit OpenerCommitmentsSet(name, indices); }
+    }
 
     // Global issuer registry and optional libp2p multiaddrs
     mapping(address => bool) public issuerAllowed;
@@ -56,35 +136,6 @@ contract Params {
     mapping(uint256 => mapping(uint16 => bytes)) private openerCommitmentsG2;
     event OpenerCommitmentsSet(string indexed name, uint16[] indices);
 
-    function setParamsOnce(
-        string memory name,
-        uint256 messageCount,
-        uint256 t,
-        uint256 n,
-        uint256[] memory public_m_encoding,
-        uint256 hLen
-    ) external onlyOwner {
-        require(nameToId[name] == 0, "exists");
-        require(bytes(name).length > 0, "bad name");
-        require(t > 0 && n >= t, "bad threshold");
-        uint256 id = nextId++;
-        nameToId[name] = id;
-        paramsById[id] = CredParams({
-            messageCount: messageCount,
-            t: t,
-            n: n,
-            public_m_encoding: public_m_encoding,
-            hLen: hLen,
-            pkG2: new bytes(0),
-            g1: new bytes(0),
-            h0: new bytes(0),
-            g2Base: new bytes(0),
-            H: new bytes[](0),
-            openerYbarG1: new bytes(0),
-            openerPkG2: new bytes(0)
-        });
-        emit ParamsSet(name, id, messageCount, t, n);
-    }
 
     function getMapCredentials(string memory name) external view returns (uint256) {
         return nameToId[name];
@@ -101,55 +152,49 @@ contract Params {
         return paramsById[id];
     }
 
-    // Set pkG2 for an existing credential set; can be called later once key is known.
-    function setPkG2(string memory name, bytes calldata pkG2) external onlyOwner {
-        uint256 id = nameToId[name];
-        require(id != 0, "not found");
-        require(pkG2.length == 256, "bad pk len");
-        paramsById[id].pkG2 = pkG2;
-    }
+    // Set pkG2 for an existing credential set; removed in favor of setupAll
+    // function setPkG2(string memory name, bytes calldata pkG2) external onlyOwner { ... }
 
     function getPkG2ByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
+        address ptr = dataPtr[id];
+        if (ptr != address(0)) { return SSTORE2.read(ptr, 512, 256); }
         return paramsById[id].pkG2;
     }
 
     // --- Opener keys (Ybar in G1, opener pk in G2) ---
-    function setOpenerKeys(string memory name, bytes calldata ybarG1, bytes calldata pkG2) external onlyOwner {
-        uint256 id = nameToId[name];
-        require(id != 0, "not found");
-        require(ybarG1.length == 128 && pkG2.length == 256, "bad opener lens");
-        paramsById[id].openerYbarG1 = ybarG1;
-        paramsById[id].openerPkG2 = pkG2;
-    }
+    // function setOpenerKeys(string memory name, bytes calldata ybarG1, bytes calldata pkG2) external onlyOwner { ... }
 
     function getOpenerYbarByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
+        address ptr = dataPtr[id];
+        if (ptr != address(0)) { return SSTORE2.read(ptr, 768, 128); }
         return paramsById[id].openerYbarG1;
     }
 
     function getOpenerPkG2ByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
+        address ptr = dataPtr[id];
+        if (ptr != address(0)) { return SSTORE2.read(ptr, 896, 256); }
         return paramsById[id].openerPkG2;
     }
 
     event ParamsG1H0G2Set(string indexed name);
-    function setG1H0G2(string memory name, bytes calldata g1, bytes calldata h0, bytes calldata g2Base) external onlyOwner {
-        uint256 id = nameToId[name];
-        require(id != 0, "not found");
-        require(g1.length == 128 && h0.length == 128 && g2Base.length == 256, "bad lens");
-        paramsById[id].g1 = g1;
-        paramsById[id].h0 = h0;
-        paramsById[id].g2Base = g2Base;
-        emit ParamsG1H0G2Set(name);
-    }
+    // function setG1H0G2(string memory name, bytes calldata g1, bytes calldata h0, bytes calldata g2Base) external onlyOwner { ... }
 
     function getG1H0G2ByName(string memory name) external view returns (bytes memory g1, bytes memory h0, bytes memory g2Base) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
+        address ptr = dataPtr[id];
+        if (ptr != address(0)) {
+            bytes memory _g1 = SSTORE2.read(ptr, 0, 128);
+            bytes memory _h0 = SSTORE2.read(ptr, 128, 128);
+            bytes memory _g2 = SSTORE2.read(ptr, 256, 256);
+            return (_g1, _h0, _g2);
+        }
         CredParams storage cp = paramsById[id];
         return (cp.g1, cp.h0, cp.g2Base);
     }
@@ -208,20 +253,7 @@ contract Params {
     }
 
     // --- Opener commitments per-credential ---
-    function setOpenerCommitments(
-        string memory name,
-        uint16[] calldata indices,
-        bytes[] calldata commitmentsG2
-    ) external onlyOwner {
-        require(indices.length == commitmentsG2.length, "len mismatch");
-        uint256 id = nameToId[name];
-        require(id != 0, "not found");
-        for (uint256 i = 0; i < indices.length; i++) {
-            require(commitmentsG2[i].length == 256, "bad g2 len");
-            openerCommitmentsG2[id][indices[i]] = commitmentsG2[i];
-        }
-        emit OpenerCommitmentsSet(name, indices);
-    }
+    // function setOpenerCommitments(string memory name, uint16[] calldata indices, bytes[] calldata commitmentsG2) external onlyOwner { ... }
 
     function getOpenerCommitment(string memory name, uint16 idx) external view returns (bytes memory) {
         uint256 id = nameToId[name];
@@ -257,5 +289,12 @@ contract Params {
 
     function getIssuers() external view returns (address[] memory) {
         return issuersList;
+    }
+
+    /// @notice Return the keccak256 hash of the fixed params blob stored via SSTORE2 for `name`
+    function getDataHashByName(string memory name) external view returns (bytes32) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        return dataHash[id];
     }
 }

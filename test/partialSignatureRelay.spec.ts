@@ -8,9 +8,15 @@ describe("PartialSignatureRelay", function () {
     const Params = await ethers.getContractFactory("Params");
     const params = await Params.connect(owner).deploy();
     await params.waitForDeployment();
-    await params
-      .connect(owner)
-      .setParamsOnce("ANON_CRED", 5, 2, 3, [1, 2], 6);
+  const zeros = (n: number) => "0x" + "00".repeat(n);
+  const blob = ethers.concat([
+    zeros(128), zeros(128), zeros(256), zeros(256), zeros(128), zeros(256)
+  ]);
+  await (
+    await (params as any).connect(owner).setupAll(
+      "ANON_CRED", 5, 2, 3, [1, 2], blob, [], []
+    )
+  ).wait();
 
     const Relay = await ethers.getContractFactory("PartialSignatureRelay");
     const relay = await Relay.connect(owner).deploy(await params.getAddress());

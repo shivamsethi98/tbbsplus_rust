@@ -10,16 +10,6 @@ async function main() {
   const Params = await ethers.getContractFactory("Params");
   const params = await Params.connect(owner).deploy();
   await params.waitForDeployment();
-  await (
-    await (params as any).connect(owner).setParamsOnce(
-      credName,
-      messageCount,
-      t,
-      n,
-      [1, 2],
-      messageCount
-    )
-  ).wait();
 
   const Registry = await ethers.getContractFactory("CredentialRegistry");
   const registry = await Registry.connect(owner).deploy(await params.getAddress());
