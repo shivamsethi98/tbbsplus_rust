@@ -45,6 +45,7 @@ once_cell = "1.19"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+short_group_sig = { path = "crypto/short_group_sig" }
 
 [features]
 mpc = ["libp2p"]
@@ -83,3 +84,8 @@ path = "src/bin/opener.rs"
 [[bin]]
 name = "service_provider"
 path = "src/bin/service_provider.rs"
+
+[[bin]]
+name = "opener_threshold"
+path = "src/bin/opener_threshold.rs"
+required-features = ["mpc"]

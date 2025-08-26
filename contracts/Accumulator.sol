@@ -55,6 +55,7 @@ contract Accumulator {
     event MemberRevoked(string indexed name, uint256 indexed e, bytes newDelta);
     event OpenRequested(string indexed name, address indexed requester, bytes T1, bytes T2);
     event Opened(string indexed name, bytes A);
+    event RevokeRequested(string indexed name, uint256 indexed e);
 
     function setServiceProvider(address sp) external onlyOpener {
         require(sp != address(0), "bad sp");
@@ -141,6 +142,12 @@ contract Accumulator {
     function publishOpenResult(string calldata name, bytes calldata A128) external onlyOpener {
         require(A128.length == 128, "bad A len");
         emit Opened(name, A128);
+    }
+
+    /// @notice Service provider can request revocation directly by e (after opening off-chain)
+    function requestRevokeByE(string calldata name, uint256 e) external onlyServiceProvider {
+        require(e != 0, "bad e");
+        emit RevokeRequested(name, e);
     }
 
     /// @notice Verify membership e \in Acc(name) with witness; uses Params openerPkG2 as pkAcc

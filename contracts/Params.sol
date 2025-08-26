@@ -45,6 +45,17 @@ contract Params {
     event IssuerSet(address indexed issuer, uint16 idx, bool allowed);
     event IssuerMultiaddrsSet(address indexed issuer, string[] addrs);
 
+    // --- Opener roster and commitments (per-credential commitments, global roster like issuers) ---
+    mapping(address => bool) public openerAllowed;
+    mapping(address => uint16) public openerIndex; // 1..n index
+    mapping(address => string[]) private openerMultiaddrs;
+    address[] private openersList;
+    event OpenerSet(address indexed opener, uint16 idx, bool allowed);
+    event OpenerMultiaddrsSet(address indexed opener, string[] addrs);
+    // Per-credential (by id) opener index -> G2 commitment bytes (256B)
+    mapping(uint256 => mapping(uint16 => bytes)) private openerCommitmentsG2;
+    event OpenerCommitmentsSet(string indexed name, uint16[] indices);
+
     function setParamsOnce(
         string memory name,
         uint256 messageCount,
@@ -165,6 +176,57 @@ contract Params {
         require(id != 0, "not found");
         CredParams storage cp = paramsById[id];
         return cp.H;
+    }
+
+    // --- Opener admin (roster and multiaddrs) ---
+    function setOpener(address opener, uint16 idx, bool allowed) external onlyOwner {
+        require(idx > 0, "bad idx");
+        openerAllowed[opener] = allowed;
+        openerIndex[opener] = idx;
+        bool seen = false;
+        for (uint256 i = 0; i < openersList.length; i++) {
+            if (openersList[i] == opener) { seen = true; break; }
+        }
+        if (!seen) { openersList.push(opener); }
+        emit OpenerSet(opener, idx, allowed);
+    }
+
+    function setOpenerMultiaddrs(address opener, string[] calldata addrs) external onlyOwner {
+        delete openerMultiaddrs[opener];
+        for (uint256 i = 0; i < addrs.length; i++) {
+            openerMultiaddrs[opener].push(addrs[i]);
+        }
+        emit OpenerMultiaddrsSet(opener, addrs);
+    }
+
+    function getOpenerMultiaddrs(address opener) external view returns (string[] memory) {
+        return openerMultiaddrs[opener];
+    }
+
+    function getOpeners() external view returns (address[] memory) {
+        return openersList;
+    }
+
+    // --- Opener commitments per-credential ---
+    function setOpenerCommitments(
+        string memory name,
+        uint16[] calldata indices,
+        bytes[] calldata commitmentsG2
+    ) external onlyOwner {
+        require(indices.length == commitmentsG2.length, "len mismatch");
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        for (uint256 i = 0; i < indices.length; i++) {
+            require(commitmentsG2[i].length == 256, "bad g2 len");
+            openerCommitmentsG2[id][indices[i]] = commitmentsG2[i];
+        }
+        emit OpenerCommitmentsSet(name, indices);
+    }
+
+    function getOpenerCommitment(string memory name, uint16 idx) external view returns (bytes memory) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        return openerCommitmentsG2[id][idx];
     }
 
     // Issuer registry ops

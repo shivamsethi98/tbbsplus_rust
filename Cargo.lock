@@ -6026,6 +6026,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3",
+ "short_group_sig",
  "test_utils",
  "thiserror 1.0.69",
  "tokio",

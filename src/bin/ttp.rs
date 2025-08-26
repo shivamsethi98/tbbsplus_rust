@@ -13,6 +13,7 @@ use ark_std::rand::SeedableRng;
 use base64::Engine;
 use ethers::contract::abigen;
 use ethers::prelude::*;
+use ethers::abi::Abi;
 use ethers::providers::{Provider, Ws};
 use secret_sharing_and_dkg::shamir_ss::deal_random_secret;
 use ark_ec::{CurveGroup, AffineRepr};
@@ -128,22 +129,16 @@ async fn main() -> anyhow::Result<()> {
     g2base_bytes[128..].copy_from_slice(&yg2);
     println!("export G2_BASE_256=0x{}", hex::encode(&g2base_bytes));
 
-    // --- Opener strategy: derive opener secret deterministically and compute Ybar (G1) and opener pkG2 ---
-    // For demo, derive opener secret from label + fixed suffix
-    use blake2::Digest as _;
-    let mut h = blake2::Blake2b512::new();
-    h.update(b"TBBS+_OPENER_SK_v1");
-    h.update(cred_name.as_bytes());
-    let dig = h.finalize();
-    let mut le32 = [0u8; 32];
-    le32.copy_from_slice(&dig[..32]);
-    let opener_sk = <Fr as PrimeField>::from_be_bytes_mod_order(&le32);
-    // Ybar = g1 * opener_sk
+    // --- Opener accumulator secret: Shamir shares (t-of-n) and commitments ---
+    // Generate a fresh secret alpha for openers (per-credential), deal t-of-n shares among openers
+    let (alpha, opener_shares, _poly) = deal_random_secret::<_, Fr>(&mut rng, t, n)
+        .map_err(|e| anyhow::anyhow!("deal_random_secret (openers): {:?}", e))?;
     use ark_ec::CurveGroup as _;
-    let ybar_aff = params_bbs.g1.mul_bigint(opener_sk.into_bigint()).into_affine();
+    // Ybar = g1 * alpha (used by encryption/opening relation)
+    let ybar_aff = params_bbs.g1.mul_bigint(alpha.into_bigint()).into_affine();
     let ybar_bytes = g1_to_eip2537_bytes(&ybar_aff).to_vec();
-    // opener pk in G2: g2 * opener_sk
-    let opener_pk_aff = params_bbs.g2.mul_bigint(opener_sk.into_bigint()).into_affine();
+    // Accumulator public key in G2: pkAcc = g2 * alpha
+    let opener_pk_aff = params_bbs.g2.mul_bigint(alpha.into_bigint()).into_affine();
     let opener_pk_bytes = g2_to_eip2537_bytes(&opener_pk_aff).to_vec();
 
     // Also set g1, h0, H, g2base, pkG2 on-chain (requires OWNER to call onlyOwner fns)
@@ -208,22 +203,70 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .await?;
 
-    // Persist opener secret shares for openers to read (single opener v1: index 1)
+    // Publish opener commitments Y_i = g2 * y_i on-chain
     {
         use ark_serialize::CanonicalSerialize as _;
-        let mut sk_bytes = Vec::new();
-        opener_sk.serialize_compressed(&mut sk_bytes)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(sk_bytes);
+        use tbbsplus_rust::orchestration::crypto::encoding::g2_to_eip2537_bytes;
+        // Load dynamic ABI to avoid compile-time dependency on regenerated artifacts
+        fn load_abi(path: &str, tag: &str) -> anyhow::Result<Abi> {
+            let art = std::fs::read(path).map_err(|e| anyhow::anyhow!("[ttp] read {} failed: {:?}", path, e))?;
+            let v: serde_json::Value = serde_json::from_slice(&art)
+                .map_err(|e| anyhow::anyhow!("[ttp] parse {} failed: {:?}", path, e))?;
+            let abi_val = v.get("abi").cloned().ok_or_else(|| anyhow::anyhow!("[ttp] {} abi missing in {}", tag, path))?;
+            let abi: Abi = serde_json::from_value(abi_val)
+                .map_err(|e| anyhow::anyhow!("[ttp] {} abi decode failed: {:?}", tag, e))?;
+            Ok(abi)
+        }
+        let params_dyn = {
+            let abi = load_abi("artifacts/contracts/Params.sol/Params.json", "params")?;
+            ethers::contract::Contract::new(params_addr, abi, client.clone())
+        };
+        let mut indices: Vec<u16> = Vec::new();
+        let mut commits: Vec<ethers::types::Bytes> = Vec::new();
+        for (idx1, share) in opener_shares.0.iter().enumerate() {
+            let y_i: Fr = share.share;
+            let y_i_g2 = params_bbs.g2.mul_bigint(y_i.into_bigint()).into_affine();
+            let y_i_bytes = g2_to_eip2537_bytes(&y_i_g2).to_vec();
+            indices.push((idx1 as u16) + 1);
+            commits.push(ethers::types::Bytes::from(y_i_bytes));
+        }
+        let _ = params_dyn
+            .method::<_, ()>(
+                "setOpenerCommitments",
+                (cred_name.clone(), indices.clone(), commits.clone()),
+            )?
+            .send()
+            .await?
+            .await?;
+    }
+
+    // Persist opener secret shares for openers to read (t-of-n)
+    {
+        use ark_serialize::CanonicalSerialize as _;
+        use tbbsplus_rust::orchestration::crypto::encoding::g2_to_eip2537_bytes;
+        let mut shares_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut commits_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (idx1, share) in opener_shares.0.iter().enumerate() {
+            let y_i: Fr = share.share;
+            let mut y_bytes = Vec::new();
+            y_i.serialize_compressed(&mut y_bytes)?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(y_bytes);
+            shares_map.insert(((idx1 as u16) + 1).to_string(), serde_json::json!({"y_b64": b64}));
+            let y_i_g2 = params_bbs.g2.mul_bigint(y_i.into_bigint()).into_affine();
+            let y_i_bytes = g2_to_eip2537_bytes(&y_i_g2).to_vec();
+            commits_map.insert(((idx1 as u16) + 1).to_string(), serde_json::json!(format!("0x{}", hex::encode(y_i_bytes))));
+        }
         let out = serde_json::json!({
-            "openers": {
-                "1": { "y_b64": b64 }
-            }
+            "t": t,
+            "n": n,
+            "openers": shares_map,
+            "commitments_g2": commits_map
         });
         let data = serde_json::to_vec_pretty(&out)?;
         let tmp = ".runtime.openers.json.tmp";
         fs::write(tmp, &data)?;
         fs::rename(tmp, ".runtime.openers.json")?;
-        println!("TTP: wrote opener secret to .runtime.openers.json (index 1)");
+        println!("TTP: wrote opener secrets and commitments to .runtime.openers.json");
     }
 
     // Write a .runtime.env for tests/clients to source

@@ -3,4 +3,6 @@ pub mod pok;
 pub mod encoding;
 pub mod shares;
 pub mod seeds;
+#[cfg(test)]
+mod tests;
 

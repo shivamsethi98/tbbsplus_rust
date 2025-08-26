@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
             use std::collections::BTreeMap; use ark_serialize::CanonicalSerialize; use ark_std::rand::{rngs::StdRng, SeedableRng}; use ark_std::UniformRand;
             let mut hidden_u256: BTreeMap<u32, U256> = BTreeMap::new();
             for i in 0..mcount_onchain { if i == 0 { continue; } if !revealed_idx.contains(&i) { hidden_u256.insert(i, U256::from(100u64 + i as u64)); } }
-            let hidden_msgs_fr: BTreeMap<usize, Fr> = hidden_u256.iter().map(|(i, v)| (*i as usize, tbbsplus_rust::orchestration::helpers::u256_to_fr::<Fr>(v))).collect();
+            let hidden_msgs_fr: BTreeMap<usize, Fr> = hidden_u256.iter().map(|(i, v)| (*i as usize, u256_to_fr::<Fr>(v))).collect();
             let mut rng = StdRng::seed_from_u64(rand::random::<u64>()); let blinding = Fr::rand(&mut rng);
             {
                 use std::fs; use std::path::PathBuf; let base: PathBuf = [".runtime","users", &format!("{:x}", client.address()), &cred_name, &format!("sid_{}", sid)].iter().collect();

@@ -66,31 +66,45 @@ async fn main() -> anyhow::Result<()> {
         }
         if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens (T1={}, T2={})", t1.len(), t2.len()); continue; }
         // Interactive prompt
-        println!("ServiceProvider: PresentationVerified received (T1.len={}, T2.len={}). Open now? [y/N]", t1.len(), t2.len());
+        println!("ServiceProvider: choose action: [1] open-only  [2] revoke-by-e  [other] skip");
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).ok();
-        if matches!(ans.trim(), "y"|"Y"|"yes"|"YES") {
-            let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-            let t1b = ethers::types::Bytes::from(t1);
-            let t2b = ethers::types::Bytes::from(t2);
-            let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env, t1b, t2b))?;
-            let pending = call.send().await?;
-            let rcpt = pending.await?;
-            println!("ServiceProvider: requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
-            // Show follow-up status from Accumulator (Opened/MemberRevoked)
-            let mut notified = false;
-            let start = std::time::Instant::now();
-            while start.elapsed().as_secs() < 10 {
-                if let Some(lg) = status_stream.next().await {
-                    if lg.address == acc_addr_h && !lg.topics.is_empty() {
-                        if lg.topics[0] == ev_opened { println!("ServiceProvider: Opened emitted"); notified = true; break; }
-                        if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
-                    }
-                } else { break; }
+        match ans.trim() {
+            "1" => {
+                let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
+                let t1b = ethers::types::Bytes::from(t1);
+                let t2b = ethers::types::Bytes::from(t2);
+                let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env, t1b, t2b))?;
+                let pending = call.send().await?;
+                let rcpt = pending.await?;
+                println!("ServiceProvider: requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+                let mut notified = false;
+                let start = std::time::Instant::now();
+                while start.elapsed().as_secs() < 10 {
+                    if let Some(lg) = status_stream.next().await {
+                        if lg.address == acc_addr_h && !lg.topics.is_empty() {
+                            if lg.topics[0] == ev_opened { println!("ServiceProvider: Opened emitted"); notified = true; break; }
+                            if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
+                        }
+                    } else { break; }
+                }
+                if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 10s"); }
             }
-            if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 10s"); }
-        } else {
-            println!("ServiceProvider: skipped opening");
+            "2" => {
+                use std::io::Write as _;
+                print!("Enter e (hex 0x..): ");
+                let _ = std::io::stdout().flush();
+                let mut e_hex = String::new();
+                std::io::stdin().read_line(&mut e_hex).ok();
+                let e_hex = e_hex.trim();
+                let e_u = match U256::from_str_radix(e_hex.trim_start_matches("0x"), 16) { Ok(v) => v, Err(_) => { eprintln!("bad e"); continue; } };
+                let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
+                let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env, e_u))?;
+                let pending = call.send().await?;
+                let rcpt = pending.await?;
+                println!("ServiceProvider: requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+            }
+            _ => { println!("ServiceProvider: skipped"); }
         }
     }
     Ok(())

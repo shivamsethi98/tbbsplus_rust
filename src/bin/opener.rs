@@ -159,6 +159,16 @@ async fn main() -> anyhow::Result<()> {
             let _ = run_open_loop(client_c, accumulator_c, cred_name_c, accum_sk_c, opener_sk_c).await;
         });
     }
+    // Spawn revoke loop to handle Accumulator.RevokeRequested events
+    {
+        let client_c = client.clone();
+        let accumulator_c = accumulator.clone();
+        let cred_name_c = cred_name.clone();
+        let accum_sk_c = accum_sk.clone();
+        tokio::spawn(async move {
+            let _ = run_revoke_loop(client_c, accumulator_c, cred_name_c, accum_sk_c).await;
+        });
+    }
 
     while let Some(_log) = stream.next().await {
         // Fetch signature (A,e,s,status) for latest sid from the event's topics
@@ -298,32 +308,42 @@ async fn run_open_loop(
         if t1_b.len() != 128 || t2_b.len() != 128 { continue; }
         let (_tbar_b, a_b) = compute_tbar_and_a(&t1_b, &t2_b, opener_sk).await?;
         println!("opener/open: recovered A (keccak={})", hex::encode(ethers::utils::keccak256(&a_b.0)));
-        // Optional: publish recovered A
-        let _ = accumulator
-            .method::<_, ()>("publishOpenResult", (cred_name.clone(), ethers::types::Bytes::from(a_b.clone())))?
-            .send()
-            .await?
-            .await?;
-        // Lookup e by A
-        let e_u: U256 = accumulator
-            .method("getEByA", (cred_name.clone(), ethers::types::Bytes::from(a_b.clone())))?
-            .call()
-            .await?;
-        if e_u.is_zero() {
-            println!("opener/open: no A→e mapping found; skipping revocation");
-            continue;
-        }
+    }
+    Ok(())
+}
+
+
+// Listen to Accumulator.RevokeRequested and perform deletion (single-opener v1)
+async fn run_revoke_loop(
+    client: std::sync::Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
+    accumulator: Contract<SignerMiddleware<Provider<Ws>, LocalWallet>>,
+    cred_name: String,
+    accum_sk: AccumSecretKey<Fr>,
+) -> anyhow::Result<()> {
+    use ethers::types::{Filter, ValueOrArray, H256, BlockNumber};
+    let acc_addr = accumulator.address();
+    let event_sig = H256::from(ethers::utils::keccak256(b"RevokeRequested(string,uint256)"));
+    let name_topic = H256::from(ethers::utils::keccak256(cred_name.as_bytes()));
+    let filter = Filter::new()
+        .address(ValueOrArray::Value(acc_addr))
+        .topic0(ValueOrArray::Value(event_sig))
+        .topic1(ValueOrArray::Value(name_topic))
+        .from_block(BlockNumber::Latest);
+    let mut stream = client.provider().subscribe_logs(&filter).await?;
+    loop {
+        let Some(log) = stream.next().await else { break };
+        // topic2 is indexed e
+        let e_topic = log.topics.get(2).cloned().unwrap_or_default();
+        let e_u = U256::from_big_endian(e_topic.as_bytes());
+        if e_u.is_zero() { continue; }
         // Skip if already revoked
         let already: bool = accumulator
             .method("isRevoked", (cred_name.clone(), e_u))?
             .call()
             .await
             .unwrap_or(false);
-        if already {
-            println!("opener/open: e=0x{:x} already revoked; skipping", e_u);
-            continue;
-        }
-        // Fetch current Delta and compute new after removal
+        if already { continue; }
+        // Fetch current Delta
         let delta_bytes: ethers::types::Bytes = accumulator
             .method("getDelta", (cred_name.clone(),))?
             .call()
@@ -335,17 +355,12 @@ async fn run_open_loop(
         let e_fr: Fr = u256_to_fr::<Fr>(&e_u);
         let new_delta_aff = acc_local.compute_new_post_remove(&e_fr, &accum_sk);
         let new_delta_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&new_delta_aff).to_vec());
-        let new_delta_b_print = new_delta_b.clone();
         let _ = accumulator
             .method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b))?
             .send()
             .await?
             .await?;
-        println!(
-            "opener: opened and revoked e=0x{:x}; updated Delta (keccak={})",
-            e_u,
-            hex::encode(ethers::utils::keccak256(&new_delta_b_print.0))
-        );
+        println!("opener: revoked e=0x{:x}", e_u);
     }
     Ok(())
 }
