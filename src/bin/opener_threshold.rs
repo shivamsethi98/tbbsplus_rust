@@ -23,6 +23,7 @@ use tbbsplus_rust::orchestration::crypto::encoding::{
 use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 #[cfg(feature = "mpc")]
 use libp2p::Multiaddr;
+use tbbsplus_rust::orchestration::vb_accum::VbEnv;
 // Added for threshold accumulator deletion MPC
 use tbbsplus_rust::orchestration::threshold_phases::{KAPPA, STATISTICAL_SECURITY_PARAMETER, BASE_OT_KEY_SIZE};
 use tbbsplus_rust::orchestration::crypto::seeds;
@@ -63,7 +64,6 @@ struct OpenPartialMsg {
     sid: u64,
     from_idx: u16,
     tbar_128: Vec<u8>,
-    proof_bytes: Vec<u8>,
 }
 
 // Accumulator deletion MPC messages
@@ -176,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
         let abi = load_abi("artifacts/contracts/Accumulator.sol/Accumulator.json", "accumulator")?;
         Contract::new(acc_addr, abi, client.clone())
     };
+
+    // vb_accumulator environment (params + pk)
+    let _vb_env = VbEnv::from_onchain(&params, &cred_name).await?;
 
     // Get G2 base from Params
     let (_g1_b, _h0_b, g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
@@ -304,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
                         // Expect JSON OpenPartialMsg
                         if let Ok(msg) = serde_json::from_slice::<OpenPartialMsg>(&dm.data) {
                             let entry = partials.entry(msg.sid).or_default();
-                            entry.push((msg.from_idx, msg.tbar_128.clone(), msg.proof_bytes.clone()));
+                            entry.push((msg.from_idx, msg.tbar_128.clone(), Vec::new()));
                             println!("[agg] got partial from {} (sid={})", msg.from_idx, msg.sid);
                             if entry.len() as u16 >= threshold {
                                 // Verify and recombine using first t
@@ -312,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
                                 let t1 = match eip2537_g1_to_affine(&t1b[..]) { Ok(v) => v, Err(_) => continue };
                                 // fetch commitments and verify each
                                 let mut verified: Vec<(u16, <Bls12_381 as Pairing>::G1Affine)> = Vec::new();
-                                for (idx, tbar_b, proof_b) in entry.iter().take(threshold as usize) {
+                                for (idx, tbar_b, _proof_b) in entry.iter().take(threshold as usize) {
                                     let y_i_bytes: ethers::types::Bytes = params.method("getOpenerCommitment", (cred_name.clone(), *idx))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
                                     if y_i_bytes.0.len() != 256 { continue; }
                                     let y_i = eip2537_g2_to_affine(&y_i_bytes.0[..])?;
@@ -321,12 +324,6 @@ async fn main() -> anyhow::Result<()> {
                                     let lhs = Bls12_381::pairing(t1, y_i);
                                     let rhs = Bls12_381::pairing(tbar, g2);
                                     if lhs != rhs { continue; }
-                                    // verify Schnorr DLEQ in G2: base=g2, y=Y_i
-                                    let proof: schnorr_pok::discrete_log::PokDiscreteLog<<Bls12_381 as Pairing>::G2Affine> = CanonicalDeserialize::deserialize_compressed(&proof_b[..]).unwrap_or_default();
-                                    let mut chal_contrib = Vec::new();
-                                    proof.challenge_contribution(&g2, &y_i, &mut chal_contrib).ok();
-                                    let chal = compute_random_oracle_challenge::<Fr, Blake2b512>(&chal_contrib);
-                                    if !proof.verify(&y_i, &g2, &chal) { continue; }
                                     verified.push((*idx, tbar));
                                 }
                                 if verified.len() as u16 >= threshold {
@@ -385,22 +382,8 @@ if let Ok(ann) = serde_json::from_slice::<OpenAnnounceMsg>(&bytes) {
                     let t1 = match eip2537_g1_to_affine(&ann.t1[..]) { Ok(v) => v, Err(_) => continue };
                     let tbar = t1.mul_bigint(y_i.into_bigint()).into_affine();
 
-                    // Build DLEQ proof in G2: base=g2, y=Y_i
-                    let y_i_bytes: ethers::types::Bytes = params.method("getOpenerCommitment", (ann.name.clone(), participant_id))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-                    if y_i_bytes.0.len() != 256 { continue; }
-                    let y_g2 = eip2537_g2_to_affine(&y_i_bytes.0[..])?;
-                    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(ann.sid);
-                    let blind = Fr::rand(&mut rng);
-                    let protocol = PokDiscreteLogProtocol::<<Bls12_381 as Pairing>::G2Affine>::init(y_i, blind, &g2);
-                    let mut chal_contrib = Vec::new();
-                    let _ = protocol.challenge_contribution(&g2, &y_g2, &mut chal_contrib);
-                    let chal = compute_random_oracle_challenge::<Fr, Blake2b512>(&chal_contrib);
-                    let proof = protocol.gen_proof(&chal);
-                    let mut proof_bytes = Vec::new();
-                    proof.serialize_compressed(&mut proof_bytes)?;
-
-                    // Send to aggregator
-                    let msg = OpenPartialMsg { sid: ann.sid, from_idx: participant_id, tbar_128: g1_to_eip2537_bytes(&tbar).to_vec(), proof_bytes };
+                    // Send to aggregator (no DLEQ)
+                    let msg = OpenPartialMsg { sid: ann.sid, from_idx: participant_id, tbar_128: g1_to_eip2537_bytes(&tbar).to_vec() };
                     let payload = serde_json::to_vec(&msg)?;
                     let _ = handle.send_to(ann.aggregator_idx, payload).await;
                     println!("[opener-{}] sent open partial to agg idx={} for sid={}", participant_id, ann.aggregator_idx, ann.sid);

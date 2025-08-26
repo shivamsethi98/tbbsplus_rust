@@ -11,4 +11,5 @@ pub mod persistence;
 pub mod onchain;
 pub mod chain;
 pub mod crypto;
+pub mod vb_accum;
 

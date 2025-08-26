@@ -89,27 +89,53 @@ async fn main() -> anyhow::Result<()> {
                                 // Decode (name, A)
                                 let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
                                 if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
-                                    let mut name_s = String::new();
+                                    // We cannot recover indexed string param from topics; use configured credential name
+                                    let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
                                     let mut a_bytes: Vec<u8> = Vec::new();
                                     for p in parsed.params.iter() {
-                                        if p.name == "name" { if let ethers::abi::Token::String(s) = &p.value { name_s = s.clone(); } }
                                         if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
                                     }
-                                    if !name_s.is_empty() && a_bytes.len() == 128 {
-                                        match accumulator.contract.method::<_, U256>("getEByA", (name_s.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
-                                            Ok(call) => {
-                                                match call.call().await {
-                                                    Ok(e_u) => {
-                                                        if e_u != U256::zero() {
-                                                            println!("ServiceProvider: resolved e=0x{:x} via A->e mapping for {}", e_u, name_s);
-                                                        } else {
-                                                            println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
+                                    if a_bytes.len() == 128 {
+                                        // Try to resolve e via A->e mapping with a few retries (mapping may be populated just after Opened)
+                                        let mut e_u = U256::zero();
+                                        for _ in 0..10 {
+                                            match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
+                                                Ok(call) => {
+                                                    match call.call().await {
+                                                        Ok(x) => { e_u = x; }
+                                                        Err(err) => { eprintln!("ServiceProvider: getEByA call error: {:?}", err); }
+                                                    }
+                                                }
+                                                Err(err) => { eprintln!("ServiceProvider: getEByA method error: {:?}", err); }
+                                            }
+                                            if e_u != U256::zero() { break; }
+                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                        }
+                                        if e_u != U256::zero() {
+                                            println!("ServiceProvider: resolved e=0x{:x} via A->e mapping", e_u);
+                                            // Fetch witness for e (may not be available immediately)
+                                            let mut witness_ok = false;
+                                            for _ in 0..10 {
+                                                match accumulator.contract.method::<_, ethers::types::Bytes>("getWitness", (name_env.clone(), e_u)) {
+                                                    Ok(wc) => {
+                                                        match wc.call().await {
+                                                            Ok(wb) => {
+                                                                if wb.0.len() == 128 { witness_ok = true; break; }
+                                                            }
+                                                            Err(err) => eprintln!("ServiceProvider: getWitness call error: {:?}", err),
                                                         }
                                                     }
-                                                    Err(err) => eprintln!("ServiceProvider: getEByA call error: {:?}", err),
+                                                    Err(err) => eprintln!("ServiceProvider: getWitness method error: {:?}", err),
                                                 }
+                                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                             }
-                                            Err(err) => eprintln!("ServiceProvider: getEByA method error: {:?}", err),
+                                            if witness_ok {
+                                                println!("ServiceProvider: witness available (len=128) for e=0x{:x}", e_u);
+                                            } else {
+                                                println!("ServiceProvider: witness not yet available for e=0x{:x}", e_u);
+                                            }
+                                        } else {
+                                            println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
                                         }
                                     }
                                 }

@@ -20,6 +20,8 @@ use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 #[cfg(feature = "mpc")]
 use libp2p::Multiaddr;
 use secret_sharing_and_dkg::common::lagrange_basis_at_0;
+// vb_accumulator integration helper
+use tbbsplus_rust::orchestration::vb_accum::VbEnv;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenAnnounceMsg {
@@ -45,7 +47,6 @@ struct OpenPartialMsg {
     sid: u64,
     from_idx: u16,
     tbar_128: Vec<u8>,
-    proof_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -137,11 +138,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Params data used for pairing checks
-    let (_g1_b, _h0_b, g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
+    let (g1_b, _h0_b, g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
         .method("getG1H0G2ByName", (cred_name.clone(),))?
         .call()
         .await?;
     let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
+    // vb_accumulator environment (params + pk)
+    let vb_env = VbEnv::from_onchain(&params, &cred_name).await?;
 
     // Mesh peers from openers (optional dialing)
     let openers: Vec<Address> = params.method::<_, Vec<Address>>("getOpeners", ())?.call().await.unwrap_or_default();
@@ -272,26 +275,21 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                     // Open partials, deletion shares, or addition contributions
                     if let Ok(msg) = serde_json::from_slice::<OpenPartialMsg>(&dm.data) {
                         let entry = partials.entry(msg.sid).or_default();
-                        entry.push((msg.from_idx, msg.tbar_128.clone(), msg.proof_bytes.clone()));
+                        entry.push((msg.from_idx, msg.tbar_128.clone(), Vec::new()));
                         if entry.len() as u16 >= threshold {
                             // Verify and recombine
                             let Some((t1b, t2b)) = announces.get(&msg.sid) else { continue };
                             let t1 = match eip2537_g1_to_affine(&t1b[..]) { Ok(v) => v, Err(_) => continue };
                             let mut verified = Vec::new();
-                            for (idx, tbar_b, proof_b) in entry.iter().take(threshold as usize) {
+                            for (idx, tbar_b, _proof_b) in entry.iter().take(threshold as usize) {
                                 let y_i_bytes: ethers::types::Bytes = params.method("getOpenerCommitment", (cred_name.clone(), *idx))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
                                 if y_i_bytes.0.len()!=256 { continue; }
                                 let y_i = eip2537_g2_to_affine(&y_i_bytes.0[..])?;
                                 let tbar = eip2537_g1_to_affine(&tbar_b[..])?;
+                                // pairing check e(T1, Y_i) == e(tbar, g2)
                                 let lhs = Bls12_381::pairing(t1, y_i);
                                 let rhs = Bls12_381::pairing(tbar, g2);
                                 if lhs != rhs { continue; }
-                                let proof: schnorr_pok::discrete_log::PokDiscreteLog<<Bls12_381 as Pairing>::G2Affine> = CanonicalDeserialize::deserialize_compressed(&proof_b[..]).unwrap_or_default();
-                                let mut chal_contrib = Vec::new();
-                                use schnorr_pok::discrete_log::PokDiscreteLog as _;
-                                proof.challenge_contribution(&g2, &y_i, &mut chal_contrib).ok();
-                                let chal = tbbsplus_rust::orchestration::crypto::encoding::keccak_to_fr(&chal_contrib);
-                                if !proof.verify(&y_i, &g2, &chal) { continue; }
                                 verified.push((*idx, tbar));
                             }
                             if verified.len() as u16 >= threshold {
@@ -341,47 +339,64 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                             }
                         }
                     } else if let Ok(ac) = serde_json::from_slice::<AccAddContribMsg>(&dm.data) {
-                        // Collect addition contrib
+                        // Collect addition contrib with de-dup per (sid, from_idx)
+                        let seen = add_seen.entry(ac.sid).or_default();
+                        if !seen.insert(ac.from_idx) {
+                            println!("[agg] duplicate add-contrib from {} (sid={}) ignored", ac.from_idx, ac.sid);
+                            continue;
+                        }
                         let entry = add_contribs.entry(ac.sid).or_default();
                         entry.push((ac.from_idx, ac.contrib_128.clone()));
-                        let seen = add_seen.entry(ac.sid).or_default(); seen.insert(ac.from_idx);
                         println!("[agg] add-contrib from {} (sid={})", ac.from_idx, ac.sid);
-                        // If enough, verify and update Delta and witness
-if let Some((subset, v128, e_u, _seq)) = add_meta.get(&ac.sid).cloned() {
-                            if entry.len() as u16 >= threshold {
-                                // Prepare V and constants
-                                let V = match eip2537_g1_to_affine(&v128[..]) { Ok(v) => v, Err(_) => { println!("[agg] invalid V bytes"); return Ok(()); } };
-                                let e_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
-                                // Verify each contribution and sum
-                                let mut sum_c = <Bls12_381 as Pairing>::G1::zero();
-                                for (idx, contrib_b) in entry.iter().take(threshold as usize) {
-                                    // Check idx is in subset
-                                    if !subset.contains(idx) { println!("[agg] contrib idx {} not in subset", idx); continue; }
-                                    let lam = match lagrange_basis_at_0::<Fr>(&subset, *idx) { Ok(l) => l, Err(_) => { println!("[agg] lagrange failed for {}", idx); continue; } };
-                                    let contrib = match eip2537_g1_to_affine(&contrib_b[..]) { Ok(v) => v, Err(_) => continue };
-                                    // Fetch Y_i, compute Y_i^lambda
-                                    let y_i_bytes: ethers::types::Bytes = params.method("getOpenerCommitment", (cred_name.clone(), *idx))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-                                    if y_i_bytes.0.len() != 256 { println!("[agg] missing Y_i for idx {}", idx); continue; }
-                                    let y_i = eip2537_g2_to_affine(&y_i_bytes.0[..])?;
-                                    let y_lam = (y_i.into_group().mul_bigint(lam.into_bigint())).into_affine();
-                                    // Pairing check: e(C_i, g2) == e(V, Y_i^lambda)
-                                    let lhs = Bls12_381::pairing(contrib, g2);
-                                    let rhs = Bls12_381::pairing(V, y_lam);
-                                    if lhs != rhs { println!("[agg] pairing check failed for idx {}", idx); continue; }
-                                    sum_c += contrib.into_group();
-                                }
-                                // Compute V' = sum_c + e*V
-                                let v_e = V.into_group().mul_bigint(e_fr.into_bigint());
-                                let v_new = (sum_c + v_e).into_affine();
-                                let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
-                                let _ = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
-                                // Publish witness W = V
-                                let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&V).to_vec());
-                                let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
-                                println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);
+                        // Only proceed when we have threshold unique contributors from the announced subset
+                        if let Some((subset, v128, e_u, _seq)) = add_meta.get(&ac.sid).cloned() {
+                            let ready = subset.iter().all(|i| seen.contains(i));
+                            if !ready { continue; }
+                            // Prepare V and constants
+                            let V = match eip2537_g1_to_affine(&v128[..]) { Ok(v) => v, Err(_) => { println!("[agg] invalid V bytes"); continue; } };
+                            let e_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
+                            // Verify contributions for exactly the designated subset and sum
+                            let mut sum_c = <Bls12_381 as Pairing>::G1::zero();
+                            let mut ok_subset = true;
+                            for idx in subset.iter() {
+                                // find contribution for this idx
+                                let Some((_, contrib_b)) = entry.iter().find(|(i, _)| i == idx) else { ok_subset = false; break; };
+                                let lam = match lagrange_basis_at_0::<Fr>(&subset, *idx) { Ok(l) => l, Err(_) => { println!("[agg] lagrange failed for {}", idx); ok_subset = false; break; } };
+                                let contrib = match eip2537_g1_to_affine(&contrib_b[..]) { Ok(v) => v, Err(_) => { ok_subset = false; break; } };
+                                // Fetch Y_i, compute Y_i^lambda
+                                let y_i_bytes: ethers::types::Bytes = params.method("getOpenerCommitment", (cred_name.clone(), *idx))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                if y_i_bytes.0.len() != 256 { println!("[agg] missing Y_i for idx {}", idx); ok_subset = false; break; }
+                                let y_i = eip2537_g2_to_affine(&y_i_bytes.0[..])?;
+                                let y_lam = (y_i.into_group().mul_bigint(lam.into_bigint())).into_affine();
+                                // Pairing check: e(C_i, g2) == e(V, Y_i^lambda)
+                                let lhs = Bls12_381::pairing(contrib, g2);
+                                let rhs = Bls12_381::pairing(V, y_lam);
+                                if lhs != rhs { println!("[agg] pairing check failed for idx {}", idx); ok_subset = false; break; }
+                                sum_c += contrib.into_group();
+                            }
+                            if !ok_subset { continue; }
+                            // Compute V' = sum_c + e*V
+                            let v_e = V.into_group().mul_bigint(e_fr.into_bigint());
+                            let v_new = (sum_c + v_e).into_affine();
+                            // vb_accumulator: verify membership of e in new Delta with witness W = old V
+                            let ok = vb_env.verify_add_result(V, v_new, e_fr);
+                            if !ok {
+                                println!("[agg] ERROR: vb_accumulator membership verify failed; aborting setDelta for sid={}", ac.sid);
+                                // hard fail this round; clear pending state to avoid spinning
                                 add_meta.remove(&ac.sid);
                                 add_contribs.remove(&ac.sid);
+                                add_seen.remove(&ac.sid);
+                                continue;
                             }
+                            let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
+                            let _ = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
+                            // Publish witness W = V
+                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&V).to_vec());
+                            let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
+                            println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);
+                            add_meta.remove(&ac.sid);
+                            add_contribs.remove(&ac.sid);
+                            add_seen.remove(&ac.sid);
                         }
                     }
                 }
@@ -391,12 +406,11 @@ if let Some((subset, v128, e_u, _seq)) = add_meta.get(&ac.sid).cloned() {
                 let keys: Vec<u64> = add_meta.keys().cloned().collect();
                 for sid in keys {
                     if let Some((subset, v128, e_u, seq)) = add_meta.get_mut(&sid) {
-                        // Gate: stop re-announcing if we already have all subset contributions or threshold reached
+                        // Gate: stop re-announcing if we already have all subset contributions
                         let covered = if let Some(seen) = add_seen.get(&sid) {
                             subset.iter().all(|i| seen.contains(i))
                         } else { false };
-                        let have = add_contribs.get(&sid).map(|v| v.len() as u16).unwrap_or(0);
-                        if covered || have >= threshold { continue; }
+                        if covered { continue; }
                         *seq = seq.saturating_add(1);
                         let msg = AccAddAnnounceMsg {
                             sid,
