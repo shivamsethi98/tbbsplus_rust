@@ -8,12 +8,17 @@ import {Verify} from "./Verify.sol";
 
 /// @title CredentialRegistry with on-chain aggregation
 /// @notice Collects issuer partial shares and aggregates them to a full BBS+ signature (A,e,s)
+interface IAccumulatorLike {
+    function publishMappingFromRegistry(string calldata name, uint256 sid, bytes calldata A128, uint256 e) external;
+}
+
 contract CredentialRegistry {
     using Fr for uint256;
 
     Params public immutable params;
     address public owner;
     address public requestContract;
+    address public accumulator;
 
     modifier onlyOwner { require(msg.sender == owner, "only owner"); _; }
 
@@ -69,6 +74,11 @@ contract CredentialRegistry {
     function setRequestContract(address rc) external onlyOwner {
         require(rc != address(0), "bad rc");
         requestContract = rc;
+    }
+
+    function setAccumulator(address acc) external onlyOwner {
+        require(acc != address(0), "bad acc");
+        accumulator = acc;
     }
 
     function noteRequest(string calldata name, uint256 sid, address owner_) external {
@@ -209,7 +219,9 @@ contract CredentialRegistry {
                 bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
                 bytes memory neg_g1_plus_bpp = Bls12381.g1neg(g1PlusBpp);
                 bool ok = Verify.verifyPairing(srec.A, pk_plus_eg2, neg_g1_plus_bpp, g2base);
-                if (ok) { srec.status = Status.Verified; emit Confirmed(name, sid); }
+                if (ok) { srec.status = Status.Verified; emit Confirmed(name, sid);
+                    if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
+                }
             }
         }
     }
@@ -260,6 +272,7 @@ contract CredentialRegistry {
         require(ok, "pairing fail");
         srec.status = Status.Verified;
         emit Confirmed(name, sid);
+        if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
     }
 
     function getSignature(string calldata name, uint256 sid) external view returns (bytes memory A, uint256 e, uint256 s, Status status) {

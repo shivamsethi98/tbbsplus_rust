@@ -52,6 +52,11 @@ contract Accumulator {
     event AccumulatorUpdated(string indexed name, bytes delta);
     event WitnessAvailable(string indexed name, uint256 indexed e, bytes witness, bytes delta);
     event MappingPublished(string indexed name, uint256 indexed sid, bytes32 Ahash, uint256 e);
+
+    modifier onlyRegistry() {
+        require(msg.sender == address(registry), "only registry");
+        _;
+    }
     event MemberRevoked(string indexed name, uint256 indexed e, bytes newDelta);
     event OpenRequested(string indexed name, address indexed requester, bytes T1, bytes T2);
     event Opened(string indexed name, bytes A);
@@ -86,23 +91,42 @@ contract Accumulator {
         return witnesses[_key(name)][e];
     }
 
-    /// @notice Publish mapping from signature component A (G1) to element e (Fr) for credential `name`
-    /// @dev Stores keccak256(A) -> e; `A128` must be 128-byte uncompressed G1. `sid` is advisory for indexing.
-    function publishMapping(
+    /// Internal helper to populate A->e mapping and emit event
+    function _publishMapping(
         string calldata name,
         uint256 sid,
         bytes calldata A128,
         uint256 e
-    ) external onlyOpener {
+    ) internal {
         require(A128.length == 128, "bad A len");
         bytes32 k = _key(name);
         bytes32 ah = keccak256(A128);
-        // Do not overwrite if already set with a different value
         uint256 existing = AhashToE[k][ah];
         if (existing == 0) {
             AhashToE[k][ah] = e;
         }
         emit MappingPublished(name, sid, ah, e);
+    }
+
+    /// @notice Deprecated: mapping is now published by the Registry only
+    /// Kept for compatibility but restricted to onlyRegistry
+    function publishMapping(
+        string calldata name,
+        uint256 sid,
+        bytes calldata A128,
+        uint256 e
+    ) external onlyRegistry {
+        _publishMapping(name, sid, A128, e);
+    }
+
+    /// @notice Registry can populate A->e mapping immediately after verification
+    function publishMappingFromRegistry(
+        string calldata name,
+        uint256 sid,
+        bytes calldata A128,
+        uint256 e
+    ) external onlyRegistry {
+        _publishMapping(name, sid, A128, e);
     }
 
     /// @notice Lookup e by A for a credential name. Returns 0 if not found

@@ -46,6 +46,8 @@ async function main() {
     await registry.getAddress()
   );
   await accumulator.waitForDeployment();
+  // Wire: registry should know accumulator to auto-publish A->e mapping after verification
+  await (await (registry as any).connect(owner).setAccumulator(await accumulator.getAddress())).wait();
 
   // Gate: set opener account as accumulatorManager on the registry
   // Prefer explicit OPENER_ADDR, else derive from OPENER_PK, else fallback to owner

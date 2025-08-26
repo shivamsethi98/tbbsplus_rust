@@ -89,3 +89,8 @@ path = "src/bin/service_provider.rs"
 name = "opener_threshold"
 path = "src/bin/opener_threshold.rs"
 required-features = ["mpc"]
+
+[[bin]]
+name = "opener_aggregator"
+path = "src/bin/opener_aggregator.rs"
+required-features = ["mpc"]

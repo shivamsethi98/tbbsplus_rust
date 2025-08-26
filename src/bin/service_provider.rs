@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let ev_opened = H256::from(ethers::utils::keccak256(b"Opened(string,bytes)"));
     let ev_revoked = H256::from(ethers::utils::keccak256(b"MemberRevoked(string,uint256,bytes)"));
     let mut status_stream = client.provider().subscribe_logs(&Filter::new().address(ValueOrArray::Value(acc_addr_h)).from_block(BlockNumber::Latest)).await?;
+    let acc_opened_abi = accumulator.contract.abi().event("Opened")?;
 
     println!("service_provider: listening for PresentationVerified from {:?}", verify_addrs);
     while let Some(log) = stream.next().await {
@@ -83,7 +84,37 @@ async fn main() -> anyhow::Result<()> {
                 while start.elapsed().as_secs() < 10 {
                     if let Some(lg) = status_stream.next().await {
                         if lg.address == acc_addr_h && !lg.topics.is_empty() {
-                            if lg.topics[0] == ev_opened { println!("ServiceProvider: Opened emitted"); notified = true; break; }
+                            if lg.topics[0] == ev_opened {
+                                println!("ServiceProvider: Opened emitted");
+                                // Decode (name, A)
+                                let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
+                                if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
+                                    let mut name_s = String::new();
+                                    let mut a_bytes: Vec<u8> = Vec::new();
+                                    for p in parsed.params.iter() {
+                                        if p.name == "name" { if let ethers::abi::Token::String(s) = &p.value { name_s = s.clone(); } }
+                                        if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
+                                    }
+                                    if !name_s.is_empty() && a_bytes.len() == 128 {
+                                        match accumulator.contract.method::<_, U256>("getEByA", (name_s.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
+                                            Ok(call) => {
+                                                match call.call().await {
+                                                    Ok(e_u) => {
+                                                        if e_u != U256::zero() {
+                                                            println!("ServiceProvider: resolved e=0x{:x} via A->e mapping for {}", e_u, name_s);
+                                                        } else {
+                                                            println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
+                                                        }
+                                                    }
+                                                    Err(err) => eprintln!("ServiceProvider: getEByA call error: {:?}", err),
+                                                }
+                                            }
+                                            Err(err) => eprintln!("ServiceProvider: getEByA method error: {:?}", err),
+                                        }
+                                    }
+                                }
+                                notified = true; break;
+                            }
                             if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
                         }
                     } else { break; }

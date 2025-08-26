@@ -57,6 +57,7 @@ pub mod p2p {
             participant_id: u16,
             peer_id: PeerId,
         },
+        RedialBootstraps,
     }
     
     pub struct Mesh {
@@ -69,6 +70,7 @@ pub mod p2p {
         direct_sink: Option<Sender<DirectMessage>>,
         participant_to_peer: HashMap<u16, PeerId>,
         peer_to_participant: HashMap<PeerId, u16>,
+        bootstraps: Vec<(u16, Multiaddr)>,
     }
     
     #[derive(Clone)]
@@ -162,16 +164,16 @@ pub mod p2p {
                 direct_sink: None,
                 participant_to_peer: HashMap::new(),
                 peer_to_participant: HashMap::new(),
+                bootstraps: bootstrap_peers,
             };
             
             // Register self
             mesh.participant_to_peer.insert(participant_id, local_peer_id);
             mesh.peer_to_participant.insert(local_peer_id, participant_id);
             
-            // Dial bootstrap peers
-            for (_pid, addr) in bootstrap_peers {
-                mesh.swarm.dial(addr)?;
-                // Note: peer_id will be discovered via mDNS or when they connect
+            // Dial bootstrap peers (initial attempt)
+            for (_pid, addr) in mesh.bootstraps.iter() {
+                let _ = mesh.swarm.dial(addr.clone());
             }
             
             Ok(mesh)
@@ -204,6 +206,8 @@ pub mod p2p {
             };
             
             tokio::spawn(async move {
+                // Periodic task ticker for redial attempts
+                let mut redial_tick = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     tokio::select! {
                         event = self.swarm.select_next_some() => {
@@ -224,10 +228,6 @@ pub mod p2p {
                                             // Try to deserialize as DirectMessage
                                             if let Ok(msg) = serde_json::from_slice::<DirectMessage>(&request) {
                                                 // Learn mapping from incoming message
-                                                // This allows peers to discover participant_id -> peer_id mapping lazily
-                                                // and enables subsequent direct sends without prior registration.
-                                                // Safe to overwrite to keep most recent mapping.
-                                                // Note: no authentication of mapping beyond transport channel.
                                                 self.participant_to_peer.insert(msg.from, peer);
                                                 self.peer_to_participant.insert(peer, msg.from);
                                                 if let Some(sink) = &self.direct_sink {
@@ -248,19 +248,24 @@ pub mod p2p {
                                 )) => {
                                     for (peer_id, addr) in peers {
                                         // Auto-discover peers via mDNS and proactively dial
-                                        // so that direct request-response channels can be established.
                                         let _ = self.swarm.dial(addr);
-                                        // Note: participant_id mapping is learned lazily from incoming
-                                        // direct messages or explicit registration at higher layers.
                                         let _ = peer_id; // suppress unused warning if addr move fails
                                     }
                                 }
+                                
                                 
                                 SwarmEvent::NewListenAddr { address, .. } => {
                                     println!("Listening on {}", address);
                                 }
                                 
                                 _ => {}
+                            }
+                        }
+                        
+                        // Periodic redial of bootstrap peers to ensure connectivity to late starters
+                        _ = redial_tick.tick() => {
+                            for (_pid, addr) in self.bootstraps.clone() {
+                                let _ = self.swarm.dial(addr);
                             }
                         }
                         
@@ -294,6 +299,12 @@ pub mod p2p {
                                 Command::RegisterPeer { participant_id, peer_id } => {
                                     self.participant_to_peer.insert(participant_id, peer_id);
                                     self.peer_to_participant.insert(peer_id, participant_id);
+                                }
+                                
+                                Command::RedialBootstraps => {
+                                    for (_pid, addr) in self.bootstraps.clone() {
+                                        let _ = self.swarm.dial(addr);
+                                    }
                                 }
                             }
                         }
