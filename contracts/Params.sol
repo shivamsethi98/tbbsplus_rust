@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity >=0.7.0 <0.9.0;
 
-import {SSTORE2} from "./lib/SSTORE2.sol";
-
 contract Params {
     address private owner;
     constructor() { owner = msg.sender; }
@@ -37,23 +35,22 @@ contract Params {
     }
     mapping(uint256 => CredParams) private paramsById;
 
-    // Pointer to compact params blob stored via SSTORE2 per credential id
-    // Layout (byte offsets) for fixed blob (H is stored separately via setHByName):
+    // Compact params blob layout (byte offsets) for slicing input blob in setupAll
     // 0..127: g1 (128B), 128..255: h0 (128B), 256..511: g2Base (256B),
     // 512..767: pkG2 (256B), 768..895: openerYbarG1 (128B), 896..1151: openerPkG2 (256B)
-    mapping(uint256 => address) private dataPtr;
     mapping(uint256 => bytes32) private dataHash;
 
     event ParamsSet(string indexed name, uint256 indexed id, uint256 messageCount, uint256 t, uint256 n);
 
-    // Internal memcpy helper (memory-safe assembly)
-    function _copy(bytes memory dst, uint256 destOffset, bytes memory src, uint256 len) private pure {
-        assembly ("memory-safe") {
-            let dest := add(add(dst, 0x20), destOffset)
-            let s := add(src, 0x20)
-            // copy 32-byte chunks
+    // Slice helper: returns blob[start:start+len]
+    function _slice(bytes memory blob, uint256 start, uint256 len) private pure returns (bytes memory out) {
+        require(start + len <= blob.length, "oob");
+        out = new bytes(len);
+        assembly {
+            let src := add(add(blob, 0x20), start)
+            let dst := add(out, 0x20)
             for { let i := 0 } lt(i, len) { i := add(i, 0x20) } {
-                mstore(add(dest, i), mload(add(s, i)))
+                mstore(add(dst, i), mload(add(src, i)))
             }
         }
     }
@@ -93,19 +90,15 @@ contract Params {
         cp.public_m_encoding = public_m_encoding;
         // hLen is maintained by setHByName; do not overwrite here
 
-        // Persist compact blob via SSTORE2
+        // Persist compact blob directly into storage fields; keep cp.H set via setHByName
         bytes memory _blob = blob; // move to memory
-        address ptr = SSTORE2.write(_blob);
-        dataPtr[id] = ptr;
         dataHash[id] = keccak256(_blob);
-
-        // Do not store bulky bytes in storage; keep cp.* bytes as empty; keep cp.H as-is
-        cp.g1 = new bytes(0);
-        cp.h0 = new bytes(0);
-        cp.g2Base = new bytes(0);
-        cp.pkG2 = new bytes(0);
-        cp.openerYbarG1 = new bytes(0);
-        cp.openerPkG2 = new bytes(0);
+        cp.g1 = _slice(_blob, 0, 128);
+        cp.h0 = _slice(_blob, 128, 128);
+        cp.g2Base = _slice(_blob, 256, 256);
+        cp.pkG2 = _slice(_blob, 512, 256);
+        cp.openerYbarG1 = _slice(_blob, 768, 128);
+        cp.openerPkG2 = _slice(_blob, 896, 256);
 
         // Set opener commitments
         for (uint256 k = 0; k < indices.length; k++) {
@@ -116,6 +109,8 @@ contract Params {
         emit ParamsG1H0G2Set(name);
         if (indices.length > 0) { emit OpenerCommitmentsSet(name, indices); }
     }
+
+    // no-op
 
     // Global issuer registry and optional libp2p multiaddrs
     mapping(address => bool) public issuerAllowed;
@@ -158,8 +153,6 @@ contract Params {
     function getPkG2ByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
-        address ptr = dataPtr[id];
-        if (ptr != address(0)) { return SSTORE2.read(ptr, 512, 256); }
         return paramsById[id].pkG2;
     }
 
@@ -169,16 +162,12 @@ contract Params {
     function getOpenerYbarByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
-        address ptr = dataPtr[id];
-        if (ptr != address(0)) { return SSTORE2.read(ptr, 768, 128); }
         return paramsById[id].openerYbarG1;
     }
 
     function getOpenerPkG2ByName(string memory name) external view returns (bytes memory) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
-        address ptr = dataPtr[id];
-        if (ptr != address(0)) { return SSTORE2.read(ptr, 896, 256); }
         return paramsById[id].openerPkG2;
     }
 
@@ -188,13 +177,6 @@ contract Params {
     function getG1H0G2ByName(string memory name) external view returns (bytes memory g1, bytes memory h0, bytes memory g2Base) {
         uint256 id = nameToId[name];
         require(id != 0, "not found");
-        address ptr = dataPtr[id];
-        if (ptr != address(0)) {
-            bytes memory _g1 = SSTORE2.read(ptr, 0, 128);
-            bytes memory _h0 = SSTORE2.read(ptr, 128, 128);
-            bytes memory _g2 = SSTORE2.read(ptr, 256, 256);
-            return (_g1, _h0, _g2);
-        }
         CredParams storage cp = paramsById[id];
         return (cp.g1, cp.h0, cp.g2Base);
     }

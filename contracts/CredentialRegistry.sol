@@ -97,14 +97,10 @@ contract CredentialRegistry {
         require(msg.sender == requestContract, "only request");
         require(Bprime.length == 128, "bad B' len");
         bytes32 k = _key(name, sid);
-        // Store directly on the aggregated record if exists, else pending via sum_R placeholder
         Sig storage srec = sigs[k];
+        // Keep B' required for verification; stash in session store if record not yet created
         if (srec.status != Status.None) {
             srec.Bprime = Bprime;
-        } else {
-            // Temporarily store in pending by abusing sum_R storage if empty? Better: stash in dedicated mapping
-            pendings[k].sum_R; // noop to silence warnings
-            // We use a separate mapping for B' to avoid storage collision
         }
         bprimes[k] = Bprime;
         emit BprimeRecorded(name, sid);
@@ -174,7 +170,7 @@ contract CredentialRegistry {
             p.sum_R = Bls12381.g1add(p.sum_R, R128);
         }
         p.sum_u = p.sum_u.add(u);
-        p.count += 1;
+        unchecked { p.count += 1; }
         emit PartialShareAccepted(msg.sender, name, sid, idx);
 
         if (p.count >= p.tNeeded) {
@@ -219,8 +215,14 @@ contract CredentialRegistry {
                 bytes memory pk_plus_eg2 = Bls12381.g2add(pkG2, eg2);
                 bytes memory neg_g1_plus_bpp = Bls12381.g1neg(g1PlusBpp);
                 bool ok = Verify.verifyPairing(srec.A, pk_plus_eg2, neg_g1_plus_bpp, g2base);
-                if (ok) { srec.status = Status.Verified; emit Confirmed(name, sid);
+                if (ok) {
+                    srec.status = Status.Verified;
+                    emit Confirmed(name, sid);
                     if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
+                    // cleanup per-session request data now that verification succeeded
+                    delete revealedIdxs[k];
+                    delete revealedVals[k];
+                    delete bprimes[k];
                 }
             }
         }
@@ -273,6 +275,10 @@ contract CredentialRegistry {
         srec.status = Status.Verified;
         emit Confirmed(name, sid);
         if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
+        // cleanup per-session request data
+        delete revealedIdxs[k];
+        delete revealedVals[k];
+        delete bprimes[k];
     }
 
     function getSignature(string calldata name, uint256 sid) external view returns (bytes memory A, uint256 e, uint256 s, Status status) {

@@ -25,9 +25,7 @@ async function main() {
   // 2) Let RequestCredential know the registry so it can forward request metadata post-PoK
   await (await (request as any).connect(owner).setRegistry(await registry.getAddress())).wait();
 
-  const Relay = await ethers.getContractFactory("PartialSignatureRelay");
-  const relay = await Relay.connect(owner).deploy(await params.getAddress());
-  await relay.waitForDeployment();
+  // Deprecated: PartialSignatureRelay removed; use CredentialRegistry for aggregation
 
   // Deploy Accumulator with Params and Registry
   const Accumulator = await ethers.getContractFactory("Accumulator");
@@ -55,7 +53,8 @@ async function main() {
   }
 
   console.log(`export REQ_CONTRACT=${await request.getAddress()}`);
-  console.log(`export RELAY_CONTRACT=${await relay.getAddress()}`);
+  // Export RELAY_CONTRACT for backward-compatibility with scripts expecting it
+  console.log(`export RELAY_CONTRACT=${await registry.getAddress()}`);
   console.log(`export REGISTRY_CONTRACT=${await registry.getAddress()}`);
   console.log(`export PARAMS_CONTRACT=${await params.getAddress()}`);
   console.log(`export ACC_CONTRACT=${await accumulator.getAddress()}`);

@@ -1,10 +1,10 @@
 {
   "_format": "hh-sol-cache-2",
   "files": {
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/BbsPlusPokVerify.sol": {
-      "lastModificationDate": 1755580985524,
-      "contentHash": "68f078853da69d72a097a36992bed2aa",
-      "sourceName": "contracts/BbsPlusPokVerify.sol",
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Accumulator.sol": {
+      "lastModificationDate": 1756277607366,
+      "contentHash": "cbace3c876c46820208700e1e0f203e8",
+      "sourceName": "contracts/Accumulator.sol",
       "solcConfig": {
         "version": "0.8.27",
         "settings": {
@@ -31,50 +31,16 @@
         }
       },
       "imports": [
-        "./lib/Bls12381.sol"
+        "./Params.sol",
+        "./lib/Bls12381.sol",
+        "./Verify.sol"
       ],
       "versionPragmas": [
         "^0.8.24"
       ],
       "artifacts": [
-        "BbsPlusPokVerify"
-      ]
-    },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/lib/Bls12381.sol": {
-      "lastModificationDate": 1755603217617,
-      "contentHash": "a93b4d8d9426824c925ddd46e8ea6d6c",
-      "sourceName": "contracts/lib/Bls12381.sol",
-      "solcConfig": {
-        "version": "0.8.27",
-        "settings": {
-          "optimizer": {
-            "enabled": true,
-            "runs": 200
-          },
-          "viaIR": true,
-          "evmVersion": "prague",
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [],
-      "versionPragmas": [
-        "^0.8.24"
-      ],
-      "artifacts": [
-        "Bls12381"
+        "Accumulator",
+        "ICredentialRegistryLike"
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Params.sol": {
@@ -116,53 +82,10 @@
         "Params"
       ]
     },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CredentialRegistry.sol": {
-      "lastModificationDate": 1756238774553,
-      "contentHash": "9b6f62136d1a67b1ec6253dd3ff298de",
-      "sourceName": "contracts/CredentialRegistry.sol",
-      "solcConfig": {
-        "version": "0.8.27",
-        "settings": {
-          "optimizer": {
-            "enabled": true,
-            "runs": 200
-          },
-          "viaIR": true,
-          "evmVersion": "prague",
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [
-        "./Params.sol",
-        "./lib/Bls12381.sol",
-        "./lib/Fr.sol",
-        "./Verify.sol"
-      ],
-      "versionPragmas": [
-        "^0.8.24"
-      ],
-      "artifacts": [
-        "CredentialRegistry",
-        "IAccumulatorLike"
-      ]
-    },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/lib/Fr.sol": {
-      "lastModificationDate": 1755581728205,
-      "contentHash": "c9b56f85ec1c5adc0cd4e8b64e15186a",
-      "sourceName": "contracts/lib/Fr.sol",
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/lib/Bls12381.sol": {
+      "lastModificationDate": 1755603217617,
+      "contentHash": "a93b4d8d9426824c925ddd46e8ea6d6c",
+      "sourceName": "contracts/lib/Bls12381.sol",
       "solcConfig": {
         "version": "0.8.27",
         "settings": {
@@ -193,128 +116,7 @@
         "^0.8.24"
       ],
       "artifacts": [
-        "Fr"
-      ]
-    },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/RequestCredential.sol": {
-      "lastModificationDate": 1755590438124,
-      "contentHash": "1b2476b364918921181279ed5e1ecdd8",
-      "sourceName": "contracts/RequestCredential.sol",
-      "solcConfig": {
-        "version": "0.8.27",
-        "settings": {
-          "optimizer": {
-            "enabled": true,
-            "runs": 200
-          },
-          "viaIR": true,
-          "evmVersion": "prague",
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [
-        "./CommitmentPokVerify.sol"
-      ],
-      "versionPragmas": [
-        "^0.8.24"
-      ],
-      "artifacts": [
-        "ICredentialRegistry",
-        "RequestCredential"
-      ]
-    },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CommitmentPokVerify.sol": {
-      "lastModificationDate": 1755580985524,
-      "contentHash": "c6d02f2030f4efe6ced62f76bbbcd3cd",
-      "sourceName": "contracts/CommitmentPokVerify.sol",
-      "solcConfig": {
-        "version": "0.8.27",
-        "settings": {
-          "optimizer": {
-            "enabled": true,
-            "runs": 200
-          },
-          "viaIR": true,
-          "evmVersion": "prague",
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [
-        "./lib/Bls12381.sol"
-      ],
-      "versionPragmas": [
-        "^0.8.24"
-      ],
-      "artifacts": [
-        "CommitmentPokVerify"
-      ]
-    },
-    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Accumulator.sol": {
-      "lastModificationDate": 1756229885146,
-      "contentHash": "cbace3c876c46820208700e1e0f203e8",
-      "sourceName": "contracts/Accumulator.sol",
-      "solcConfig": {
-        "version": "0.8.27",
-        "settings": {
-          "optimizer": {
-            "enabled": true,
-            "runs": 200
-          },
-          "viaIR": true,
-          "evmVersion": "prague",
-          "outputSelection": {
-            "*": {
-              "*": [
-                "abi",
-                "evm.bytecode",
-                "evm.deployedBytecode",
-                "evm.methodIdentifiers",
-                "metadata"
-              ],
-              "": [
-                "ast"
-              ]
-            }
-          }
-        }
-      },
-      "imports": [
-        "./Params.sol",
-        "./lib/Bls12381.sol",
-        "./Verify.sol"
-      ],
-      "versionPragmas": [
-        "^0.8.24"
-      ],
-      "artifacts": [
-        "Accumulator",
-        "ICredentialRegistryLike"
+        "Bls12381"
       ]
     },
     "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/Verify.sol": {
@@ -394,6 +196,204 @@
       ],
       "artifacts": [
         "SSTORE2"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/BbsPlusPokVerify.sol": {
+      "lastModificationDate": 1755580985524,
+      "contentHash": "68f078853da69d72a097a36992bed2aa",
+      "sourceName": "contracts/BbsPlusPokVerify.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [
+        "./lib/Bls12381.sol"
+      ],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "BbsPlusPokVerify"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CredentialRegistry.sol": {
+      "lastModificationDate": 1756278811403,
+      "contentHash": "9b6f62136d1a67b1ec6253dd3ff298de",
+      "sourceName": "contracts/CredentialRegistry.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [
+        "./Params.sol",
+        "./lib/Bls12381.sol",
+        "./lib/Fr.sol",
+        "./Verify.sol"
+      ],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "CredentialRegistry",
+        "IAccumulatorLike"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/lib/Fr.sol": {
+      "lastModificationDate": 1755581728205,
+      "contentHash": "c9b56f85ec1c5adc0cd4e8b64e15186a",
+      "sourceName": "contracts/lib/Fr.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "Fr"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/CommitmentPokVerify.sol": {
+      "lastModificationDate": 1756239364683,
+      "contentHash": "c6d02f2030f4efe6ced62f76bbbcd3cd",
+      "sourceName": "contracts/CommitmentPokVerify.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [
+        "./lib/Bls12381.sol"
+      ],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "CommitmentPokVerify"
+      ]
+    },
+    "/home/quanta/fast_ssd/codebases/tbbsplus_rust-1/contracts/RequestCredential.sol": {
+      "lastModificationDate": 1755951709121,
+      "contentHash": "1b2476b364918921181279ed5e1ecdd8",
+      "sourceName": "contracts/RequestCredential.sol",
+      "solcConfig": {
+        "version": "0.8.27",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "viaIR": true,
+          "evmVersion": "prague",
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [
+        "./CommitmentPokVerify.sol"
+      ],
+      "versionPragmas": [
+        "^0.8.24"
+      ],
+      "artifacts": [
+        "ICredentialRegistry",
+        "RequestCredential"
       ]
     }
   }

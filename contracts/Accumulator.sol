@@ -108,16 +108,7 @@ contract Accumulator {
         emit MappingPublished(name, sid, ah, e);
     }
 
-    /// @notice Deprecated: mapping is now published by the Registry only
-    /// Kept for compatibility but restricted to onlyRegistry
-    function publishMapping(
-        string calldata name,
-        uint256 sid,
-        bytes calldata A128,
-        uint256 e
-    ) external onlyRegistry {
-        _publishMapping(name, sid, A128, e);
-    }
+    // Removed deprecated publishMapping; use publishMappingFromRegistry
 
     /// @notice Registry can populate A->e mapping immediately after verification
     function publishMappingFromRegistry(

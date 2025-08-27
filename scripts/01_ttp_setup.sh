@@ -72,7 +72,6 @@ cat > .runtime.env <<EOF
 ETH_WS=$ETH_WS
 CHAIN_ID=$CHAIN_ID
 REQ_CONTRACT=$REQ_CONTRACT
-RELAY_CONTRACT=$RELAY_CONTRACT
 REGISTRY_CONTRACT=${REGISTRY_CONTRACT}
 PARAMS_CONTRACT=$PARAMS_CONTRACT
 ACC_CONTRACT=$ACC_CONTRACT
@@ -85,14 +84,12 @@ SHARES_FILE=$SHARES_FILE
 EOF
 set -a; source .runtime.env; set +a
 
-echo "[04] Deploy PoK/Verify helpers"
+echo "[04] Deploy Verify contract"
 VERIFY_ENV=$(npx hardhat run --network localhost scripts/deploy_pok_verifiers.ts | sed -n 's/^export /export /p')
 eval "$VERIFY_ENV"
-# Append verify vars
+# Append verify var
 {
   echo "VERIFY_CONTRACT=${VERIFY_CONTRACT}"
-  echo "POK_VERIFY_WRAPPER=${POK_VERIFY_WRAPPER}"
-  echo "POK_TRANSCRIPT_WRAPPER=${POK_TRANSCRIPT_WRAPPER}"
 } >> .runtime.env
 
 echo "[05] Allowlist issuers & set multiaddrs in Params"
