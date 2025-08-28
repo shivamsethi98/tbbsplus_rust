@@ -23,7 +23,7 @@ use tbbsplus_rust::orchestration::crypto::encoding::{
 use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 #[cfg(feature = "mpc")]
 use libp2p::Multiaddr;
-use tbbsplus_rust::orchestration::vb_accum::VbEnv;
+// Use vb_accumulator directly; no wrapper
 // Added for threshold accumulator deletion MPC
 use tbbsplus_rust::orchestration::threshold_phases::{KAPPA, STATISTICAL_SECURITY_PARAMETER, BASE_OT_KEY_SIZE};
 use tbbsplus_rust::orchestration::crypto::seeds;
@@ -37,6 +37,8 @@ use short_group_sig::threshold_weak_bb_sig as tbb;
 use sha3::Shake256;
 use test_utils::ot::do_pairwise_base_ot;
 use secret_sharing_and_dkg::common::lagrange_basis_at_0;
+use std::time::Instant;
+use std::io::Write as _;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenAnnounceMsg {
@@ -177,8 +179,24 @@ async fn main() -> anyhow::Result<()> {
         Contract::new(acc_addr, abi, client.clone())
     };
 
-    // vb_accumulator environment (params + pk)
-    let _vb_env = VbEnv::from_onchain(&params, &cred_name).await?;
+    // vb_accumulator params and pk directly from Params
+    let (g1_b_for_params, _h0_b_for_params, g2_b_for_params): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
+        .method("getG1H0G2ByName", (cred_name.clone(),))?
+        .call()
+        .await?;
+    let _vb_params = vb_accumulator::setup::SetupParams::<Bls12_381> {
+        P: eip2537_g1_to_affine(&g1_b_for_params.0[..])?,
+        P_tilde: eip2537_g2_to_affine(&g2_b_for_params.0[..])?,
+    };
+    let _vb_pk = {
+        let pk_acc_bytes: ethers::types::Bytes = params
+            .method("getOpenerPkG2ByName", (cred_name.clone(),))?
+            .call()
+            .await
+            .unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+        if pk_acc_bytes.0.len() != 256 { anyhow::bail!("opener pkG2 missing in Params"); }
+        vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pk_acc_bytes.0[..])?)
+    };
 
     // Get G2 base from Params
     let (_g1_b, _h0_b, g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
@@ -380,7 +398,12 @@ if let Ok(ann) = serde_json::from_slice::<OpenAnnounceMsg>(&bytes) {
                     println!("[opener-{}] open-announce: sid={} name={}", participant_id, ann.sid, ann.name);
                     // Compute tbar = T1 * y_i
                     let t1 = match eip2537_g1_to_affine(&ann.t1[..]) { Ok(v) => v, Err(_) => continue };
+                    let t0 = Instant::now();
                     let tbar = t1.mul_bigint(y_i.into_bigint()).into_affine();
+                    if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                        let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/openers.ndjson".into());
+                        let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"compute_decrypt_share","sid":ann.sid,"idx":participant_id,"ms":t0.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                    }
 
                     // Send to aggregator (no DLEQ)
                     let msg = OpenPartialMsg { sid: ann.sid, from_idx: participant_id, tbar_128: g1_to_eip2537_bytes(&tbar).to_vec() };
@@ -559,16 +582,33 @@ if let Ok(ra) = serde_json::from_slice::<RevokeAnnounceMsg>(&bytes) {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                     }
 
-                    // Finish and send SigShare to aggregator
-                    let sigshare = p2.finish(&eip2537_g1_to_affine(&{
-                        // Use Delta from chain as pk_gen surrogate; in strict math, pk_gen is g1 base
-                        let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await.unwrap_or((ethers::types::Bytes::from_static(&[0u8;128]), ethers::types::Bytes::from_static(&[0u8;128]), ethers::types::Bytes::from_static(&[0u8;256])));
-                        g1_b.0
-                    }[..]).unwrap());
+                    // Finish and send SigShare to aggregator (measure reconstruction time)
+                    let t0_recon = Instant::now();
+                    // Use current accumulator Delta as the base for threshold deletion, so aggregated share yields the new anchor
+                    let delta_bytes: ethers::types::Bytes = accumulator
+                        .method("getDelta", (cred_name.clone(),))?
+                        .call()
+                        .await
+                        .unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                    let base_for_threshold = if delta_bytes.0.len() == 128 {
+                        eip2537_g1_to_affine(&delta_bytes.0[..])?
+                    } else {
+                        // Fallback to g1 base if no Delta yet
+                        let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params
+                            .method("getG1H0G2ByName", (cred_name.clone(),))?
+                            .call()
+                            .await?;
+                        eip2537_g1_to_affine(&g1_b.0[..])?
+                    };
+                    let sigshare = p2.finish(&base_for_threshold);
                     let mut sb = Vec::new(); sigshare.serialize_compressed(&mut sb).unwrap();
                     let j = AccDelSigShareMsg { sid: ra.sid, from: participant_id, share_b64: base64::engine::general_purpose::STANDARD.encode(sb) };
                     let _ = handle.send_to(ra.aggregator_idx, serde_json::to_vec(&j)?).await;
                     println!("[opener-{}] sent deletion SigShare to agg idx={} for sid={}", participant_id, ra.aggregator_idx, ra.sid);
+                    if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                        let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/openers.ndjson".into());
+                        let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"reconstruct_delete_share","sid":ra.sid,"idx":participant_id,"ms":t0_recon.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                    }
                 }
             }
         }

@@ -7,6 +7,10 @@ use ethers::providers::{Provider, Ws};
 use ethers::contract::Contract;
 use ethers::abi::Abi;
 use ethers::types::{Bytes as EthBytes, H256, U256};
+use std::time::Instant;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use serde_json::json;
 
 use tbbsplus_rust::orchestration::onchain::{ParamsContract, fetch_params_bundle};
 use tbbsplus_rust::orchestration::persistence::{persist_request_meta, persist_revealed_pairs, load_revealed_pairs, CredentialsStore, MessagesFile, SignatureFile, RevealedFile};
@@ -59,35 +63,38 @@ async fn main() -> anyhow::Result<()> {
     enum Mode { Request { sid: u64, revealed_idx: Vec<u32>, revealed_vals: Vec<U256>, context: Vec<u8>, wait_and_verify: bool }, Verify { sid: u64 }, Present { sid: u64 } }
     // Parse args with clap first; fall back to legacy interactive prompts when none supplied
     let clap_mode = clap_args::parse_mode();
-    let mode: Mode = if matches!(clap_mode, clap_args::Mode::Interactive) {
-        let sid = prompt_parse_u64("Enter session id (sid)", 1)?;
-        let user_id_preview = env::var("USER_ID").unwrap_or_else(|_| "unknown".into());
-        if local_credential_present(&user_id_preview, &cred_name, sid) {
-            Mode::Verify { sid }
+    let is_interactive = matches!(clap_mode, clap_args::Mode::Interactive);
+
+    'MAIN_LOOP: loop {
+        let mode: Mode = if is_interactive {
+            let sid = prompt_parse_u64("Enter session id (sid)", 1)?;
+            let user_id_preview = env::var("USER_ID").unwrap_or_else(|_| "unknown".into());
+            if local_credential_present(&user_id_preview, &cred_name, sid) {
+                Mode::Verify { sid }
+            } else {
+                let m = prompt_line("Choose mode: [r]equest or [v]erify (default: request)")?;
+                if m.trim().eq_ignore_ascii_case("v") || m.trim().eq_ignore_ascii_case("verify") { Mode::Verify { sid } } else {
+                    println!("Enter revealed pairs as idx=value comma-separated (default: 0 only; 0 will be set to sid)");
+                    let line = prompt_line("")?;
+                    let (revealed_idx, revealed_vals) = if line.trim().is_empty() { (vec![0u32], vec![U256::zero()]) } else { parse_revealed(&line)? };
+                    let ctxs = prompt_line("Optional context (ascii, default: client-demo)")?;
+                    let context = if ctxs.trim().is_empty() { b"client-demo".to_vec() } else { ctxs.into_bytes() };
+                    let w = prompt_line("Wait for shares and verify now? [y/N]")?;
+                    let wait_and_verify = matches!(w.trim(), "y"|"Y"|"yes"|"YES");
+                    Mode::Request { sid, revealed_idx, revealed_vals, context, wait_and_verify }
+                }
+            }
         } else {
-            let m = prompt_line("Choose mode: [r]equest or [v]erify (default: request)")?;
-            if m.trim().eq_ignore_ascii_case("v") || m.trim().eq_ignore_ascii_case("verify") { Mode::Verify { sid } } else {
-                println!("Enter revealed pairs as idx=value comma-separated (default: 0 only; 0 will be set to sid)");
-                let line = prompt_line("")?;
-                let (revealed_idx, revealed_vals) = if line.trim().is_empty() { (vec![0u32], vec![U256::zero()]) } else { parse_revealed(&line)? };
-                let ctxs = prompt_line("Optional context (ascii, default: client-demo)")?;
-                let context = if ctxs.trim().is_empty() { b"client-demo".to_vec() } else { ctxs.into_bytes() };
-                let w = prompt_line("Wait for shares and verify now? [y/N]")?;
-                let wait_and_verify = matches!(w.trim(), "y"|"Y"|"yes"|"YES");
-                Mode::Request { sid, revealed_idx, revealed_vals, context, wait_and_verify }
+            match clap_mode {
+                clap_args::Mode::Interactive => unreachable!(),
+                clap_args::Mode::Verify { sid } => Mode::Verify { sid },
+                clap_args::Mode::Present { sid } => Mode::Present { sid },
+                clap_args::Mode::Request { sid, wait_and_verify } => {
+                    // Non-interactive defaults for revealed/context
+                    Mode::Request { sid, revealed_idx: vec![0u32], revealed_vals: vec![U256::zero()], context: b"client-demo".to_vec(), wait_and_verify }
+                }
             }
-        }
-    } else {
-        match clap_mode {
-            clap_args::Mode::Interactive => unreachable!(),
-            clap_args::Mode::Verify { sid } => Mode::Verify { sid },
-            clap_args::Mode::Present { sid } => Mode::Present { sid },
-            clap_args::Mode::Request { sid, wait_and_verify } => {
-                // Non-interactive defaults for revealed/context
-                Mode::Request { sid, revealed_idx: vec![0u32], revealed_vals: vec![U256::zero()], context: b"client-demo".to_vec(), wait_and_verify }
-            }
-        }
-    };
+        };
 
     let ws = Provider::<Ws>::connect(ws_url.clone()).await?;
     let wallet: LocalWallet = if let Ok(pk) = env::var("CLIENT_PK").or_else(|_| env::var("OWNER_PK")) { pk.parse::<LocalWallet>()? } else { "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".parse::<LocalWallet>()? }.with_chain_id(chain_id);
@@ -103,10 +110,23 @@ async fn main() -> anyhow::Result<()> {
     let req = RequestCredential::new(req_addr, client.clone());
     let store = CredentialsStore::new(&user_id, &cred_name);
     let registry_addr_env = env::var("REGISTRY_CONTRACT").ok().or_else(|| env::var("RELAY_CONTRACT").ok());
+    let metrics = env::var("METRICS").map(|v| v=="1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/client.ndjson".into());
     let registry_opt: Option<RegistryClient<SignerMiddleware<Provider<Ws>, LocalWallet>>> = registry_addr_env
         .and_then(|s| s.parse::<Address>().ok())
         .and_then(|addr| RegistryClient::new(addr, client.clone()).ok());
     let params_contract = ParamsContract::new(params_addr, client.clone());
+
+    fn metrics_append(enabled: bool, path: &str, value: serde_json::Value) {
+        if !enabled { return; }
+        let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+            let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+            let s = serde_json::to_string(&value)?;
+            writeln!(f, "{}", s)?;
+            Ok(())
+        })();
+    }
 
 
 
@@ -118,9 +138,9 @@ async fn main() -> anyhow::Result<()> {
                 {
                     println!("entering actions");
                     let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
-                    return ui::run_action_loop(client.clone(), &params_contract, &sess).await;
+                    ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
                 }
-                return Ok(());
+                if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
             }
             let pb = fetch_params_bundle(&params_contract, &cred_name).await?;
             let mcount_onchain = pb.mcount; let params_bbs = pb.params_bbs.clone();
@@ -141,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
             // Persist revealed pairs now so downstream flows use exact values
             let _ = persist_revealed_pairs(&user_id, &cred_name, sid, &revealed_idx, &revealed_vals);
             let _ = store.save_revealed(sid, &RevealedFile { idx: revealed_idx.clone(), vals: revealed_vals.iter().map(|v| { let mut be=[0u8;32]; v.to_big_endian(&mut be); format!("0x{}", hex::encode(be)) }).collect() });
+            let t0_pok = Instant::now();
             let proof_bytes = build_commitment_pok(&params_bbs, &commitment, &hidden_msgs_fr, &blinding, mcount_onchain, sid, &cred_name, &revealed_idx, &revealed_vals, &context)?;
+            let pok_ms = t0_pok.elapsed().as_millis() as u64;
+            metrics_append(metrics, &metrics_file, json!({"scenario":"commitment_pok","sid":sid,"ms":pok_ms}));
             let commitment_b = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let commitment_u = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let context_bytes = ethers::types::Bytes::from(context.clone());
@@ -161,8 +184,28 @@ async fn main() -> anyhow::Result<()> {
             if wait_and_verify {
                 if registry_opt.is_none() { anyhow::bail!("REGISTRY_CONTRACT/RELAY_CONTRACT missing; cannot wait for Aggregated event"); }
                 let registry = registry_opt.as_ref().unwrap();
-                let filter = registry.aggregated_filter(&cred_name, sid);
-                let mut agg_stream = client.provider().subscribe_logs(&filter).await?;
+                // Build Aggregated and Confirmed streams
+                use ethers::types::{Filter, ValueOrArray, BlockNumber};
+                let topic_agg = H256::from(ethers::utils::keccak256(b"Aggregated(string,uint256,bytes,uint256,uint256)"));
+                let name_topic = H256::from(ethers::utils::keccak256(cred_name.as_bytes()));
+                let mut sid_be = [0u8; 32];
+                U256::from(sid).to_big_endian(&mut sid_be);
+                let sid_topic = H256::from(sid_be);
+                let filter_agg = Filter::new()
+                    .address(ValueOrArray::Value(registry.address()))
+                    .topic0(ValueOrArray::Value(topic_agg))
+                    .topic1(ValueOrArray::Value(name_topic))
+                    .topic2(ValueOrArray::Value(sid_topic))
+                    .from_block(BlockNumber::Latest);
+                let mut agg_stream = client.provider().subscribe_logs(&filter_agg).await?;
+                let topic_conf = H256::from(ethers::utils::keccak256(b"Confirmed(string,uint256)"));
+                let filter_conf = Filter::new()
+                    .address(ValueOrArray::Value(registry.address()))
+                    .topic0(ValueOrArray::Value(topic_conf))
+                    .topic1(ValueOrArray::Value(name_topic))
+                    .topic2(ValueOrArray::Value(sid_topic))
+                    .from_block(BlockNumber::Latest);
+                let mut conf_stream = client.provider().subscribe_logs(&filter_conf).await?;
                 let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
                     U256::from(req_session.sid), req_session.cred_name.clone(),
                     req_session.commitment_u.clone(), req_session.commitment_b.clone(),
@@ -172,12 +215,22 @@ async fn main() -> anyhow::Result<()> {
                     req_session.c_u256, req_session.resp_vec_u256.clone(),
                     req_session.context_bytes.clone(),
                 );
+                let t0_total = Instant::now();
+                let t0_send = Instant::now();
                 let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
+                metrics_append(metrics, &metrics_file, json!({"scenario":"request_sent","sid":sid,"ms": t0_send.elapsed().as_millis() as u64}));
                 if let Some(rcpt) = rcpt_opt.as_ref() { let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)")); let mut found = false; for lg in rcpt.logs.iter() { if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; } } println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" }); }
                 if let Some(rcpt) = rcpt_opt.clone() { let txh = rcpt.transaction_hash; if let Some(bn) = rcpt.block_number { persist_request_meta(&user_id, &cred_name, sid, txh, bn.as_u64()).ok(); } }
                 // Wait for Aggregated and then fetch signature; persist artifacts; enter action loop
+                let t0_wait = Instant::now();
                 loop {
                     if let Some(_log) = agg_stream.next().await {
+                        metrics_append(metrics, &metrics_file, json!({"scenario":"aggregated_received","sid":sid,"ms": t0_wait.elapsed().as_millis() as u64}));
+                        metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_request_to_aggregated","sid":sid,"ms": t0_total.elapsed().as_millis() as u64}));
+                        // Additionally watch for Confirmed and record E2E if present soon after
+                        if let Ok(Some(_lg)) = tokio::time::timeout(std::time::Duration::from_secs(30), conf_stream.next()).await {
+                            metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_request_to_confirmed","sid":sid,"ms": t0_total.elapsed().as_millis() as u64}));
+                        }
                         // Fetch aggregated signature from registry
                         let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), U256::from(sid)).await?;
                         if abytes.0.len() != 128 { anyhow::bail!("registry returned bad A len: {}", abytes.0.len()); }
@@ -204,9 +257,9 @@ async fn main() -> anyhow::Result<()> {
                         #[cfg(feature = "interactive")]
                         {
                             let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
-                            return ui::run_action_loop(client.clone(), &params_contract, &sess).await;
+                            ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
                         }
-                        return Ok(());
+                        if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
                     }
                 }
             } else {
@@ -221,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
                 if let Some(rcpt) = rcpt_opt.clone() { let txh = rcpt.transaction_hash; if let Some(bn) = rcpt.block_number { persist_request_meta(&user_id, &cred_name, sid, txh, bn.as_u64()).ok(); } }
+                if is_interactive { continue 'MAIN_LOOP; }
             }
         }
         Mode::Verify { sid } => {
@@ -251,9 +305,9 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "interactive")]
                     {
                         let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
-                        return ui::run_action_loop(client.clone(), &params_contract, &sess).await;
+                        ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
                     }
-                    return Ok(());
+                    if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
                 }
             }
             anyhow::bail!("Aggregated signature not found in registry for sid {}", sid);
@@ -264,10 +318,11 @@ async fn main() -> anyhow::Result<()> {
                 let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
                 return ui::run_action_loop(client.clone(), &params_contract, &sess).await;
             }
-            return Ok(());
+            if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
         }
         
     }
-
+        if !is_interactive { break 'MAIN_LOOP; }
+    }
     Ok(())
 }

@@ -232,7 +232,7 @@ contract CredentialRegistry {
     function confirmCredential(string calldata name, uint256 sid) external {
         bytes32 k = _key(name, sid);
         Sig storage srec = sigs[k];
-        require(srec.status == Status.Unverified, "bad status");
+        // Allow re-check even if already Verified to enable metrics collection; avoid reverting
         require(owners[k] == msg.sender || accumulatorManagers[msg.sender], "not allowed");
         require(srec.Bprime.length == 128 || bprimes[k].length == 128, "B' missing");
         bytes memory Bp = srec.Bprime.length == 128 ? srec.Bprime : bprimes[k];
@@ -272,9 +272,12 @@ contract CredentialRegistry {
         bytes memory neg_g1_plus_bpp = Bls12381.g1neg(g1PlusBpp);
         bool ok = Verify.verifyPairing(srec.A, pk_plus_eg2, neg_g1_plus_bpp, g2base);
         require(ok, "pairing fail");
-        srec.status = Status.Verified;
-        emit Confirmed(name, sid);
-        if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
+        // Update status and emit only if transitioning to Verified
+        if (srec.status != Status.Verified) {
+            srec.status = Status.Verified;
+            emit Confirmed(name, sid);
+            if (accumulator != address(0)) { IAccumulatorLike(accumulator).publishMappingFromRegistry(name, sid, srec.A, srec.e); }
+        }
         // cleanup per-session request data
         delete revealedIdxs[k];
         delete revealedVals[k];

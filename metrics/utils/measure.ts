@@ -6,9 +6,31 @@ export async function sendAndMeasure(txp: Promise<ContractTransactionResponse>, 
   const r = await tx.wait();
   const t1 = Date.now();
   const gasUsed = r?.gasUsed;
-  const txFull = await provider.getTransaction(tx.hash);
-  const effGasPrice = txFull?.gasPrice;
+  const effGasPrice = (r as any)?.effectiveGasPrice ?? null;
   const costWei = gasUsed && effGasPrice ? gasUsed * effGasPrice : null;
-  return { hash: tx.hash, startMs: t0, endMs: t1, wallMs: t1 - t0, gasUsed: gasUsed?.toString(), gasPrice: effGasPrice?.toString(), costWei: costWei?.toString(), block: r?.blockNumber };
+  let oracle: any = null;
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  const chainId = (await provider.getNetwork()).chainId.toString();
+  try {
+    const doFetch: any = (globalThis as any).fetch;
+    if (apiKey && doFetch && (chainId === '11155111' || chainId === '1')) {
+      const base = chainId === '11155111' ? 'https://api-sepolia.etherscan.io' : 'https://api.etherscan.io';
+      const url = `${base}/api?module=gastracker&action=gasoracle&apikey=${apiKey}`;
+      const res = await doFetch(url);
+      const j = await res.json();
+      if (j && j.status === '1' && j.result) oracle = j.result;
+    }
+  } catch {}
+  return {
+    hash: tx.hash,
+    startMs: t0,
+    endMs: t1,
+    wallMs: t1 - t0,
+    gasUsed: gasUsed?.toString(),
+    effectiveGasPrice: effGasPrice?.toString?.(),
+    costWei: costWei?.toString?.(),
+    block: r?.blockNumber,
+    gasOracle: oracle,
+  };
 }
 

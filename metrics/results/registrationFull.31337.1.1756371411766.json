@@ -1,0 +1,23 @@
+{
+  "scenario": "registrationFull",
+  "name": "ANON_CRED",
+  "sid": 1,
+  "ts": 1756371411766,
+  "chainId": "31337",
+  "verifyCred": {
+    "wallMs": null,
+    "gasUsed": null,
+    "costWei": null
+  },
+  "setDelta": {
+    "wallMs": null,
+    "gasUsed": null,
+    "costWei": null
+  },
+  "publishWitness": {
+    "wallMs": null,
+    "gasUsed": null,
+    "costWei": null
+  },
+  "registrationFullMs": null
+}

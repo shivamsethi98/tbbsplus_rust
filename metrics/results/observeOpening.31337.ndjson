@@ -1,0 +1,4 @@
+{"scenario":"observeOpening","name":"ANON_CRED","chainId":"31337","txHash":"0x6c7a51fc78717fad97d2266d8f7312abf940f8376781d7cc8166c3d7b5b12281","blockNumber":56,"deltaSec":0,"gasUsed":"32695","gasPrice":null,"costWei":null,"ts":1756374277906}
+{"scenario":"observeOpening","name":"ANON_CRED","chainId":"31337","txHash":"0x82659c7eeee5d95e7e7b417ce73b9ebc7e24fa1fcda9889ba8d58603cabf4d5a","blockNumber":73,"deltaSec":0,"gasUsed":"32695","gasPrice":null,"costWei":null,"ts":1756375321601}
+{"scenario":"observeOpening","name":"ANON_CRED","chainId":"31337","txHash":"0x25f6368f000973fb91439197cafe9c1cee705f5ab42fac578560aa03e19db827","blockNumber":47,"deltaSec":0,"gasUsed":"32695","gasPrice":null,"costWei":null,"ts":1756375670933}
+{"scenario":"observeOpening","name":"ANON_CRED","chainId":"31337","txHash":"0xa4e79e8fb073b589883f844f645ff5ed86de14e468f6d3c3dfaff83797a17937","blockNumber":56,"deltaSec":0,"gasUsed":"32683","gasPrice":null,"costWei":null,"ts":1756376297974}

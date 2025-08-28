@@ -31,7 +31,9 @@ async fn main() -> anyhow::Result<()> {
     let verify = VerifyClient::new(verify_addrs[0], client.clone())?;
     let accumulator = AccumulatorClient::new(acc_addr, client.clone())?;
 
-    // No persistent modes; only interactive
+    // Non-interactive defaults for testing: auto open and auto revoke
+    let auto_open = env::var("SP_AUTO_OPEN").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
+    let auto_revoke = env::var("SP_AUTO_REVOKE").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
 
     // Subscribe to PresentationVerified(name, prover, T1, T2)
     // (already imported above) use ethers::types::{Filter, ValueOrArray, H256, BlockNumber};
@@ -52,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let mut status_stream = client.provider().subscribe_logs(&Filter::new().address(ValueOrArray::Value(acc_addr_h)).from_block(BlockNumber::Latest)).await?;
     let acc_opened_abi = accumulator.contract.abi().event("Opened")?;
 
-    println!("service_provider: listening for PresentationVerified from {:?}", verify_addrs);
+    println!("service_provider: listening for PresentationVerified from {:?} (auto_open={}, auto_revoke={})", verify_addrs, auto_open, auto_revoke);
     while let Some(log) = stream.next().await {
         let raw = RawLog { topics: log.topics.clone(), data: log.data.to_vec() };
         let parsed = match ev.parse_log(raw) { Ok(p) => p, Err(e) => { eprintln!("parse err: {:?}", e); continue; } };
@@ -66,12 +68,82 @@ async fn main() -> anyhow::Result<()> {
             if p.name == "T2" { if let ethers::abi::Token::Bytes(b) = &p.value { t2 = b.clone(); } }
         }
         if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens (T1={}, T2={})", t1.len(), t2.len()); continue; }
-        // Interactive prompt
+        if auto_open {
+            let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
+            let t1b = ethers::types::Bytes::from(t1.clone());
+            let t2b = ethers::types::Bytes::from(t2.clone());
+            let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b))?;
+            let pending = call.send().await?;
+            let rcpt = pending.await?;
+            println!("ServiceProvider(auto): requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+            let mut notified = false;
+            let start = std::time::Instant::now();
+            let mut e_for_revoke: Option<U256> = None;
+            while start.elapsed().as_secs() < 10 {
+                if let Some(lg) = status_stream.next().await {
+                    if lg.address == acc_addr_h && !lg.topics.is_empty() {
+                        if lg.topics[0] == ev_opened {
+                            println!("ServiceProvider(auto): Opened emitted");
+                            let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
+                            if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
+                                let mut a_bytes: Vec<u8> = Vec::new();
+                                for p in parsed.params.iter() {
+                                    if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
+                                }
+                                if a_bytes.len() == 128 {
+                                    let mut e_u = U256::zero();
+                                    for _ in 0..10 {
+                                        match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
+                                            Ok(call) => { match call.call().await { Ok(x) => { e_u = x; }, Err(err) => { eprintln!("ServiceProvider: getEByA call error: {:?}", err); } } }
+                                            Err(err) => { eprintln!("ServiceProvider: getEByA method error: {:?}", err); }
+                                        }
+                                        if e_u != U256::zero() { break; }
+                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                    }
+                                    if e_u != U256::zero() {
+                                        println!("ServiceProvider: resolved e=0x{:x} via A->e mapping", e_u);
+                                        e_for_revoke = Some(e_u);
+                                        // Optional: probe witness
+                                        let mut witness_ok = false;
+                                        for _ in 0..10 {
+                                            match accumulator.contract.method::<_, ethers::types::Bytes>("getWitness", (name_env.clone(), e_u)) {
+                                                Ok(wc) => { match wc.call().await { Ok(wb) => { if wb.0.len() == 128 { witness_ok = true; break; } }, Err(err) => eprintln!("ServiceProvider: getWitness call error: {:?}", err) } }
+                                                Err(err) => eprintln!("ServiceProvider: getWitness method error: {:?}", err),
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                        }
+                                        if witness_ok { println!("ServiceProvider: witness available (len=128) for e=0x{:x}", e_u); }
+                                        else { println!("ServiceProvider: witness not yet available for e=0x{:x}", e_u); }
+                                    } else {
+                                        println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
+                                    }
+                                }
+                            }
+                            notified = true; break;
+                        }
+                        if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
+                    }
+                } else { break; }
+            }
+            if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 10s"); }
+            if auto_revoke {
+                if let Some(e_u) = e_for_revoke {
+                    let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env, e_u))?;
+                    let pending = call.send().await?;
+                    let rcpt = pending.await?;
+                    println!("ServiceProvider(auto): requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+                } else {
+                    println!("ServiceProvider(auto): skip revoke (e not resolved)");
+                }
+            }
+            continue;
+        }
+        // Interactive prompt fallback
         println!("ServiceProvider: choose action: [1] open-only  [2] revoke-by-e  [other] skip");
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).ok();
         match ans.trim() {
-            "1" => {
+            "1" | "" => {
                 let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
                 let t1b = ethers::types::Bytes::from(t1);
                 let t2b = ethers::types::Bytes::from(t2);

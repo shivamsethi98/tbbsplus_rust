@@ -1,0 +1,13 @@
+{
+  "scenario": "verifyCred",
+  "name": "ANON_CRED",
+  "sid": 1,
+  "hash": null,
+  "wallMs": 0,
+  "gasUsed": null,
+  "gasPrice": null,
+  "costWei": null,
+  "block": null,
+  "ts": 1756371406927,
+  "chainId": "31337"
+}

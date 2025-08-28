@@ -1,0 +1,7 @@
+{"ms":6,"scenario":"commitment_pok","sid":1}
+{"ms":7095,"scenario":"request_sent","sid":1}
+{"ms":0,"scenario":"aggregated_received","sid":1}
+{"ms":7095,"scenario":"issuance_e2e_request_to_aggregated","sid":1}
+{"ms":7096,"scenario":"issuance_e2e_request_to_confirmed","sid":1}
+{"ms":809,"scenario":"proveCred","sid":1}
+{"blockNumber":37,"costWei":"5050883064241000","effectiveGasPrice":"3009613028","gasUsed":"1678250","hash":"0xc8d7927931c46d5cb643e2610de2cfaf82eee1e6dc6b20726f4d96afad7a03bd","ms":7345,"scenario":"verifyPresent","sid":1}

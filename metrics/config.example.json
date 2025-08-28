@@ -1,0 +1,16 @@
+{
+  "name": "ANON_CRED",
+  "messageCount": 5,
+  "threshold": 3,
+  "total": 3,
+  "repetitions": 1,
+  "network": "local",
+  "scenarios": [
+    "issuance",
+    "verify_cred",
+    "register_info",
+    "present_cred"
+  ]
+}
+
+

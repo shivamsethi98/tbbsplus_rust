@@ -11,5 +11,5 @@ pub mod persistence;
 pub mod onchain;
 pub mod chain;
 pub mod crypto;
-pub mod vb_accum;
+// vb_accum was removed; use vb_accumulator crate directly in binaries
 

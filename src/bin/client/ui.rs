@@ -23,6 +23,16 @@ use schnorr_pok::compute_random_oracle_challenge;
 use tbbsplus_rust::orchestration::chain::clients::{VerifyClient, AccumulatorClient};
 
 use super::session::Session;
+fn metrics_append(enabled: bool, path: &str, value: serde_json::Value) {
+    if !enabled { return; }
+    let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let s = serde_json::to_string(&value)?;
+        use std::io::Write; writeln!(f, "{}", s)?;
+        Ok(())
+    })();
+}
 
 pub async fn run_action_loop(
     client: Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
@@ -50,6 +60,8 @@ pub async fn run_action_loop(
     let s = Fr::deserialize_compressed(&hex::decode(s_hex.trim_start_matches("0x"))?[..])?;
     let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
 
+    let metrics = std::env::var("METRICS").map(|v| v=="1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/client.ndjson".into());
     loop {
         println!("Choose action: [v]erify off-chain, [p]resent on-chain, [w]itness check, [e]xit (default: verify)");
         let mut line = String::new(); std::io::stdin().read_line(&mut line)?; let choice = line.trim().to_lowercase();
@@ -97,6 +109,7 @@ pub async fn run_action_loop(
             continue;
         } else if choice == "p" || choice == "present" {
             // On-chain presentation via VerifyWrapper
+            let t0_prove = std::time::Instant::now();
             let pb = onchain::fetch_params_bundle(params_contract, &session.cred_name).await?;
             let params_bbs = pb.params_bbs.clone();
             // Prompt revealed indices
@@ -122,6 +135,7 @@ pub async fn run_action_loop(
                 } else { signature.clone() }
             };
             let (proof, c_fr, revealed_idx2) = build_pok_and_proof(&params_bbs, &sig_struct, &messages, &ybar_aff, &revealed_idx)?;
+            metrics_append(metrics, &metrics_file, serde_json::json!({"scenario":"proveCred","sid":session.sid,"ms": t0_prove.elapsed().as_millis() as u64}));
             let (sig_t, ctx_t, revealed_t, challenge_u256, p1_t, p2_t, enc_extras) = build_presentation_tuples(&params_bbs, &proof, &revealed_idx2, &messages, pb.mcount, &c_fr)?;
             let EncExtras { t1_b, t2enc_b, t_enc_b, resp_a3_u, resp_k_u } = enc_extras;
             let verify_addr: Address = std::env::var("VERIFY_CONTRACT").expect("VERIFY_CONTRACT").parse()?;
@@ -168,11 +182,36 @@ pub async fn run_action_loop(
             )?;
             let topic = H256::from(ethers::utils::keccak256(b"PresentationVerified(string,address,bytes,bytes)"));
             let mut ok = false;
+            let t0_send = std::time::Instant::now();
             match call.send().await {
                 Ok(pending_tx) => {
                     match pending_tx.await {
                         Ok(rcpt_opt) => {
                             if let Some(r) = rcpt_opt.as_ref() { for lg in &r.logs { if lg.address == verify_addr && !lg.topics.is_empty() && lg.topics[0] == topic { ok = true; break; } } }
+                            // Emit metrics with gas if available
+                            if let Some(r) = rcpt_opt.as_ref() {
+                                let gas_used = r.gas_used.unwrap_or_default();
+                                let eff_price = r.effective_gas_price.unwrap_or_default();
+                                let cost = gas_used * eff_price;
+                                let blk = r.block_number.unwrap_or_default();
+                                metrics_append(metrics, &metrics_file, serde_json::json!({
+                                    "scenario":"verifyPresent",
+                                    "sid": session.sid,
+                                    "ms": t0_send.elapsed().as_millis() as u64,
+                                    "hash": format!("0x{:x}", r.transaction_hash),
+                                    "blockNumber": blk.as_u64(),
+                                    "gasUsed": gas_used.to_string(),
+                                    "effectiveGasPrice": eff_price.to_string(),
+                                    "costWei": cost.to_string()
+                                }));
+                            } else {
+                                metrics_append(metrics, &metrics_file, serde_json::json!({
+                                    "scenario":"verifyPresent",
+                                    "sid": session.sid,
+                                    "ms": t0_send.elapsed().as_millis() as u64,
+                                    "hash": rcpt_opt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash))
+                                }));
+                            }
                         }
                         Err(e) => { eprintln!("[present] tx await error: {:?}", e); }
                     }

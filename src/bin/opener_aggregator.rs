@@ -20,8 +20,11 @@ use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 #[cfg(feature = "mpc")]
 use libp2p::Multiaddr;
 use secret_sharing_and_dkg::common::lagrange_basis_at_0;
-// vb_accumulator integration helper
-use tbbsplus_rust::orchestration::vb_accum::VbEnv;
+// Use vb_accumulator directly (no wrapper)
+use std::time::Instant;
+use std::io::Write as _;
+use vb_accumulator::witness::{MembershipWitness as VbMembershipWitness, Witness as VbWitnessTrait};
+use vb_accumulator::positive::Accumulator as _;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenAnnounceMsg {
@@ -142,9 +145,17 @@ async fn main() -> anyhow::Result<()> {
         .method("getG1H0G2ByName", (cred_name.clone(),))?
         .call()
         .await?;
+    let g1 = eip2537_g1_to_affine(&g1_b.0[..])?;
     let g2 = eip2537_g2_to_affine(&g2_b.0[..])?;
-    // vb_accumulator environment (params + pk)
-    let vb_env = VbEnv::from_onchain(&params, &cred_name).await?;
+    // Build vb_accumulator params and public key directly from on-chain Params
+    let pk_acc_bytes: ethers::types::Bytes = params
+        .method("getOpenerPkG2ByName", (cred_name.clone(),))?
+        .call()
+        .await
+        .unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+    if pk_acc_bytes.0.len() != 256 { anyhow::bail!("opener pkG2 missing in Params"); }
+    let vb_params = vb_accumulator::setup::SetupParams::<Bls12_381> { P: g1, P_tilde: g2 };
+    let vb_pk = vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pk_acc_bytes.0[..])?);
 
     // Mesh peers from openers (optional dialing)
     let openers: Vec<Address> = params.method::<_, Vec<Address>>("getOpeners", ())?.call().await.unwrap_or_default();
@@ -185,6 +196,22 @@ async fn main() -> anyhow::Result<()> {
         .from_block(BlockNumber::Latest);
     let mut stream_rev = client.provider().subscribe_logs(&filter_rev).await?;
 
+    let ev_memrev = H256::from(ethers::utils::keccak256(b"MemberRevoked(string,uint256,bytes)"));
+    let filter_memrev_latest = Filter::new()
+        .address(ValueOrArray::Value(acc_addr))
+        .topic0(ValueOrArray::Value(ev_memrev))
+        .topic1(ValueOrArray::Value(name_topic))
+        .from_block(BlockNumber::Latest);
+    let mut stream_memrev = client.provider().subscribe_logs(&filter_memrev_latest).await?;
+
+    let ev_wit = H256::from(ethers::utils::keccak256(b"WitnessAvailable(string,uint256,bytes,bytes)"));
+    let filter_wit_latest = Filter::new()
+        .address(ValueOrArray::Value(acc_addr))
+        .topic0(ValueOrArray::Value(ev_wit))
+        .topic1(ValueOrArray::Value(name_topic))
+        .from_block(BlockNumber::Latest);
+    let mut stream_wit = client.provider().subscribe_logs(&filter_wit_latest).await?;
+
     let ev_conf = H256::from(ethers::utils::keccak256(b"Confirmed(string,uint256)"));
     let filter_conf = Filter::new()
         .address(ValueOrArray::Value(registry.address()))
@@ -205,6 +232,39 @@ async fn main() -> anyhow::Result<()> {
     let mut add_meta: Map<u64, (Vec<u16>, Vec<u8>, U256, u64)> = Map::new(); // sid -> (subset, V128, e, seq)
     let mut add_contribs: Map<u64, Vec<(u16, Vec<u8>)>> = Map::new(); // sid -> vec[(idx, contrib)]
     let mut add_seen: Map<u64, std::collections::BTreeSet<u16>> = Map::new(); // sid -> set of idx received
+    let mut members: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // all added e values
+    let mut revoked_set: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // revoked e values
+
+    // Initialize members from past WitnessAvailable events (chain scan)
+    let filter_wit_all = Filter::new()
+        .address(ValueOrArray::Value(acc_addr))
+        .topic0(ValueOrArray::Value(ev_wit))
+        .topic1(ValueOrArray::Value(name_topic))
+        .from_block(BlockNumber::Earliest)
+        .to_block(BlockNumber::Latest);
+    if let Ok(init_logs) = client.provider().get_logs(&filter_wit_all).await {
+        for lg in init_logs {
+            if let Some(e_topic) = lg.topics.get(2) {
+                let e_u = U256::from_big_endian(e_topic.as_bytes());
+                if !e_u.is_zero() { members.insert(e_u); }
+            }
+        }
+    }
+    // Initialize revoked set and subtract from members
+    let filter_memrev_all = Filter::new()
+        .address(ValueOrArray::Value(acc_addr))
+        .topic0(ValueOrArray::Value(ev_memrev))
+        .topic1(ValueOrArray::Value(name_topic))
+        .from_block(BlockNumber::Earliest)
+        .to_block(BlockNumber::Latest);
+    if let Ok(init_logs) = client.provider().get_logs(&filter_memrev_all).await {
+        for lg in init_logs {
+            if let Some(e_topic) = lg.topics.get(2) {
+                let e_u = U256::from_big_endian(e_topic.as_bytes());
+                if !e_u.is_zero() { revoked_set.insert(e_u); members.remove(&e_u); }
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -270,6 +330,22 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                     handle.broadcast("revoke-announce", serde_json::to_vec(&msg)?).await?;
                 }
             },
+            ev = stream_memrev.next() => {
+                if let Some(lg) = ev {
+                    if let Some(e_topic) = lg.topics.get(2) {
+                        let e_u = U256::from_big_endian(e_topic.as_bytes());
+                        if !e_u.is_zero() { revoked_set.insert(e_u); members.remove(&e_u); }
+                    }
+                }
+            },
+            ev = stream_wit.next() => {
+                if let Some(lg) = ev {
+                    if let Some(e_topic) = lg.topics.get(2) {
+                        let e_u = U256::from_big_endian(e_topic.as_bytes());
+                        if !e_u.is_zero() { members.insert(e_u); }
+                    }
+                }
+            },
             dm = direct_rx.recv() => {
                 if let Some(dm) = dm {
                     // Open partials, deletion shares, or addition contributions
@@ -278,6 +354,7 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                         entry.push((msg.from_idx, msg.tbar_128.clone(), Vec::new()));
                         if entry.len() as u16 >= threshold {
                             // Verify and recombine
+                            let t0_recon = Instant::now();
                             let Some((t1b, t2b)) = announces.get(&msg.sid) else { continue };
                             let t1 = match eip2537_g1_to_affine(&t1b[..]) { Ok(v) => v, Err(_) => continue };
                             let mut verified = Vec::new();
@@ -304,6 +381,10 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 let a = (t2.into_group() + (-tbar_agg).into_group()).into_affine();
                                 let a_bytes = g1_to_eip2537_bytes(&a).to_vec();
                                 let _ = accumulator.method::<_, ()>("publishOpenResult", (cred_name.clone(), ethers::types::Bytes::from(a_bytes.clone())))?.send().await?.await?;
+                                if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                                    let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"open_reconstruct","sid": msg.sid, "ms": t0_recon.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                }
                                 // resolve e
                                 let mut e_u = U256::zero();
                                 for _ in 0..10 {
@@ -329,11 +410,40 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 let mut rb = &b[..]; let sh: AccSigShare<<Bls12_381 as Pairing>::G1Affine> = CanonicalDeserialize::deserialize_compressed(&mut rb).unwrap();
                                 shares.push(sh);
                             }
+                            let t0_agg = Instant::now();
                             let new_delta_aff = AccSigShare::aggregate(shares);
                             let new_delta_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&new_delta_aff).to_vec());
                             if let Some(e_u) = e_by_sid.get(&v.sid).cloned() {
-                                let _ = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b))?.send().await?.await?;
+                                let _ = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b.clone()))?.send().await?.await?;
                                 println!("[agg] deleteMember executed for sid={} e=0x{:x}", v.sid, e_u);
+                                // After removal, update witnesses for remaining members using library helper (public update after single removal)
+                                let V_new = new_delta_aff;
+                                let e_removed_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
+                                let to_update: Vec<U256> = members.iter().cloned().collect();
+                                for e_old in to_update.into_iter() {
+                                    if revoked_set.contains(&e_old) { continue; }
+                                    if e_old == e_u { continue; }
+                                    let wit_b: ethers::types::Bytes = accumulator.method("getWitness", (cred_name.clone(), e_old))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                    if wit_b.0.len() != 128 { continue; }
+                                    let w_old = match eip2537_g1_to_affine(&wit_b.0[..]) { Ok(v) => v, Err(_) => continue };
+                                    let e_old_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_old);
+                                    if let Ok((_d, w_new)) = VbMembershipWitness::<ark_bls12_381::G1Affine>::compute_update_after_removal(
+                                        &e_old_fr,
+                                        &e_removed_fr,
+                                        &w_old,
+                                        &V_new,
+                                    ) {
+                                        let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
+                                        let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
+                                    }
+                                }
+                                // Update local sets
+                                revoked_set.insert(e_u);
+                                members.remove(&e_u);
+                                if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                                    let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_delete_aggregate","sid": v.sid, "ms": t0_agg.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                }
                             } else {
                                 println!("[agg] deleteMember: e missing for sid={}", v.sid);
                             }
@@ -356,6 +466,7 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                             let V = match eip2537_g1_to_affine(&v128[..]) { Ok(v) => v, Err(_) => { println!("[agg] invalid V bytes"); continue; } };
                             let e_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
                             // Verify contributions for exactly the designated subset and sum
+                            let t0_verify = Instant::now();
                             let mut sum_c = <Bls12_381 as Pairing>::G1::zero();
                             let mut ok_subset = true;
                             for idx in subset.iter() {
@@ -375,11 +486,18 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 sum_c += contrib.into_group();
                             }
                             if !ok_subset { continue; }
-                            // Compute V' = sum_c + e*V
-                            let v_e = V.into_group().mul_bigint(e_fr.into_bigint());
+                            // Compute V' = sum_c + e*V (keep V_old for witness updates)
+                            let V_old = V;
+                            let v_e = V_old.into_group().mul_bigint(e_fr.into_bigint());
                             let v_new = (sum_c + v_e).into_affine();
                             // vb_accumulator: verify membership of e in new Delta with witness W = old V
-                            let ok = vb_env.verify_add_result(V, v_new, e_fr);
+                            let ok = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::verify_membership_given_accumulated::<Bls12_381>(
+                                &v_new,
+                                &e_fr,
+                                &vb_accumulator::witness::MembershipWitness::<ark_bls12_381::G1Affine>(V),
+                                &vb_pk,
+                                &vb_params,
+                            );
                             if !ok {
                                 println!("[agg] ERROR: vb_accumulator membership verify failed; aborting setDelta for sid={}", ac.sid);
                                 // hard fail this round; clear pending state to avoid spinning
@@ -388,11 +506,33 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 add_seen.remove(&ac.sid);
                                 continue;
                             }
+                            if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                                let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_add_verify_sum","sid": ac.sid, "ms": t0_verify.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                            }
                             let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
                             let _ = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
-                            // Publish witness W = V
-                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&V).to_vec());
+                            // Update witnesses for all existing members using library helper (public update after single addition)
+                            let mut to_update: Vec<U256> = members.iter().cloned().collect();
+                            for e_old in to_update.into_iter() {
+                                if revoked_set.contains(&e_old) { continue; }
+                                let wit_b: ethers::types::Bytes = accumulator.method("getWitness", (cred_name.clone(), e_old))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                if wit_b.0.len() != 128 { continue; }
+                                let w_old = match eip2537_g1_to_affine(&wit_b.0[..]) { Ok(v) => v, Err(_) => continue };
+                                let e_old_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_old);
+                                let (_d, w_new) = VbMembershipWitness::<ark_bls12_381::G1Affine>::compute_update_after_addition(
+                                    &e_old_fr,
+                                    &e_fr,
+                                    &w_old,
+                                    &V_old,
+                                );
+                                let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
+                                let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
+                            }
+                            // Publish witness for the newly added element: W_new(e_new) = V_old
+                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&V_old).to_vec());
                             let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
+                            members.insert(e_u);
                             println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);
                             add_meta.remove(&ac.sid);
                             add_contribs.remove(&ac.sid);
