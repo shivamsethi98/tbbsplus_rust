@@ -66,22 +66,36 @@ pub async fn run_action_loop(
         println!("Choose action: [v]erify off-chain, [p]resent on-chain, [w]itness check, [e]xit (default: verify)");
         let mut line = String::new(); std::io::stdin().read_line(&mut line)?; let choice = line.trim().to_lowercase();
     if choice.is_empty() || choice == "v" || choice == "verify" {
-            // Build params and public key (mirrors issuer setup)
-            let params_bbs = SignatureParamsG1::<Bls12_381>::new::<Blake2b512>(session.cred_name.as_bytes(), onchain_mcount);
-            let mut rng_sk = StdRng::seed_from_u64(42);
-            let (secret, _shares, _poly) = secret_sharing_and_dkg::shamir_ss::deal_random_secret::<_, Fr>(&mut rng_sk, onchain_t, onchain_n)
-                .map_err(|e| anyhow::anyhow!("deal_random_secret failed: {:?}", e))?;
-            let pk = PublicKeyG2::generate_using_secret_key(&SecretKey(secret), &params_bbs);
-            let sig_for_verify = {
-                let bpath = store.base(session.sid).join("blinding.hex");
-                if let Ok(s) = fs::read_to_string(&bpath) {
-                    if let Some(stripped) = s.strip_prefix("0x") { if let Ok(bytes) = hex::decode(stripped) { if let Ok(b) = Fr::deserialize_compressed(&bytes[..]) { println!("[local] found blinding; unblinding before verification"); signature.clone().unblind(&b) } else { signature.clone() } } else { signature.clone() } }
-                    else { signature.clone() }
-                } else { signature.clone() }
-            };
-            match sig_for_verify.verify(&messages, pk, params_bbs) {
-                Ok(()) => println!("[local] aggregated signature verification: OK"),
-                Err(e) => println!("[local] aggregated signature verification FAILED: {:?}", e),
+            // Build params and issuer public key from on-chain Params
+            let params_bbs = pb.params_bbs.clone();
+            let pk_g2_b: EthBytes = params_contract
+                .method("getPkG2ByName", (session.cred_name.to_string(),))?
+                .call()
+                .await?;
+            let pk_g2_aff = eip2537_g2_to_affine(&pk_g2_b.0[..])?;
+            let pk = bbs_plus::setup::PublicKeyG2::<Bls12_381>(pk_g2_aff);
+            // Try unblinded first if blinding exists; if that fails, try as-is
+            let bpath = store.base(session.sid).join("blinding.hex");
+            let maybe_blinding = if let Ok(s) = fs::read_to_string(&bpath) {
+                if let Some(stripped) = s.strip_prefix("0x") {
+                    if let Ok(bytes) = hex::decode(stripped) {
+                        Fr::deserialize_compressed(&bytes[..]).ok()
+                    } else { None }
+                } else { None }
+            } else { None };
+            let try_unblinded_first = if let Some(b) = maybe_blinding.as_ref() {
+                println!("[local] found blinding; unblinding before verification");
+                let sig_unblinded = signature.clone().unblind(b);
+                match sig_unblinded.verify(&messages, pk.clone(), params_bbs.clone()) {
+                    Ok(()) => { println!("[local] aggregated signature verification: OK (unblinded)"); true }
+                    Err(e) => { println!("[local] unblinded verify FAILED: {:?}; retrying with blinded signature", e); false }
+                }
+            } else { false };
+            if !try_unblinded_first {
+                match signature.clone().verify(&messages, pk, params_bbs) {
+                    Ok(()) => println!("[local] aggregated signature verification: OK (as-is)"),
+                    Err(e) => println!("[local] aggregated signature verification FAILED (as-is): {:?}", e),
+                }
             }
             continue;
         } else if choice == "w" || choice == "witness" {

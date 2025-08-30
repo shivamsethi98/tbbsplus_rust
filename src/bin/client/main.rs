@@ -142,6 +142,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
             }
+            // Chain check: if Confirmed was missed locally but signature exists on-chain, pull it and persist
+            if let Some(registry) = registry_opt.as_ref() {
+                let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), U256::from(sid)).await?;
+                if abytes.0.len() == 128 {
+                    println!("[chain] aggregated signature found for sid {}; persisting locally", sid);
+                    // Persist params/messages/signature like in post-Confirmed branch
+                    let pb2 = fetch_params_bundle(&params_contract, &cred_name).await?;
+                    let onchain_mcount = pb2.mcount;
+                    let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
+                    if !messages.is_empty() { messages[0] = Fr::from(sid); }
+                    if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
+                        for (i, fr_val) in rev { if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; } }
+                    }
+                    use ark_serialize::CanonicalSerialize;
+                    let msgs_hex: Vec<String> = messages.iter().map(|f| {
+                        let mut be = Vec::new(); ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap();
+                        format!("0x{}", hex::encode(be))
+                    }).collect();
+                    store.save_messages(sid, &MessagesFile(msgs_hex))?;
+                    // Persist aggregated signature from registry
+                    let a = eip2537_g1_to_affine(&abytes.0[..])?; let e = u256_to_fr::<Fr>(&e_u); let s = u256_to_fr::<Fr>(&s_u);
+                    let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
+                    let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
+                    let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
+                    let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
+                    store.save_signature(sid, &SignatureFile { a: format!("0x{}", hex::encode(a_bytes)), e: format!("0x{}", hex::encode(e_bytes)), s: format!("0x{}", hex::encode(s_bytes)) })?;
+                    #[cfg(feature = "interactive")]
+                    {
+                        let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
+                        ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
+                    }
+                    if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
+                }
+            }
             let pb = fetch_params_bundle(&params_contract, &cred_name).await?;
             let mcount_onchain = pb.mcount; let params_bbs = pb.params_bbs.clone();
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) { revealed_vals[pos] = U256::from(sid); }
