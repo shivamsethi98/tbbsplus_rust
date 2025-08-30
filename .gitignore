@@ -2,7 +2,7 @@
 /typechain-types
 /artifacts
 /out
-/.runtime
+.runtime*
 /.venv/
 /.vscode/
 /.venv
