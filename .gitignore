@@ -9,7 +9,10 @@
 # Added by cargo
 #
 # already existing elements were commented out
-
+/test
+/tests
+/redundant_files
+/contracts_bak
 #/target
 node_modules
 /cache
