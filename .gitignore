@@ -19,3 +19,8 @@ node_modules
 /cache_hardhat
 /docs
 /redundant_files
+/scripts/cache_hardhat/
+/metrics/results/
+/metrics/**/*.ndjson
+*.env
+*.hex
