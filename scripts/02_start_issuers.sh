@@ -5,7 +5,7 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. && pwd)
 cd "$ROOT_DIR"
 
 BASE_PORT=${BASE_PORT:-9900}
-THRESHOLD=${THRESHOLD:-3}
+THRESHOLD=${THRESHOLD_ISSUER:-${THRESHOLD:-3}}
 
 # Load env produced by stage 1 if present
 if [[ -f .runtime.env ]]; then
@@ -35,7 +35,7 @@ for i in $(seq 1 $THRESHOLD); do
 		TOTAL=$TOTAL \
 		MESSAGE_COUNT=$MESSAGE_COUNT \
 	SHARES_FILE=${SHARES_FILE:-.runtime.shares.json} \
-		cargo run --features mpc --bin issuer_onchain | sed -u "s/^/[issuer-$i] /"
+		METRICS=1 cargo run --features mpc --bin issuer_onchain | sed -u "s/^/[issuer-$i] /"
 	) &
 
 done

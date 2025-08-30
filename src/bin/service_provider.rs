@@ -4,6 +4,7 @@ use ethers::providers::{Provider, Ws};
 use ethers::abi::RawLog;
 use futures::StreamExt;
 use tbbsplus_rust::orchestration::chain::clients::{VerifyClient, AccumulatorClient};
+use std::io::Write as _;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,6 +31,8 @@ async fn main() -> anyhow::Result<()> {
 
     let verify = VerifyClient::new(verify_addrs[0], client.clone())?;
     let accumulator = AccumulatorClient::new(acc_addr, client.clone())?;
+    let metrics_on = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/service_provider.ndjson".into());
 
     // Non-interactive defaults for testing: auto open and auto revoke
     let auto_open = env::var("SP_AUTO_OPEN").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
@@ -51,6 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let acc_addr_h = acc_addr;
     let ev_opened = H256::from(ethers::utils::keccak256(b"Opened(string,bytes)"));
     let ev_revoked = H256::from(ethers::utils::keccak256(b"MemberRevoked(string,uint256,bytes)"));
+    let name_topic = {
+        let name_env0 = env::var("CRED_NAME").expect("CRED_NAME");
+        H256::from(ethers::utils::keccak256(name_env0.as_bytes()))
+    };
     let mut status_stream = client.provider().subscribe_logs(&Filter::new().address(ValueOrArray::Value(acc_addr_h)).from_block(BlockNumber::Latest)).await?;
     let acc_opened_abi = accumulator.contract.abi().event("Opened")?;
 
@@ -69,21 +76,46 @@ async fn main() -> anyhow::Result<()> {
         }
         if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens (T1={}, T2={})", t1.len(), t2.len()); continue; }
         if auto_open {
-            let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
+            let name_env = env::var("CRED_NAME").expect("CRED_NAME");
             let t1b = ethers::types::Bytes::from(t1.clone());
             let t2b = ethers::types::Bytes::from(t2.clone());
             let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b))?;
+            let t0 = std::time::Instant::now();
             let pending = call.send().await?;
             let rcpt = pending.await?;
             println!("ServiceProvider(auto): requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+            if metrics_on {
+                let _ = (||{
+                    let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap());
+                    let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
+                    let gas = rcpt.as_ref().and_then(|r| r.gas_used).map(|g| g.to_string());
+                    let eff = rcpt.as_ref().and_then(|r| r.effective_gas_price).map(|p| p.to_string());
+                    let hash = rcpt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash));
+                    let blk = rcpt.as_ref().and_then(|r| r.block_number).map(|b| b.as_u64());
+                    let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
+                    let _=writeln!(f, "{}", serde_json::json!({
+                        "scenario":"sp_requestOpen",
+                        "hash": hash,
+                        "blockNumber": blk,
+                        "gasUsed": gas,
+                        "effectiveGasPrice": eff,
+                        "costWei": cost
+                    }));
+                    Ok::<(),()>(())
+                })();
+            }
             let mut notified = false;
             let start = std::time::Instant::now();
             let mut e_for_revoke: Option<U256> = None;
-            while start.elapsed().as_secs() < 10 {
+            while start.elapsed().as_secs() < 30 {
                 if let Some(lg) = status_stream.next().await {
                     if lg.address == acc_addr_h && !lg.topics.is_empty() {
-                        if lg.topics[0] == ev_opened {
+                        if lg.topics[0] == ev_opened && lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) {
                             println!("ServiceProvider(auto): Opened emitted");
+                            if metrics_on {
+                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
+                                    use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_open_e2e","ms": t0.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                            }
                             let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
                             if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
                                 let mut a_bytes: Vec<u8> = Vec::new();
@@ -92,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 if a_bytes.len() == 128 {
                                     let mut e_u = U256::zero();
-                                    for _ in 0..10 {
+                                    for _ in 0..50 {
                                         match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
                                             Ok(call) => { match call.call().await { Ok(x) => { e_u = x; }, Err(err) => { eprintln!("ServiceProvider: getEByA call error: {:?}", err); } } }
                                             Err(err) => { eprintln!("ServiceProvider: getEByA method error: {:?}", err); }
@@ -103,35 +135,69 @@ async fn main() -> anyhow::Result<()> {
                                     if e_u != U256::zero() {
                                         println!("ServiceProvider: resolved e=0x{:x} via A->e mapping", e_u);
                                         e_for_revoke = Some(e_u);
-                                        // Optional: probe witness
-                                        let mut witness_ok = false;
-                                        for _ in 0..10 {
-                                            match accumulator.contract.method::<_, ethers::types::Bytes>("getWitness", (name_env.clone(), e_u)) {
-                                                Ok(wc) => { match wc.call().await { Ok(wb) => { if wb.0.len() == 128 { witness_ok = true; break; } }, Err(err) => eprintln!("ServiceProvider: getWitness call error: {:?}", err) } }
-                                                Err(err) => eprintln!("ServiceProvider: getWitness method error: {:?}", err),
-                                            }
-                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                        }
-                                        if witness_ok { println!("ServiceProvider: witness available (len=128) for e=0x{:x}", e_u); }
-                                        else { println!("ServiceProvider: witness not yet available for e=0x{:x}", e_u); }
                                     } else {
                                         println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
                                     }
                                 }
                             }
                             notified = true; break;
+                        } else if lg.topics[0] == ev_revoked {
+                            // Ignore unrelated MemberRevoked during open E2E window
+                            continue;
                         }
-                        if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
                     }
                 } else { break; }
             }
-            if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 10s"); }
+            if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 30s"); }
             if auto_revoke {
                 if let Some(e_u) = e_for_revoke {
-                    let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env, e_u))?;
+                    let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env.clone(), e_u))?;
+                    let t0 = std::time::Instant::now();
                     let pending = call.send().await?;
                     let rcpt = pending.await?;
                     println!("ServiceProvider(auto): requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
+                    if metrics_on {
+                        let _ = (||{
+                            let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap());
+                            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
+                            let gas = rcpt.as_ref().and_then(|r| r.gas_used).map(|g| g.to_string());
+                            let eff = rcpt.as_ref().and_then(|r| r.effective_gas_price).map(|p| p.to_string());
+                            let hash = rcpt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash));
+                            let blk = rcpt.as_ref().and_then(|r| r.block_number).map(|b| b.as_u64());
+                            let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
+                            let _=writeln!(f, "{}", serde_json::json!({
+                                "scenario":"sp_requestRevokeByE",
+                                "hash": hash,
+                                "blockNumber": blk,
+                                "gasUsed": gas,
+                                "effectiveGasPrice": eff,
+                                "costWei": cost
+                            }));
+                            Ok::<(),()>(())
+                        })();
+                    }
+                    // Wait for MemberRevoked to compute revoke E2E
+                    let rev_start = std::time::Instant::now();
+                    let mut saw_rev = false;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while std::time::Instant::now() < deadline {
+                        if let Some(lg) = status_stream.next().await {
+                            if lg.address == acc_addr_h && !lg.topics.is_empty() && lg.topics[0] == ev_revoked {
+                                // Filter by name and expected e
+                                let mut e_be = [0u8; 32];
+                                e_u.to_big_endian(&mut e_be);
+                                let e_topic = H256::from(e_be);
+                                if lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) == false { continue; }
+                                if lg.topics.get(2).map(|t| *t == e_topic).unwrap_or(false) == false { continue; }
+                                println!("ServiceProvider: MemberRevoked emitted");
+                                if metrics_on {
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap(); use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_revoke_e2e","ms": rev_start.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                }
+                                saw_rev = true; break;
+                            }
+                        } else { break; }
+                    }
+                    if !saw_rev { println!("ServiceProvider: MemberRevoked not observed within 30s"); }
                 } else {
                     println!("ServiceProvider(auto): skip revoke (e not resolved)");
                 }

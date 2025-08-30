@@ -135,7 +135,8 @@ pub async fn run_action_loop(
                 } else { signature.clone() }
             };
             let (proof, c_fr, revealed_idx2) = build_pok_and_proof(&params_bbs, &sig_struct, &messages, &ybar_aff, &revealed_idx)?;
-            metrics_append(metrics, &metrics_file, serde_json::json!({"scenario":"proveCred","sid":session.sid,"ms": t0_prove.elapsed().as_millis() as u64}));
+            let prove_ms = t0_prove.elapsed().as_millis() as u64;
+            metrics_append(metrics, &metrics_file, serde_json::json!({"scenario":"off_chain_proof_gen","sid":session.sid,"ms": prove_ms}));
             let (sig_t, ctx_t, revealed_t, challenge_u256, p1_t, p2_t, enc_extras) = build_presentation_tuples(&params_bbs, &proof, &revealed_idx2, &messages, pb.mcount, &c_fr)?;
             let EncExtras { t1_b, t2enc_b, t_enc_b, resp_a3_u, resp_k_u } = enc_extras;
             let verify_addr: Address = std::env::var("VERIFY_CONTRACT").expect("VERIFY_CONTRACT").parse()?;
@@ -195,7 +196,7 @@ pub async fn run_action_loop(
                                 let cost = gas_used * eff_price;
                                 let blk = r.block_number.unwrap_or_default();
                                 metrics_append(metrics, &metrics_file, serde_json::json!({
-                                    "scenario":"verifyPresent",
+                                    "scenario":"on_chain_verify_time",
                                     "sid": session.sid,
                                     "ms": t0_send.elapsed().as_millis() as u64,
                                     "hash": format!("0x{:x}", r.transaction_hash),
@@ -204,9 +205,57 @@ pub async fn run_action_loop(
                                     "effectiveGasPrice": eff_price.to_string(),
                                     "costWei": cost.to_string()
                                 }));
+                                // Presentation E2E from proof construction start to tx mined
+                                metrics_append(metrics, &metrics_file, serde_json::json!({
+                                    "scenario":"presentation_e2e",
+                                    "sid": session.sid,
+                                    "ms": t0_prove.elapsed().as_millis() as u64
+                                }));
+                                // Off-chain verification (BBS+ PoK incl. pairing and optional enc relation; and accumulator membership PoK)
+                                let mut revealed_map = std::collections::BTreeMap::<usize, Fr>::new();
+                                for &ix in revealed_idx.iter() { revealed_map.insert(ix as usize, messages[ix as usize]); }
+                                let t0_off = std::time::Instant::now();
+                                // BBS+ PoK verify using issuer pk from Params
+                                let pk_g2_b: EthBytes = params_contract
+                                    .method("getPkG2ByName", (session.cred_name.to_string(),))?
+                                    .call()
+                                    .await?;
+                                let pk_g2_aff = eip2537_g2_to_affine(&pk_g2_b.0[..])?;
+                                let bbs_pk = bbs_plus::setup::PublicKeyG2::<Bls12_381>(pk_g2_aff);
+                                let prepared_bbs_pk = bbs_plus::setup::PreparedPublicKeyG2::<Bls12_381>::from(bbs_pk);
+                                let prepared_bbs_params = bbs_plus::setup::PreparedSignatureParamsG1::<Bls12_381>::from(params_bbs.clone());
+                                let mut bbs_ok = proof.verify(&revealed_map, &c_fr, prepared_bbs_pk, prepared_bbs_params).is_ok();
+                                // Explicit encryption relation check if present
+                                if bbs_ok {
+                                    if let (Some(_ybar), Some(_t2e), Some(enc)) = (proof.Y_bar.as_ref(), proof.T2_enc.as_ref(), proof.sc_resp_enc.as_ref()) {
+                                        bbs_ok = enc.verify(_t2e, &proof.A_prime, _ybar, &c_fr);
+                                    }
+                                }
+                                // Accumulator membership verify off-chain
+                                {
+                                    use vb_accumulator::setup::{PreparedPublicKey, PreparedSetupParams, PublicKey, SetupParams};
+                                    let acc_params = SetupParams::<Bls12_381> { P: params_bbs.g1, P_tilde: params_bbs.g2 };
+                                    let prepared_params = PreparedSetupParams::<Bls12_381>::from(acc_params);
+                                    let opener_pk_b: EthBytes = params_contract
+                                        .method("getOpenerPkG2ByName", (session.cred_name.to_string(),))?
+                                        .call()
+                                        .await?;
+                                    let opener_pk_aff = eip2537_g2_to_affine(&opener_pk_b.0[..])?;
+                                    let acc_pk = PublicKey::<Bls12_381>(opener_pk_aff);
+                                    let prepared_pk = PreparedPublicKey::<Bls12_381>::from(acc_pk);
+                                    let acc_ok = proof_acc.verify(&delta_aff, &c_acc, prepared_pk, prepared_params).is_ok();
+                                    let off_ms = t0_off.elapsed().as_millis() as u64;
+                                    metrics_append(metrics, &metrics_file, serde_json::json!({
+                                        "scenario":"off-chain_verify_time",
+                                        "sid": session.sid,
+                                        "ms": off_ms,
+                                        "bbs_ok": bbs_ok,
+                                        "acc_ok": acc_ok
+                                    }));
+                                }
                             } else {
                                 metrics_append(metrics, &metrics_file, serde_json::json!({
-                                    "scenario":"verifyPresent",
+                                    "scenario":"on_chain_verify_time",
                                     "sid": session.sid,
                                     "ms": t0_send.elapsed().as_millis() as u64,
                                     "hash": rcpt_opt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash))

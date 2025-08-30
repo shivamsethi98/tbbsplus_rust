@@ -23,6 +23,9 @@ use futures::StreamExt;
 use tracing::{info, warn, error, instrument};
 // use secret_sharing_and_dkg::shamir_ss::deal_random_secret; // now loaded from TTP shares file
 use tokio::time::{sleep, Duration};
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
+use serde_json::json;
 
 use oblivious_transfer_protocols::ot_based_multiplication::dkls18_mul_2p::MultiplicationOTEParams;
 use test_utils::ot::do_pairwise_base_ot;
@@ -91,6 +94,21 @@ async fn main() -> anyhow::Result<()> {
     let params_addr: Address = env::var("PARAMS_CONTRACT").expect("PARAMS_CONTRACT").parse()?;
     let params = Params::new(params_addr, client.clone());
     let params_client = ParamsClient::new(params_addr, client.clone())?;
+
+    // Metrics config
+    let metrics = env::var("METRICS").map(|v| v=="1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = env::var("METRICS_FILE").unwrap_or_else(|_| format!("metrics/results/issuer_{}.ndjson", participant_id));
+
+    fn metrics_append(enabled: bool, path: &str, value: serde_json::Value) {
+        if !enabled { return; }
+        let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+            let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+            let s = serde_json::to_string(&value)?;
+            writeln!(f, "{}", s)?;
+            Ok(())
+        })();
+    }
 
     // Top up balance on local anvil, if needed
     if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
@@ -591,6 +609,21 @@ async fn main() -> anyhow::Result<()> {
             Ok(pend) => {
                 let rcpt = pend.await?.ok_or_else(|| anyhow::anyhow!("no receipt"))?;
                 info!(pid=%participant_id, sid, tx=?rcpt.transaction_hash, "submitShare ok");
+                // Metrics: record gas for this issuer submitShare
+                let gas_used = rcpt.gas_used.unwrap_or_default();
+                let eff_price = rcpt.effective_gas_price.unwrap_or_default();
+                let cost = gas_used * eff_price;
+                let blk = rcpt.block_number.unwrap_or_default();
+                metrics_append(metrics, &metrics_file, json!({
+                    "scenario":"submitShare",
+                    "sid": sid,
+                    "idx": participant_id,
+                    "hash": format!("0x{:x}", rcpt.transaction_hash),
+                    "blockNumber": blk.as_u64(),
+                    "gasUsed": gas_used.to_string(),
+                    "effectiveGasPrice": eff_price.to_string(),
+                    "costWei": cost.to_string()
+                }));
                 sessions.insert(sid, SidState::ShareSubmitted);
             }
             Err(e) => {

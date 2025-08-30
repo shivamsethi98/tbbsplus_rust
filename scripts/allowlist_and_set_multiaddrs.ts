@@ -4,12 +4,13 @@ import { ethers } from "hardhat";
   const paramsAddr = process.env.PARAMS_CONTRACT!;
   const Params = await ethers.getContractFactory("Params");
   const params = Params.attach(paramsAddr).connect(owner) as any;
-  const t = Number(process.env.THRESHOLD || 3);
+  const tIss = Number(process.env.THRESHOLD_ISSUER || process.env.ISSUER_THRESHOLD || process.env.THRESHOLD || 3);
+  const tOpn = Number(process.env.THRESHOLD_OPENER || process.env.OPENER_THRESHOLD || process.env.THRESHOLD || 3);
   const basePort = Number(process.env.BASE_PORT || 9900);
   const openersBasePort = Number(process.env.OPENERS_BASE_PORT || process.env.OPENERS_PORT || 10900);
   const MNEMONIC = process.env.MNEMONIC || "digital humor toss grant absorb fold dry dynamic crew wagon cute hint";
 
-  for (let i = 1; i <= t; i++) {
+  for (let i = 1; i <= tIss; i++) {
     const path = `m/44'/60'/0'/0/${i}`;
     const wallet = (ethers as any).HDNodeWallet
       ? (ethers as any).HDNodeWallet.fromPhrase(MNEMONIC, undefined, path)
@@ -22,7 +23,7 @@ import { ethers } from "hardhat";
   }
 
   // Also set opener roster and multiaddrs in Params for threshold openers
-  for (let i = 1; i <= t; i++) {
+  for (let i = 1; i <= tOpn; i++) {
     const path = `m/44'/60'/0'/0/${100 + i}`; // use different derivation for openers than issuers
     const wallet = (ethers as any).HDNodeWallet
       ? (ethers as any).HDNodeWallet.fromPhrase(MNEMONIC, undefined, path)

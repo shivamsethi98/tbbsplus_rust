@@ -46,6 +46,7 @@ clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 short_group_sig = { path = "crypto/short_group_sig" }
+ethereum-types = "0.15.1"
 
 [features]
 mpc = ["libp2p"]
@@ -94,3 +95,11 @@ required-features = ["mpc"]
 name = "opener_aggregator"
 path = "src/bin/opener_aggregator.rs"
 required-features = ["mpc"]
+
+[[bin]]
+name = "issuance_metrics"
+path = "metrics/scenarios/issuance_sum.rs"
+
+[[bin]]
+name = "presentation_metrics"
+path = "metrics/scenarios/presentation_metrics.rs"

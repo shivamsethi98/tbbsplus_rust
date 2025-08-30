@@ -103,6 +103,59 @@ pub fn build_presentation_tuples(
 }
 
 
+// Off-chain verifiers for presentation components using library functions (avoid ad-hoc logic)
+pub fn verify_bbs_pok_offchain(
+    params_bbs: &SignatureParamsG1<Bls12_381>,
+    proof: &PokProof<Bls12_381>,
+    revealed: &std::collections::BTreeMap<usize, Fr>,
+    challenge: &Fr,
+    pk_g2: &bbs_plus::prelude::PublicKeyG2<Bls12_381>,
+) -> anyhow::Result<()> {
+    use bbs_plus::prelude::{PreparedPublicKeyG2, PreparedSignatureParamsG1};
+    let prepared_pk = PreparedPublicKeyG2::from(pk_g2.clone());
+    let prepared_params = PreparedSignatureParamsG1::from(params_bbs.clone());
+    // Base verify covers 2 Schnorr relations + pairings
+    proof
+        .verify(revealed, challenge, prepared_pk, prepared_params)
+        .map_err(|e| anyhow::anyhow!("bbs+ pok verify failed: {:?}", e))?;
+    // Explicit encryption relation (3rd Schnorr) when present
+    if let (Some(ybar), Some(t2e), Some(enc)) = (
+        proof.Y_bar.as_ref(),
+        proof.T2_enc.as_ref(),
+        proof.sc_resp_enc.as_ref(),
+    ) {
+        if !enc.verify(t2e, &proof.A_prime, ybar, challenge) {
+            anyhow::bail!("bbs+ encryption relation verification failed");
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_accum_membership_pok_offchain(
+    delta: &ark_bls12_381::G1Affine,
+    e_scalar: Fr,
+    witness: &vb_accumulator::prelude::MembershipWitness<ark_bls12_381::G1Affine>,
+    challenge: &Fr,
+    pk: &vb_accumulator::setup::PublicKey<Bls12_381>,
+    params: &vb_accumulator::setup::SetupParams<Bls12_381>,
+) -> anyhow::Result<()> {
+    use vb_accumulator::proofs_cdh::MembershipProofProtocol;
+    use vb_accumulator::setup::{PreparedPublicKey, PreparedSetupParams, PublicKey, SetupParams};
+    use ark_std::rand::{rngs::StdRng, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(42);
+    let prot = MembershipProofProtocol::<Bls12_381>::init(&mut rng, e_scalar, None, delta, witness);
+    let mut chal_bytes = Vec::new();
+    prot.challenge_contribution(delta, &mut chal_bytes).map_err(|e| anyhow::anyhow!("acc pok chall contrib failed: {:?}", e))?;
+    // We accept externally supplied challenge `challenge`
+    let proof = prot.gen_proof(challenge).map_err(|e| anyhow::anyhow!("acc pok gen_proof failed: {:?}", e))?;
+    let prepared_pk: PreparedPublicKey<Bls12_381> = PreparedPublicKey::from(pk.clone());
+    let prepared_params: PreparedSetupParams<Bls12_381> = PreparedSetupParams::from(params.clone());
+    proof
+        .verify(delta, challenge, prepared_pk, prepared_params)
+        .map_err(|e| anyhow::anyhow!("accum membership pok verify failed: {:?}", e))
+}
+
+
 pub fn decode_commitment_pok_for_onchain(
     proof_bytes: &[u8]
 ) -> anyhow::Result<(Vec<u32>, EthBytes, U256, Vec<U256>)> {

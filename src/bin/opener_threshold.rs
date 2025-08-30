@@ -278,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
         use std::collections::{BTreeMap, BTreeSet};
         let mut partials: BTreeMap<u64, Vec<(u16, Vec<u8>, Vec<u8>)>> = BTreeMap::new(); // sid -> vec[(idx, tbar, proof)]
         let mut announces: BTreeMap<u64, (Vec<u8>, Vec<u8>)> = BTreeMap::new(); // sid -> (t1,t2)
-        let threshold: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
+        let threshold: u16 = env::var("THRESHOLD_OPENER").or_else(|_| env::var("THRESHOLD")).unwrap_or_else(|_| "3".into()).parse()?;
 
         loop {
             tokio::select! {
@@ -445,8 +445,8 @@ if let Ok(ra) = serde_json::from_slice::<RevokeAnnounceMsg>(&bytes) {
                     if let Some(pid_str) = &ra.aggregator_peer_id { if let Ok(pid) = pid_str.parse() { let _ = handle.register_peer(ra.aggregator_idx, pid).await; println!("[opener-{}] registered aggregator peer_id for revoke sid={}", participant_id, ra.sid); } }
                     println!("[opener-{}] revoke-announce: sid={} e={}", participant_id, ra.sid, ra.e_hex);
                     // Deterministic base OT shared across openers
-                    let threshold: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse().unwrap_or(3);
-                    let total: u16 = env::var("TOTAL").unwrap_or_else(|_| "5".into()).parse().unwrap_or(5);
+                    let threshold: u16 = env::var("THRESHOLD_OPENER").or_else(|_| env::var("THRESHOLD")).unwrap_or_else(|_| "3".into()).parse().unwrap_or(3);
+                    let total: u16 = env::var("TOTAL_OPENER").or_else(|_| env::var("TOTAL")).unwrap_or_else(|_| "5".into()).parse().unwrap_or(5);
                     let ote = MultiplicationOTEParams::<KAPPA, STATISTICAL_SECURITY_PARAMETER> {};
                     let seed = seeds::base_ot_seed(&cred_name, total, KAPPA as usize, STATISTICAL_SECURITY_PARAMETER as usize);
                     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(seed);

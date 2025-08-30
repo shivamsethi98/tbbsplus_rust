@@ -17,7 +17,7 @@ if [[ -f .runtime.env ]]; then
 fi
 
 # Validate required env
-required=(ETH_WS CHAIN_ID PARAMS_CONTRACT ACC_CONTRACT REGISTRY_CONTRACT CRED_NAME THRESHOLD TOTAL)
+required=(ETH_WS CHAIN_ID PARAMS_CONTRACT ACC_CONTRACT REGISTRY_CONTRACT CRED_NAME THRESHOLD_OPENER TOTAL)
 for v in "${required[@]}"; do
   if [[ -z "${!v:-}" ]]; then
     echo "Missing required env: $v (run scripts/01_ttp_setup.sh first)" >&2
@@ -37,7 +37,7 @@ PARAMS_CONTRACT=$PARAMS_CONTRACT \
 ACC_CONTRACT=$ACC_CONTRACT \
 REGISTRY_CONTRACT=$REGISTRY_CONTRACT \
 CRED_NAME=$CRED_NAME \
-THRESHOLD=$THRESHOLD \
+THRESHOLD=${THRESHOLD_OPENER:-${THRESHOLD:-3}} \
 TOTAL=$TOTAL \
 cargo run --features mpc --bin opener_aggregator | sed -u "s/^/[opener-agg] /"
 

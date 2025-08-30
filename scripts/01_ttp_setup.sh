@@ -6,7 +6,9 @@ cd "$ROOT_DIR"
 
 ANVIL_PORT=${ANVIL_PORT:-8545}
 BASE_PORT=${BASE_PORT:-9900}
-THRESHOLD=${THRESHOLD:-4}
+
+THRESHOLD_ISSUER=${THRESHOLD_ISSUER:-${ISSUER_THRESHOLD:-4}}
+THRESHOLD_OPENER=${THRESHOLD_OPENER:-${OPENER_THRESHOLD:-3}}
 TOTAL=${TOTAL:-5}
 MESSAGE_COUNT=${MESSAGE_COUNT:-5}
 CRED_NAME=${CRED_NAME:-ANON_CRED}
@@ -63,7 +65,7 @@ npx hardhat clean >/dev/null 2>&1 || true
 npx hardhat compile --force
 
 echo "[03] Deploy core"
-DEP_ENV=$(CRED_NAME="$CRED_NAME" MESSAGE_COUNT="$MESSAGE_COUNT" THRESHOLD="$THRESHOLD" TOTAL="$TOTAL" npx hardhat run --network localhost scripts/deploy_local.ts | sed -n 's/^export /export /p')
+DEP_ENV=$(CRED_NAME="$CRED_NAME" MESSAGE_COUNT="$MESSAGE_COUNT" THRESHOLD="$THRESHOLD_ISSUER" TOTAL="$TOTAL" npx hardhat run --network localhost scripts/deploy_local.ts | sed -n 's/^export /export /p')
 eval "$DEP_ENV"
 export ETH_WS=ws://127.0.0.1:${ANVIL_PORT}
 export CHAIN_ID=31337
@@ -77,7 +79,8 @@ PARAMS_CONTRACT=$PARAMS_CONTRACT
 ACC_CONTRACT=$ACC_CONTRACT
 CRED_NAME=$CRED_NAME
 MESSAGE_COUNT=$MESSAGE_COUNT
-THRESHOLD=$THRESHOLD
+THRESHOLD_ISSUER=$THRESHOLD_ISSUER
+THRESHOLD_OPENER=$THRESHOLD_OPENER
 TOTAL=$TOTAL
 BASE_PORT=$BASE_PORT
 SHARES_FILE=$SHARES_FILE
@@ -93,7 +96,7 @@ eval "$VERIFY_ENV"
 } >> .runtime.env
 
 echo "[05] Allowlist issuers & set multiaddrs in Params"
-PARAMS_CONTRACT="$PARAMS_CONTRACT" THRESHOLD="$THRESHOLD" BASE_PORT="$BASE_PORT" npx hardhat run --network localhost scripts/allowlist_and_set_multiaddrs.ts
+PARAMS_CONTRACT="$PARAMS_CONTRACT" THRESHOLD_ISSUER="$THRESHOLD_ISSUER" THRESHOLD_OPENER="$THRESHOLD_OPENER" BASE_PORT="$BASE_PORT" npx hardhat run --network localhost scripts/allowlist_and_set_multiaddrs.ts
 
 echo "[06] Run TTP (sets g1/h0/H, g2base, pkG2, and writes shares)"
 # Use Anvil's first default private key (0xf39f...)

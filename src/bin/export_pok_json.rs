@@ -103,7 +103,7 @@ fn main() -> Result<()> {
     let params = SignatureParamsG1::<E>::new::<Blake2b512>(cred_name.as_bytes(), m as u32);
     let msgs: Vec<Fr> = (0..m).map(|i| Fr::from((i as u64) + 5)).collect();
     // Secret aligned with TTP (seeded, threshold/n)
-    let t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse().unwrap_or(3);
+    let t: u16 = env::var("THRESHOLD_ISSUER").expect("THRESHOLD_ISSUER required").parse().unwrap_or(3);
     let n: u16 = env::var("TOTAL").unwrap_or_else(|_| "4".into()).parse().unwrap_or(4);
     let mut rng_sk = StdRng::seed_from_u64(42);
     let (secret, _shares, _poly) = deal_random_secret::<_, Fr>(&mut rng_sk, t, n)

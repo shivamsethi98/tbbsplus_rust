@@ -6,8 +6,8 @@ cd "$ROOT_DIR"
 
 # Use a separate base port for openers to avoid clashing with issuers (issuers use 9900 by default)
 OPENERS_BASE_PORT=${OPENERS_BASE_PORT:-10900}
-# Number of opener participants to start; default to THRESHOLD
-OPENERS_COUNT=${OPENERS_COUNT:-${THRESHOLD:-4}}
+# Number of opener participants to start; default to THRESHOLD_OPENER
+OPENERS_COUNT=${OPENERS_COUNT:-${THRESHOLD_OPENER:-${THRESHOLD:-4}}}
 
 # Load env produced by 01_ttp_setup.sh if present
 if [[ -f .runtime.env ]]; then
@@ -17,7 +17,7 @@ if [[ -f .runtime.env ]]; then
 fi
 
 # Validate required env
-required=(ETH_WS CHAIN_ID PARAMS_CONTRACT ACC_CONTRACT CRED_NAME THRESHOLD TOTAL)
+required=(ETH_WS CHAIN_ID PARAMS_CONTRACT ACC_CONTRACT CRED_NAME THRESHOLD_OPENER TOTAL)
 for v in "${required[@]}"; do
   if [[ -z "${!v:-}" ]]; then
     echo "Missing required env: $v (run scripts/01_ttp_setup.sh first)" >&2
@@ -39,7 +39,7 @@ for i in $(seq 1 "$OPENERS_COUNT"); do
     PARAMS_CONTRACT=$PARAMS_CONTRACT \
     ACC_CONTRACT=$ACC_CONTRACT \
     CRED_NAME=$CRED_NAME \
-    THRESHOLD=${OPENER_COUNT:-${THRESHOLD:-3}} \
+    THRESHOLD=${OPENER_COUNT:-${THRESHOLD_OPENER:-${THRESHOLD:-3}}} \
     TOTAL=${OPENER_COUNT:-${TOTAL:-3}} \
     AGG_PID=${AGG_PID:-99} \
     AGGREGATOR=0 \

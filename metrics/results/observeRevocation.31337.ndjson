@@ -1,4 +1,0 @@
-{"scenario":"observeRevocation","name":"ANON_CRED","e":"0","chainId":"31337","txHash":"0xff45965d54f824575c3ec0ba9bf62707c12963da5818d7c0fa66112b4aaf5748","blockNumber":58,"gasUsed":"82641","gasPrice":null,"costWei":null,"ts":1756374306293}
-{"scenario":"observeRevocation","name":"ANON_CRED","e":"0","chainId":"31337","txHash":"0xaa485a6840964d35b7da10d20be4eb945ae76d4c7cbef0810e34ce90f9f787e6","blockNumber":79,"gasUsed":"82665","gasPrice":null,"costWei":null,"ts":1756375377772}
-{"scenario":"observeRevocation","name":"ANON_CRED","e":"0","chainId":"31337","txHash":"0xb679b8c144dda0960b51a0742068c2260b6490c1ba5b4a0ca5db30224e449675","blockNumber":49,"gasUsed":"82641","gasPrice":null,"costWei":null,"ts":1756375699311}
-{"scenario":"observeRevocation","name":"ANON_CRED","e":"0","chainId":"31337","txHash":"0xfe92c60f7a790b056c8a5ec96c2c18db10750c44a5ab4a1c9697679308b47165","blockNumber":58,"gasUsed":"82641","gasPrice":null,"costWei":null,"ts":1756376326565}

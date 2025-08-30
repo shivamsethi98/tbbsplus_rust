@@ -225,13 +225,17 @@ async fn main() -> anyhow::Result<()> {
     let mut announces: BTreeMap<u64, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
     let mut del_shares: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
     let mut e_by_sid: BTreeMap<u64, U256> = BTreeMap::new();
-    let threshold: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
+    // Use THRESHOLD_OPENER for scaling studies;
+    let threshold: u16 = env::var("THRESHOLD_OPENER")
+        .unwrap_or_else(|_| "3".into())
+        .parse()?;
 
     // Track addition round metadata and contributions per sid
     use std::collections::BTreeMap as Map;
     let mut add_meta: Map<u64, (Vec<u16>, Vec<u8>, U256, u64)> = Map::new(); // sid -> (subset, V128, e, seq)
     let mut add_contribs: Map<u64, Vec<(u16, Vec<u8>)>> = Map::new(); // sid -> vec[(idx, contrib)]
     let mut add_seen: Map<u64, std::collections::BTreeSet<u16>> = Map::new(); // sid -> set of idx received
+    let mut add_start: Map<u64, std::time::Instant> = Map::new(); // sid -> start time at Confirmed
     let mut members: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // all added e values
     let mut revoked_set: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // revoked e values
 
@@ -273,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
                     let sid_topic = lg.topics.get(2).cloned().unwrap_or_default();
                     let sid_u = U256::from_big_endian(sid_topic.as_bytes());
                     println!("[agg] Confirmed event for sid={}", sid_u);
+                    let t0_reg = std::time::Instant::now();
                     let (a_bytes, e_u, _s_u, _status): (ethers::types::Bytes, U256, U256, u8) = registry
                         .method("getSignature", (cred_name.clone(), sid_u))?
                         .call().await
@@ -296,6 +301,7 @@ let msg = AccAddAnnounceMsg { sid: sid_u.as_u64(), name: cred_name.clone(), aggr
                         let payload = serde_json::to_vec(&msg)?;
                         handle.broadcast("acc-add-announce", payload).await?;
 add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
+add_start.insert(sid_u.as_u64(), t0_reg);
                         println!("[agg] addition round announced for sid={} subset={:?}", sid_u, subset);
                     } else {
                         println!("[agg] WARN: Confirmed but missing/invalid (A,e) for sid={}", sid_u);
@@ -380,10 +386,29 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 let t2 = match eip2537_g1_to_affine(&t2b[..]) { Ok(v) => v, Err(_) => continue };
                                 let a = (t2.into_group() + (-tbar_agg).into_group()).into_affine();
                                 let a_bytes = g1_to_eip2537_bytes(&a).to_vec();
-                                let _ = accumulator.method::<_, ()>("publishOpenResult", (cred_name.clone(), ethers::types::Bytes::from(a_bytes.clone())))?.send().await?.await?;
+                                let rcpt = accumulator.method::<_, ()>("publishOpenResult", (cred_name.clone(), ethers::types::Bytes::from(a_bytes.clone())))?.send().await?.await?;
                                 if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
-                                    let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
-                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"open_reconstruct","sid": msg.sid, "ms": t0_recon.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                    if let Some(r) = rcpt.as_ref() {
+                                        let gas_used = r.gas_used.unwrap_or_default();
+                                        let eff_price = r.effective_gas_price.unwrap_or_default();
+                                        let cost = gas_used * eff_price;
+                                        let blk = r.block_number.unwrap_or_default();
+                                        let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                        let _ = (||{
+                                            let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap());
+                                            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap();
+                                            let _=writeln!(f, "{}", serde_json::json!({
+                                                "scenario":"agg_publishOpenResult",
+                                                "sid": msg.sid,
+                                                "hash": format!("0x{:x}", r.transaction_hash),
+                                                "blockNumber": blk.as_u64(),
+                                                "gasUsed": gas_used.to_string(),
+                                                "effectiveGasPrice": eff_price.to_string(),
+                                                "costWei": cost.to_string()
+                                            }));
+                                            Ok::<(),()>(())
+                                        })();
+                                    }
                                 }
                                 // resolve e
                                 let mut e_u = U256::zero();
@@ -414,10 +439,10 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                             let new_delta_aff = AccSigShare::aggregate(shares);
                             let new_delta_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&new_delta_aff).to_vec());
                             if let Some(e_u) = e_by_sid.get(&v.sid).cloned() {
-                                let _ = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b.clone()))?.send().await?.await?;
+                                let rcpt = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b.clone()))?.send().await?.await?;
                                 println!("[agg] deleteMember executed for sid={} e=0x{:x}", v.sid, e_u);
                                 // After removal, update witnesses for remaining members using library helper (public update after single removal)
-                                let V_new = new_delta_aff;
+                                let v_new_anchor = new_delta_aff;
                                 let e_removed_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
                                 let to_update: Vec<U256> = members.iter().cloned().collect();
                                 for e_old in to_update.into_iter() {
@@ -431,7 +456,7 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                         &e_old_fr,
                                         &e_removed_fr,
                                         &w_old,
-                                        &V_new,
+                                        &v_new_anchor,
                                     ) {
                                         let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
                                         let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
@@ -441,8 +466,27 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 revoked_set.insert(e_u);
                                 members.remove(&e_u);
                                 if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
-                                    let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
-                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_delete_aggregate","sid": v.sid, "ms": t0_agg.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                    if let Some(r) = rcpt.as_ref() {
+                                        let gas_used = r.gas_used.unwrap_or_default();
+                                        let eff_price = r.effective_gas_price.unwrap_or_default();
+                                        let cost = gas_used * eff_price;
+                                        let blk = r.block_number.unwrap_or_default();
+                                        let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                        let _ = (||{
+                                            let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap());
+                                            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap();
+                                            let _=writeln!(f, "{}", serde_json::json!({
+                                                "scenario":"agg_deleteMember",
+                                                "sid": v.sid,
+                                                "hash": format!("0x{:x}", r.transaction_hash),
+                                                "blockNumber": blk.as_u64(),
+                                                "gasUsed": gas_used.to_string(),
+                                                "effectiveGasPrice": eff_price.to_string(),
+                                                "costWei": cost.to_string()
+                                            }));
+                                            Ok::<(),()>(())
+                                        })();
+                                    }
                                 }
                             } else {
                                 println!("[agg] deleteMember: e missing for sid={}", v.sid);
@@ -463,7 +507,7 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                             let ready = subset.iter().all(|i| seen.contains(i));
                             if !ready { continue; }
                             // Prepare V and constants
-                            let V = match eip2537_g1_to_affine(&v128[..]) { Ok(v) => v, Err(_) => { println!("[agg] invalid V bytes"); continue; } };
+                            let v_anchor = match eip2537_g1_to_affine(&v128[..]) { Ok(v) => v, Err(_) => { println!("[agg] invalid V bytes"); continue; } };
                             let e_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
                             // Verify contributions for exactly the designated subset and sum
                             let t0_verify = Instant::now();
@@ -481,20 +525,20 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 let y_lam = (y_i.into_group().mul_bigint(lam.into_bigint())).into_affine();
                                 // Pairing check: e(C_i, g2) == e(V, Y_i^lambda)
                                 let lhs = Bls12_381::pairing(contrib, g2);
-                                let rhs = Bls12_381::pairing(V, y_lam);
+                                let rhs = Bls12_381::pairing(v_anchor, y_lam);
                                 if lhs != rhs { println!("[agg] pairing check failed for idx {}", idx); ok_subset = false; break; }
                                 sum_c += contrib.into_group();
                             }
                             if !ok_subset { continue; }
                             // Compute V' = sum_c + e*V (keep V_old for witness updates)
-                            let V_old = V;
-                            let v_e = V_old.into_group().mul_bigint(e_fr.into_bigint());
+                            let v_old_anchor = v_anchor;
+                            let v_e = v_old_anchor.into_group().mul_bigint(e_fr.into_bigint());
                             let v_new = (sum_c + v_e).into_affine();
                             // vb_accumulator: verify membership of e in new Delta with witness W = old V
                             let ok = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::verify_membership_given_accumulated::<Bls12_381>(
                                 &v_new,
                                 &e_fr,
-                                &vb_accumulator::witness::MembershipWitness::<ark_bls12_381::G1Affine>(V),
+                                &vb_accumulator::witness::MembershipWitness::<ark_bls12_381::G1Affine>(v_old_anchor),
                                 &vb_pk,
                                 &vb_params,
                             );
@@ -510,8 +554,12 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                 let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
                                 let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_add_verify_sum","sid": ac.sid, "ms": t0_verify.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
                             }
+                            // Metrics: start acc_register_info_e2e and combine gas of setDelta + publishWitness
+                            let metrics = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
+                            let mut gas_total = U256::zero();
                             let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
-                            let _ = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
+                            let rcpt_delta = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
+                            if let Some(r) = rcpt_delta.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
                             // Update witnesses for all existing members using library helper (public update after single addition)
                             let mut to_update: Vec<U256> = members.iter().cloned().collect();
                             for e_old in to_update.into_iter() {
@@ -524,14 +572,21 @@ add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
                                     &e_old_fr,
                                     &e_fr,
                                     &w_old,
-                                    &V_old,
+                                    &v_old_anchor,
                                 );
                                 let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
-                                let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
+                                let rcpt = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
+                                if let Some(r) = rcpt.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
                             }
                             // Publish witness for the newly added element: W_new(e_new) = V_old
-                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&V_old).to_vec());
-                            let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
+                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_old_anchor).to_vec());
+                            let rcpt = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
+                            if let Some(r) = rcpt.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
+                            if metrics {
+                                let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                let ms: u64 = add_start.remove(&ac.sid).map(|t0| t0.elapsed().as_millis() as u64).unwrap_or(0);
+                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_register_info_e2e","sid": ac.sid, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                            }
                             members.insert(e_u);
                             println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);
                             add_meta.remove(&ac.sid);

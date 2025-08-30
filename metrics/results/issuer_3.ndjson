@@ -1,0 +1,10 @@
+{"blockNumber":29,"costWei":"456994184151232","effectiveGasPrice":"1027396504","gasUsed":"444808","hash":"0x7541d03a9c8c5ffbe8b6b8b9d937f0e38e19166353a4d0c727789bede4ea72e7","idx":3,"scenario":"submitShare","sid":1}
+{"blockNumber":41,"costWei":"447357313731196","effectiveGasPrice":"1005758401","gasUsed":"444796","hash":"0x456315b901af127d7a091eccdf72c970f30a8be0d7a6e2262f3135a68b886ae4","idx":3,"scenario":"submitShare","sid":2}
+{"blockNumber":53,"costWei":"445345920548256","effectiveGasPrice":"1001209332","gasUsed":"444808","hash":"0xe88442b827b95126ee56e300744befe1f075e1188e71a90622da53bdfcf44dd9","idx":3,"scenario":"submitShare","sid":3}
+{"blockNumber":67,"costWei":"100782695337506","effectiveGasPrice":"1000195462","gasUsed":"100763","hash":"0x4ed700afd84ffed211d41c42ca5e877d099a266da1934ac7928889aadd1ea02f","idx":3,"scenario":"submitShare","sid":4}
+{"blockNumber":79,"costWei":"100791137608711","effectiveGasPrice":"1000041053","gasUsed":"100787","hash":"0xb464791efcdd2c5dfab332b29bc64a445987cd0ac388248cddb55e50ba649663","idx":3,"scenario":"submitShare","sid":5}
+{"blockNumber":89,"costWei":"444824984208100","effectiveGasPrice":"1000011205","gasUsed":"444820","hash":"0x0262910a35ca9bc730100f5efaf3d3b1c7fd8f9b725431de567437ed42dce658","idx":3,"scenario":"submitShare","sid":6}
+{"blockNumber":101,"costWei":"444821048440740","effectiveGasPrice":"1000002357","gasUsed":"444820","hash":"0x644b39b422be74b06ca5c89bcc1844ee8532f8faa9f59dd055d61249b25689a4","idx":3,"scenario":"submitShare","sid":7}
+{"blockNumber":115,"costWei":"100787038802995","effectiveGasPrice":"1000000385","gasUsed":"100787","hash":"0x6a6e3e181e5d1a693df919df3bab7c3a9c1eef95b87f330a121d125c66ac3f7b","idx":3,"scenario":"submitShare","sid":8}
+{"blockNumber":126,"costWei":"100787009574765","effectiveGasPrice":"1000000095","gasUsed":"100787","hash":"0x6f0d368fd8e24aaa0e9fbe5b0ad28ab1ddbec792bd87906e777fa87db1e9508b","idx":3,"scenario":"submitShare","sid":9}
+{"blockNumber":139,"costWei":"100763002116023","effectiveGasPrice":"1000000021","gasUsed":"100763","hash":"0xc330580730d23b529d0d86852c0fd6a14cf46d68aa75bfff1af728e1d8853fd8","idx":3,"scenario":"submitShare","sid":10}

@@ -11,8 +11,8 @@ if [[ -f .runtime.env ]]; then
 	set +a
 fi
 
-if [[ -z "${ETH_WS:-}" || -z "${CHAIN_ID:-}" || -z "${REQ_CONTRACT:-}" || -z "${REGISTRY_CONTRACT:-}" || -z "${PARAMS_CONTRACT:-}" || -z "${CRED_NAME:-}" || -z "${MESSAGE_COUNT:-}" || -z "${THRESHOLD:-}" ]]; then
-	echo "Missing required env (ETH_WS, CHAIN_ID, REQ_CONTRACT, REGISTRY_CONTRACT, PARAMS_CONTRACT, CRED_NAME, MESSAGE_COUNT, THRESHOLD). Ensure 01_ttp_setup.sh was run in same shell." >&2
+if [[ -z "${ETH_WS:-}" || -z "${CHAIN_ID:-}" || -z "${REQ_CONTRACT:-}" || -z "${REGISTRY_CONTRACT:-}" || -z "${PARAMS_CONTRACT:-}" || -z "${CRED_NAME:-}" || -z "${MESSAGE_COUNT:-}" ]]; then
+	echo "Missing required env (ETH_WS, CHAIN_ID, REQ_CONTRACT, REGISTRY_CONTRACT, PARAMS_CONTRACT, CRED_NAME, MESSAGE_COUNT). Ensure 01_ttp_setup.sh was run in same shell." >&2
 	exit 1
 fi
 
@@ -24,5 +24,4 @@ REGISTRY_CONTRACT=$REGISTRY_CONTRACT \
 PARAMS_CONTRACT=$PARAMS_CONTRACT \
 CRED_NAME=$CRED_NAME \
 MESSAGE_COUNT=$MESSAGE_COUNT \
-THRESHOLD=$THRESHOLD \
-cargo run --bin client --features mpc,interactive
+METRICS=1 cargo run --bin client --features mpc,interactive

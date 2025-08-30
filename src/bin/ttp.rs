@@ -40,7 +40,17 @@ async fn main() -> anyhow::Result<()> {
         .parse::<LocalWallet>()?
         .with_chain_id(chain_id);
     let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-    let t: u16 = env::var("THRESHOLD").unwrap_or_else(|_| "3".into()).parse()?;
+    // Separate thresholds for issuers vs openers; fallback to legacy THRESHOLD
+    let t_issuer: u16 = env::var("THRESHOLD_ISSUER")
+        .or_else(|_| env::var("ISSUER_THRESHOLD"))
+        .or_else(|_| env::var("THRESHOLD"))
+        .unwrap_or_else(|_| "3".into())
+        .parse()?;
+    let t_opener: u16 = env::var("THRESHOLD_OPENER")
+        .or_else(|_| env::var("OPENER_THRESHOLD"))
+        .or_else(|_| env::var("THRESHOLD"))
+        .unwrap_or_else(|_| "3".into())
+        .parse()?;
     let n: u16 = env::var("TOTAL").unwrap_or_else(|_| "4".into()).parse()?;
     let mcount: u32 = env::var("MESSAGE_COUNT").unwrap_or_else(|_| "5".into()).parse()?;
 
@@ -76,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Generate threshold keys
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(42);
-    let (secret, shares, _poly) = deal_random_secret(&mut rng, t, n)
+    let (secret, shares, _poly) = deal_random_secret(&mut rng, t_issuer, n)
         .map_err(|e| anyhow::anyhow!("deal_random_secret: {:?}", e))?;
     let shares: Vec<Fr> = shares.0.into_iter().map(|s| s.share).collect();
 
@@ -118,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Opener accumulator secret: Shamir shares (t-of-n) and commitments ---
     // Generate a fresh secret alpha for openers (per-credential), deal t-of-n shares among openers
-    let (alpha, opener_shares, _poly) = deal_random_secret::<_, Fr>(&mut rng, t, n)
+    let (alpha, opener_shares, _poly) = deal_random_secret::<_, Fr>(&mut rng, t_opener, n)
         .map_err(|e| anyhow::anyhow!("deal_random_secret (openers): {:?}", e))?;
     use ark_ec::CurveGroup as _;
     // Ybar = g1 * alpha (used by encryption/opening relation)
@@ -184,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
         .setup_all(
             cred_name.clone(),
             mcount.into(),
-            t.into(),
+            t_issuer.into(),
             n.into(),
             vec![U256::from(1u64), U256::from(2u64)],
             blob.clone().into(),
@@ -227,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
             commits_map.insert(((idx1 as u16) + 1).to_string(), serde_json::json!(format!("0x{}", hex::encode(y_i_bytes))));
         }
         let out = serde_json::json!({
-            "t": t,
+            "t": t_opener,
             "n": n,
             "openers": shares_map,
             "commitments_g2": commits_map
@@ -246,7 +256,8 @@ async fn main() -> anyhow::Result<()> {
         lines.push_str(&format!("PK_G2_HEX={}\n", pk_hex));
         lines.push_str(&format!("G2_GEN_256=0x{}\n", hex::encode(&g2gen_bytes)));
         lines.push_str(&format!("G2_BASE_256=0x{}\n", hex::encode(&g2base_bytes)));
-        lines.push_str(&format!("THRESHOLD={}\n", t));
+        lines.push_str(&format!("THRESHOLD_ISSUER={}\n", t_issuer));
+        lines.push_str(&format!("THRESHOLD_OPENER={}\n", t_opener));
         lines.push_str(&format!("TOTAL={}\n", n));
         lines.push_str(&format!("OPENER_YBAR_128=0x{}\n", hex::encode(&ybar_bytes)));
         // Avoid clashing with EOA private-key env var name; export G2 public key under an explicit name
@@ -283,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shares_file = env::var("SHARES_FILE").unwrap_or_else(|_| ".runtime.shares.json".into());
     let out = serde_json::json!({
-        "t": t,
+        "t": t_opener,
         "n": n,
         "shares": jshares,
     });
@@ -296,6 +307,6 @@ async fn main() -> anyhow::Result<()> {
         println!("TTP: wrote shares file at {shares_file}");
     }
 
-    println!("TTP ready: Params at {params_addr:?}, t={t}, n={n}");
+    println!("TTP ready: Params at {params_addr:?}, t_issuer={t_issuer}, t_opener={t_opener}, n={n}");
     Ok(())
 }

@@ -163,8 +163,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = store.save_revealed(sid, &RevealedFile { idx: revealed_idx.clone(), vals: revealed_vals.iter().map(|v| { let mut be=[0u8;32]; v.to_big_endian(&mut be); format!("0x{}", hex::encode(be)) }).collect() });
             let t0_pok = Instant::now();
             let proof_bytes = build_commitment_pok(&params_bbs, &commitment, &hidden_msgs_fr, &blinding, mcount_onchain, sid, &cred_name, &revealed_idx, &revealed_vals, &context)?;
-            let pok_ms = t0_pok.elapsed().as_millis() as u64;
-            metrics_append(metrics, &metrics_file, json!({"scenario":"commitment_pok","sid":sid,"ms":pok_ms}));
+            metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_timer_start","sid":sid}));
             let commitment_b = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let commitment_u = EthBytes::from(g1_to_eip2537_bytes(&commitment).to_vec());
             let context_bytes = ethers::types::Bytes::from(context.clone());
@@ -215,52 +214,52 @@ async fn main() -> anyhow::Result<()> {
                     req_session.c_u256, req_session.resp_vec_u256.clone(),
                     req_session.context_bytes.clone(),
                 );
-                let t0_total = Instant::now();
+                let t0_total = t0_pok;
                 let t0_send = Instant::now();
                 let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
-                metrics_append(metrics, &metrics_file, json!({"scenario":"request_sent","sid":sid,"ms": t0_send.elapsed().as_millis() as u64}));
-                if let Some(rcpt) = rcpt_opt.as_ref() { let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)")); let mut found = false; for lg in rcpt.logs.iter() { if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; } } println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" }); }
+                if let Some(rcpt) = rcpt_opt.as_ref() {
+                    let gas_used = rcpt.gas_used.unwrap_or_default();
+                    let eff_price = rcpt.effective_gas_price.unwrap_or_default();
+                    let cost = gas_used * eff_price;
+                    metrics_append(metrics, &metrics_file, json!({
+                        "scenario":"requestCredential",
+                        "sid": sid,
+                        "gasUsed": gas_used.to_string(),
+                        "effectiveGasPrice": eff_price.to_string(),
+                        "costWei": cost.to_string()
+                    }));
+                    let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)")); let mut found = false; for lg in rcpt.logs.iter() { if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; } } println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" });
+                }
                 if let Some(rcpt) = rcpt_opt.clone() { let txh = rcpt.transaction_hash; if let Some(bn) = rcpt.block_number { persist_request_meta(&user_id, &cred_name, sid, txh, bn.as_u64()).ok(); } }
-                // Wait for Aggregated and then fetch signature; persist artifacts; enter action loop
-                let t0_wait = Instant::now();
-                loop {
-                    if let Some(_log) = agg_stream.next().await {
-                        metrics_append(metrics, &metrics_file, json!({"scenario":"aggregated_received","sid":sid,"ms": t0_wait.elapsed().as_millis() as u64}));
-                        metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_request_to_aggregated","sid":sid,"ms": t0_total.elapsed().as_millis() as u64}));
-                        // Additionally watch for Confirmed and record E2E if present soon after
-                        if let Ok(Some(_lg)) = tokio::time::timeout(std::time::Duration::from_secs(30), conf_stream.next()).await {
-                            metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_request_to_confirmed","sid":sid,"ms": t0_total.elapsed().as_millis() as u64}));
-                        }
-                        // Fetch aggregated signature from registry
-                        let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), U256::from(sid)).await?;
-                        if abytes.0.len() != 128 { anyhow::bail!("registry returned bad A len: {}", abytes.0.len()); }
-                        // Build messages and persist artifacts similar to Verify path
-                        let pb2 = fetch_params_bundle(&params_contract, &cred_name).await?;
-                        let onchain_mcount = pb2.mcount; let onchain_t = pb2.t; let onchain_n = pb2.n;
-                        let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
-                        if !messages.is_empty() { messages[0] = Fr::from(sid); }
-                        if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
-                            for (i, fr_val) in rev { if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; } }
-                        }
-                        use ark_serialize::CanonicalSerialize;
-                        let msgs_hex: Vec<String> = messages.iter().map(|f| { let mut be = Vec::new(); ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap(); format!("0x{}", hex::encode(be)) }).collect();
-                        store.save_messages(sid, &MessagesFile(msgs_hex))?;
-                        // params.json left as-is for now
-                        // Persist aggregated signature from registry
-                        let a = eip2537_g1_to_affine(&abytes.0[..])?; let e = u256_to_fr::<Fr>(&e_u); let s = u256_to_fr::<Fr>(&s_u);
-                        let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
-                        let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
-                        let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
-                        let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
-                        store.save_signature(sid, &SignatureFile { a: format!("0x{}", hex::encode(a_bytes)), e: format!("0x{}", hex::encode(e_bytes)), s: format!("0x{}", hex::encode(s_bytes)) })?;
-                        // Enter interactive loop and then return
-                        #[cfg(feature = "interactive")]
-                        {
-                            let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
-                            ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
-                        }
-                        if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
+                // Wait for Confirmed and then fetch signature; persist artifacts; enter action loop
+                if let Ok(Some(_lg)) = tokio::time::timeout(std::time::Duration::from_secs(60), conf_stream.next()).await {
+                    metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_confirmed","sid":sid,"ms": t0_total.elapsed().as_millis() as u64}));
+                    // Fetch aggregated signature from registry
+                    let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), U256::from(sid)).await?;
+                    if abytes.0.len() != 128 { anyhow::bail!("registry returned bad A len: {}", abytes.0.len()); }
+                    // Build messages and persist artifacts similar to Verify path
+                    let pb2 = fetch_params_bundle(&params_contract, &cred_name).await?;
+                    let onchain_mcount = pb2.mcount; let onchain_t = pb2.t; let onchain_n = pb2.n;
+                    let mut messages: Vec<Fr> = (0..onchain_mcount).map(|i| Fr::from(100 + i as u64)).collect();
+                    if !messages.is_empty() { messages[0] = Fr::from(sid); }
+                    if let Ok(Some(rev)) = load_revealed_pairs(&user_id, &cred_name, sid) {
+                        for (i, fr_val) in rev { if i != 0 && (i as usize) < messages.len() { messages[i as usize] = fr_val; } }
                     }
+                    use ark_serialize::CanonicalSerialize;
+                    let msgs_hex: Vec<String> = messages.iter().map(|f| { let mut be = Vec::new(); ark_serialize::CanonicalSerialize::serialize_compressed(f, &mut be).unwrap(); format!("0x{}", hex::encode(be)) }).collect();
+                    store.save_messages(sid, &MessagesFile(msgs_hex))?;
+                    let a = eip2537_g1_to_affine(&abytes.0[..])?; let e = u256_to_fr::<Fr>(&e_u); let s = u256_to_fr::<Fr>(&s_u);
+                    let signature = bbs_plus::signature::SignatureG1::<Bls12_381> { A: a, e, s };
+                    let mut a_bytes = Vec::new(); signature.A.serialize_compressed(&mut a_bytes)?;
+                    let mut e_bytes = Vec::new(); signature.e.serialize_compressed(&mut e_bytes)?;
+                    let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
+                    store.save_signature(sid, &SignatureFile { a: format!("0x{}", hex::encode(a_bytes)), e: format!("0x{}", hex::encode(e_bytes)), s: format!("0x{}", hex::encode(s_bytes)) })?;
+                    #[cfg(feature = "interactive")]
+                    {
+                        let sess = session::Session::load(&user_id, &cred_name, sid, &params_contract).await?;
+                        ui::run_action_loop(client.clone(), &params_contract, &sess).await?;
+                    }
+                    if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
                 }
             } else {
                 let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
