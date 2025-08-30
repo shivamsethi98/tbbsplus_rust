@@ -8,7 +8,7 @@ ANVIL_PORT=${ANVIL_PORT:-8545}
 BASE_PORT=${BASE_PORT:-9900}
 
 THRESHOLD_ISSUER=${THRESHOLD_ISSUER:-${ISSUER_THRESHOLD:-4}}
-THRESHOLD_OPENER=${THRESHOLD_OPENER:-${OPENER_THRESHOLD:-3}}
+THRESHOLD_OPENER=${THRESHOLD_OPENER:-${OPENER_THRESHOLD:-4}}
 TOTAL=${TOTAL:-5}
 MESSAGE_COUNT=${MESSAGE_COUNT:-5}
 CRED_NAME=${CRED_NAME:-ANON_CRED}
@@ -65,7 +65,8 @@ npx hardhat clean >/dev/null 2>&1 || true
 npx hardhat compile --force
 
 echo "[03] Deploy core"
-DEP_ENV=$(CRED_NAME="$CRED_NAME" MESSAGE_COUNT="$MESSAGE_COUNT" THRESHOLD="$THRESHOLD_ISSUER" TOTAL="$TOTAL" npx hardhat run --network localhost scripts/deploy_local.ts | sed -n 's/^export /export /p')
+DEPLOY_METRICS_FILE=${DEPLOY_METRICS_FILE:-metrics/results/deploy.ndjson}
+DEP_ENV=$(DEPLOY_METRICS_FILE="$DEPLOY_METRICS_FILE" CRED_NAME="$CRED_NAME" MESSAGE_COUNT="$MESSAGE_COUNT" THRESHOLD="$THRESHOLD_ISSUER" TOTAL="$TOTAL" npx hardhat run --network localhost scripts/deploy_local.ts | sed -n 's/^export /export /p')
 eval "$DEP_ENV"
 export ETH_WS=ws://127.0.0.1:${ANVIL_PORT}
 export CHAIN_ID=31337
@@ -88,7 +89,7 @@ EOF
 set -a; source .runtime.env; set +a
 
 echo "[04] Deploy Verify contract"
-VERIFY_ENV=$(npx hardhat run --network localhost scripts/deploy_pok_verifiers.ts | sed -n 's/^export /export /p')
+VERIFY_ENV=$(DEPLOY_METRICS_FILE="$DEPLOY_METRICS_FILE" npx hardhat run --network localhost scripts/deploy_pok_verifiers.ts | sed -n 's/^export /export /p')
 eval "$VERIFY_ENV"
 # Append verify var
 {

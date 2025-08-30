@@ -1,4 +1,36 @@
 import { ethers } from "hardhat";
+import fs from "fs";
+import path from "path";
+
+async function appendDeployMetrics(contract: string, tx: any) {
+  try {
+    const metricsFile = process.env.DEPLOY_METRICS_FILE || "metrics/results/deploy.ndjson";
+    const dir = path.dirname(metricsFile);
+    fs.mkdirSync(dir, { recursive: true });
+    const rcpt = await tx.wait();
+    const gasUsed = rcpt?.gasUsed?.toString?.() ?? String(rcpt?.gasUsed ?? "0");
+    const eff = rcpt?.effectiveGasPrice?.toString?.() ?? String(rcpt?.effectiveGasPrice ?? "0");
+    // cost = gasUsed * effectiveGasPrice (as bigint math if available)
+    let costWei = "0";
+    try {
+      const gu = BigInt(gasUsed);
+      const gp = BigInt(eff);
+      costWei = (gu * gp).toString();
+    } catch {}
+    const obj = {
+      scenario: `deploy_${contract}`,
+      contract,
+      hash: tx?.hash,
+      blockNumber: rcpt?.blockNumber,
+      gasUsed,
+      effectiveGasPrice: eff,
+      costWei,
+    };
+    fs.appendFileSync(metricsFile, JSON.stringify(obj) + "\n");
+  } catch (e) {
+    console.warn("appendDeployMetrics failed", contract, e);
+  }
+}
 
 async function main() {
   const [owner] = await ethers.getSigners();
@@ -10,14 +42,17 @@ async function main() {
   const Params = await ethers.getContractFactory("Params");
   const params = await Params.connect(owner).deploy();
   await params.waitForDeployment();
+  if (params.deploymentTransaction()) await appendDeployMetrics("Params", params.deploymentTransaction());
 
   const Registry = await ethers.getContractFactory("CredentialRegistry");
   const registry = await Registry.connect(owner).deploy(await params.getAddress());
   await registry.waitForDeployment();
+  if (registry.deploymentTransaction()) await appendDeployMetrics("CredentialRegistry", registry.deploymentTransaction());
 
   const Request = await ethers.getContractFactory("RequestCredential");
   const request = await Request.connect(owner).deploy();
   await request.waitForDeployment();
+  if (request.deploymentTransaction()) await appendDeployMetrics("RequestCredential", request.deploymentTransaction());
 
   // Wire Request <-> Registry:
   // 1) Allow RequestCredential to record request data into the registry
@@ -34,6 +69,7 @@ async function main() {
     await registry.getAddress()
   );
   await accumulator.waitForDeployment();
+  if (accumulator.deploymentTransaction()) await appendDeployMetrics("Accumulator", accumulator.deploymentTransaction());
   // Wire: registry should know accumulator to auto-publish A->e mapping after verification
   await (await (registry as any).connect(owner).setAccumulator(await accumulator.getAddress())).wait();
 

@@ -1,70 +1,65 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::env;
+use serde::Deserialize;
 
-fn parse_gas(s: &str) -> Option<u128> { s.parse::<u128>().ok() }
+#[derive(Deserialize)]
+struct Row {
+    scenario: String,
+    sid: Option<u64>,
+    ms: Option<u64>,
+    gasUsed: Option<String>,
+    effectiveGasPrice: Option<String>,
+    costWei: Option<String>,
+}
 
-fn collect(client_path: &str) -> (BTreeMap<u64,u128>, BTreeMap<u64,u64>, BTreeMap<u64,u64>, BTreeMap<u64,u64>) {
-    let mut gas: BTreeMap<u64,u128> = BTreeMap::new();
-    let mut e2e_on: BTreeMap<u64,u64> = BTreeMap::new();
-    let mut e2e_off: BTreeMap<u64,u64> = BTreeMap::new();
-    let mut build: BTreeMap<u64,u64> = BTreeMap::new();
-    let f = match File::open(client_path) { Ok(f)=>f, Err(_)=> return (gas,e2e_on,e2e_off,build) };
+fn parse_u256(s: &str) -> Option<ethereum_types::U256> {
+    use ethereum_types::U256;
+    if s.is_empty() { return None; }
+    if let Ok(v) = U256::from_dec_str(s) { return Some(v); }
+    None
+}
+
+fn main() -> eyre::Result<()> {
+    dotenvy::dotenv().ok();
+    let path = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/client.ndjson".into());
+    let f = File::open(&path)?;
     let rdr = BufReader::new(f);
-    for line in rdr.lines().flatten() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            match v.get("scenario").and_then(|x| x.as_str()) {
-                // on-chain tx time
-                Some("verifProveTime") | Some("on_chain_verify_time") => {
-                    if let (Some(sid), Some(gu)) = (v.get("sid").and_then(|x| x.as_u64()), v.get("gasUsed").and_then(|x| x.as_str()).and_then(parse_gas)) {
-                        gas.insert(sid, gu);
-                    }
-                }
-                // on-chain e2e (construction -> tx mined)
-                Some("presentation_e2e") => {
-                    if let (Some(sid), Some(ms)) = (v.get("sid").and_then(|x| x.as_u64()), v.get("ms").and_then(|x| x.as_u64())) {
-                        e2e_on.insert(sid, ms);
-                    }
-                }
-                // off-chain combined verify (BBS+ + membership)
-                Some("presentation_offchain_e2e") | Some("off-chain_prove_time") | Some("off-chain_verify_time") => {
-                    if let (Some(sid), Some(ms)) = (v.get("sid").and_then(|x| x.as_u64()), v.get("ms").and_then(|x| x.as_u64())) {
-                        e2e_off.insert(sid, ms);
-                    }
-                }
-                // proof construction time (off-chain)
-                Some("proveCred") | Some("off_chain_proof_gen") => {
-                    if let (Some(sid), Some(ms)) = (v.get("sid").and_then(|x| x.as_u64()), v.get("ms").and_then(|x| x.as_u64())) {
-                        build.insert(sid, ms);
-                    }
-                }
-                _ => {}
-            }
+
+    let mut off_ms: Vec<u64> = Vec::new();
+    let mut pres_e2e_ms: Vec<u64> = Vec::new();
+    let mut on_gas: Vec<(ethereum_types::U256, ethereum_types::U256)> = Vec::new();
+
+    for line in rdr.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        let val: serde_json::Value = serde_json::from_str(&line)?;
+        let scenario = val.get("scenario").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if scenario == "off-chain_verify_time" {
+            if let Some(ms) = val.get("ms").and_then(|v| v.as_u64()) { off_ms.push(ms); }
+        } else if scenario == "presentation_e2e" {
+            if let Some(ms) = val.get("ms").and_then(|v| v.as_u64()) { pres_e2e_ms.push(ms); }
+        } else if scenario == "on_chain_verify_time" {
+            let gu = val.get("gasUsed").and_then(|v| v.as_str()).and_then(parse_u256).unwrap_or_default();
+            let gp = val.get("effectiveGasPrice").and_then(|v| v.as_str()).and_then(parse_u256).unwrap_or_default();
+            on_gas.push((gu, gp));
         }
     }
-    (gas, e2e_on, e2e_off, build)
+
+    fn avg(v: &[u64]) -> Option<f64> { if v.is_empty() { None } else { Some(v.iter().copied().map(|x| x as f64).sum::<f64>() / (v.len() as f64)) } }
+
+    let off_avg = avg(&off_ms);
+    let e2e_avg = avg(&pres_e2e_ms);
+    let mut gas_sum = ethereum_types::U256::zero();
+    let mut cost_sum = ethereum_types::U256::zero();
+    let mut n = 0u64;
+    for (gu, gp) in on_gas { gas_sum += gu; cost_sum += gu * gp; n += 1; }
+    let gas_avg = if n>0 { gas_sum / ethereum_types::U256::from(n) } else { ethereum_types::U256::zero() };
+    let cost_avg = if n>0 { cost_sum / ethereum_types::U256::from(n) } else { ethereum_types::U256::zero() };
+
+    println!("presentation.off_chain_verify_time.ms_avg={:?}", off_avg);
+    println!("presentation.presentation_e2e.ms_avg={:?}", e2e_avg);
+    println!("presentation.on_chain_verify.gasUsed_avg={}", gas_avg);
+    println!("presentation.on_chain_verify.costWei_avg={}", cost_avg);
+
+    Ok(())
 }
-
-fn main() {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() < 2 || args[0] != "--client" { eprintln!("usage: presentation_metrics --client metrics/results/client.ndjson [--sid n ...]"); std::process::exit(1); }
-    let client_path = args[1].clone();
-    let mut sid_filters = std::collections::BTreeSet::<u64>::new();
-    let mut i = 2; while i < args.len() { if args[i] == "--sid" { i+=1; if i<args.len() { if let Ok(s) = args[i].parse::<u64>() { sid_filters.insert(s); } i+=1; } } else { i+=1; } }
-    let (gas, e2e_on, e2e_off, build) = collect(&client_path);
-    let mut sids: std::collections::BTreeSet<u64> = gas.keys().copied().collect(); sids.extend(e2e_on.keys().copied()); sids.extend(e2e_off.keys().copied()); sids.extend(build.keys().copied());
-    if !sid_filters.is_empty() { sids = sids.intersection(&sid_filters).copied().collect(); }
-    let mut sum_gas: u128 = 0; let mut n_gas: u64 = 0;
-    let mut sum_on: u128 = 0; let mut n_on: u64 = 0;
-    let mut sum_off: u128 = 0; let mut n_off: u64 = 0;
-    let mut sum_build: u128 = 0; let mut n_build: u64 = 0;
-    for sid in sids { if let Some(g) = gas.get(&sid) { sum_gas += *g; n_gas += 1; } if let Some(ms) = e2e_on.get(&sid) { sum_on += *ms as u128; n_on += 1; } if let Some(ms) = e2e_off.get(&sid) { sum_off += *ms as u128; n_off += 1; } if let Some(ms) = build.get(&sid) { sum_build += *ms as u128; n_build += 1; } }
-    let avg_gas = if n_gas>0 { sum_gas/(n_gas as u128) } else { 0 };
-    let avg_on = if n_on>0 { (sum_on/(n_on as u128)) as u64 } else { 0 };
-    let avg_off = if n_off>0 { (sum_off/(n_off as u128)) as u64 } else { 0 };
-    let avg_build = if n_build>0 { (sum_build/(n_build as u128)) as u64 } else { 0 };
-    println!("{{\"avgPresentGasUsed\":{},\"avgPresentE2EOnMs\":{},\"avgPresentE2EOffMs\":{},\"avgProofConstructMs\":{}}}", avg_gas, avg_on, avg_off, avg_build);
-}
-
-

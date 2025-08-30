@@ -103,3 +103,14 @@ path = "metrics/scenarios/issuance_sum.rs"
 [[bin]]
 name = "presentation_metrics"
 path = "metrics/scenarios/presentation_metrics.rs"
+[[bin]]
+name = "acc_register_info_metrics"
+path = "metrics/scenarios/acc_register_info_metrics.rs"
+
+[[bin]]
+name = "sp_agg_open_revoke"
+path = "metrics/scenarios/sp_agg_open_revoke.rs"
+
+[[bin]]
+name = "deploy_gas_metrics"
+path = "metrics/scenarios/deploy_gas_metrics.rs"

@@ -400,6 +400,7 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                                             let _=writeln!(f, "{}", serde_json::json!({
                                                 "scenario":"agg_publishOpenResult",
                                                 "sid": msg.sid,
+                                                "threshold": threshold,
                                                 "hash": format!("0x{:x}", r.transaction_hash),
                                                 "blockNumber": blk.as_u64(),
                                                 "gasUsed": gas_used.to_string(),
@@ -478,6 +479,7 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                                             let _=writeln!(f, "{}", serde_json::json!({
                                                 "scenario":"agg_deleteMember",
                                                 "sid": v.sid,
+                                                "threshold": threshold,
                                                 "hash": format!("0x{:x}", r.transaction_hash),
                                                 "blockNumber": blk.as_u64(),
                                                 "gasUsed": gas_used.to_string(),
@@ -552,7 +554,7 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             }
                             if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
                                 let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
-                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_add_verify_sum","sid": ac.sid, "ms": t0_verify.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_add_verify_sum","sid": ac.sid, "threshold": threshold, "ms": t0_verify.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
                             }
                             // Metrics: start acc_register_info_e2e and combine gas of setDelta + publishWitness
                             let metrics = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
@@ -585,7 +587,7 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             if metrics {
                                 let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
                                 let ms: u64 = add_start.remove(&ac.sid).map(|t0| t0.elapsed().as_millis() as u64).unwrap_or(0);
-                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_register_info_e2e","sid": ac.sid, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_register_info_e2e","sid": ac.sid, "threshold": threshold, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
                             }
                             members.insert(e_u);
                             println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);

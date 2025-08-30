@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let accumulator = AccumulatorClient::new(acc_addr, client.clone())?;
     let metrics_on = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let metrics_file = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/service_provider.ndjson".into());
+    let threshold: u16 = env::var("THRESHOLD_OPENER").or_else(|_| env::var("THRESHOLD")).ok().and_then(|s| s.parse().ok()).unwrap_or(3);
 
     // Non-interactive defaults for testing: auto open and auto revoke
     let auto_open = env::var("SP_AUTO_OPEN").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
@@ -95,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                     let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
                     let _=writeln!(f, "{}", serde_json::json!({
                         "scenario":"sp_requestOpen",
+                        "threshold": threshold,
                         "hash": hash,
                         "blockNumber": blk,
                         "gasUsed": gas,
@@ -114,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("ServiceProvider(auto): Opened emitted");
                             if metrics_on {
                                 let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
-                                    use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_open_e2e","ms": t0.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                    use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_open_e2e","threshold": threshold, "ms": t0.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
                             }
                             let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
                             if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
@@ -167,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                             let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
                             let _=writeln!(f, "{}", serde_json::json!({
                                 "scenario":"sp_requestRevokeByE",
+                                "threshold": threshold,
                                 "hash": hash,
                                 "blockNumber": blk,
                                 "gasUsed": gas,
@@ -191,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
                                 if lg.topics.get(2).map(|t| *t == e_topic).unwrap_or(false) == false { continue; }
                                 println!("ServiceProvider: MemberRevoked emitted");
                                 if metrics_on {
-                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap(); use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_revoke_e2e","ms": rev_start.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap(); use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_revoke_e2e","threshold": threshold, "ms": rev_start.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
                                 }
                                 saw_rev = true; break;
                             }
