@@ -247,3 +247,4 @@
 {"blockNumber":147,"costWei":"5034084016780280","effectiveGasPrice":"3000000010","gasUsed":"1678028","hash":"0x4dafa96ee2742316af34b5a1c78b327d9bde40a79adf09a746c932053e6ad3e2","ms":7325,"scenario":"on_chain_verify_time","sid":10}
 {"ms":8010,"scenario":"presentation_e2e","sid":10}
 {"acc_ok":true,"bbs_ok":true,"ms":204,"scenario":"off-chain_verify_time","sid":10}
+{"ms":707,"scenario":"off_chain_proof_gen","sid":1}
