@@ -204,13 +204,7 @@ async fn main() -> anyhow::Result<()> {
         .from_block(BlockNumber::Latest);
     let mut stream_memrev = client.provider().subscribe_logs(&filter_memrev_latest).await?;
 
-    let ev_wit = H256::from(ethers::utils::keccak256(b"WitnessAvailable(string,uint256,bytes,bytes)"));
-    let filter_wit_latest = Filter::new()
-        .address(ValueOrArray::Value(acc_addr))
-        .topic0(ValueOrArray::Value(ev_wit))
-        .topic1(ValueOrArray::Value(name_topic))
-        .from_block(BlockNumber::Latest);
-    let mut stream_wit = client.provider().subscribe_logs(&filter_wit_latest).await?;
+    // removed per-e witness event subscription
 
     let ev_conf = H256::from(ethers::utils::keccak256(b"Confirmed(string,uint256)"));
     let filter_conf = Filter::new()
@@ -239,17 +233,21 @@ async fn main() -> anyhow::Result<()> {
     let mut members: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // all added e values
     let mut revoked_set: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // revoked e values
 
-    // Initialize members from past WitnessAvailable events (chain scan)
-    let filter_wit_all = Filter::new()
-        .address(ValueOrArray::Value(acc_addr))
-        .topic0(ValueOrArray::Value(ev_wit))
+    // Initialize members from past Confirmed events (through registry)
+    let filter_conf_all = Filter::new()
+        .address(ValueOrArray::Value(registry.address()))
+        .topic0(ValueOrArray::Value(ev_conf))
         .topic1(ValueOrArray::Value(name_topic))
         .from_block(BlockNumber::Earliest)
         .to_block(BlockNumber::Latest);
-    if let Ok(init_logs) = client.provider().get_logs(&filter_wit_all).await {
+    if let Ok(init_logs) = client.provider().get_logs(&filter_conf_all).await {
         for lg in init_logs {
-            if let Some(e_topic) = lg.topics.get(2) {
-                let e_u = U256::from_big_endian(e_topic.as_bytes());
+            if let Some(sid_topic) = lg.topics.get(2) {
+                let sid_u = U256::from_big_endian(sid_topic.as_bytes());
+                let (_a_bytes, e_u, _s_u, _status): (ethers::types::Bytes, U256, U256, u8) = registry
+                    .method("getSignature", (cred_name.clone(), sid_u))?
+                    .call().await
+                    .unwrap_or((ethers::types::Bytes::from_static(&[]), U256::zero(), U256::zero(), 0));
                 if !e_u.is_zero() { members.insert(e_u); }
             }
         }
@@ -344,14 +342,7 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                     }
                 }
             },
-            ev = stream_wit.next() => {
-                if let Some(lg) = ev {
-                    if let Some(e_topic) = lg.topics.get(2) {
-                        let e_u = U256::from_big_endian(e_topic.as_bytes());
-                        if !e_u.is_zero() { members.insert(e_u); }
-                    }
-                }
-            },
+            // removed per-e witness event arm
             dm = direct_rx.recv() => {
                 if let Some(dm) = dm {
                     // Open partials, deletion shares, or addition contributions
@@ -442,10 +433,12 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             if let Some(e_u) = e_by_sid.get(&v.sid).cloned() {
                                 let rcpt = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b.clone()))?.send().await?.await?;
                                 println!("[agg] deleteMember executed for sid={} e=0x{:x}", v.sid, e_u);
-                                // After removal, update witnesses for remaining members using library helper (public update after single removal)
+                                // After removal, batch update witnesses for remaining members
                                 let v_new_anchor = new_delta_aff;
                                 let e_removed_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
                                 let to_update: Vec<U256> = members.iter().cloned().collect();
+                                let mut es: Vec<U256> = Vec::new();
+                                let mut ws: Vec<ethers::types::Bytes> = Vec::new();
                                 for e_old in to_update.into_iter() {
                                     if revoked_set.contains(&e_old) { continue; }
                                     if e_old == e_u { continue; }
@@ -459,9 +452,12 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                                         &w_old,
                                         &v_new_anchor,
                                     ) {
-                                        let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
-                                        let _ = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
+                                        es.push(e_old);
+                                        ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec()));
                                     }
+                                }
+                                if !es.is_empty() {
+                                    let _ = accumulator.method::<_, ()>("publishWitnessBatch", (cred_name.clone(), es, ws))?.send().await?.await?;
                                 }
                                 // Update local sets
                                 revoked_set.insert(e_u);
@@ -562,8 +558,10 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
                             let rcpt_delta = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
                             if let Some(r) = rcpt_delta.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
-                            // Update witnesses for all existing members using library helper (public update after single addition)
-                            let mut to_update: Vec<U256> = members.iter().cloned().collect();
+                            // Batch update witnesses for all existing members
+                            let mut es: Vec<U256> = Vec::new();
+                            let mut ws: Vec<ethers::types::Bytes> = Vec::new();
+                            let to_update: Vec<U256> = members.iter().cloned().collect();
                             for e_old in to_update.into_iter() {
                                 if revoked_set.contains(&e_old) { continue; }
                                 let wit_b: ethers::types::Bytes = accumulator.method("getWitness", (cred_name.clone(), e_old))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
@@ -576,13 +574,13 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                                     &w_old,
                                     &v_old_anchor,
                                 );
-                                let w_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec());
-                                let rcpt = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_old, w_new_b))?.send().await?.await?;
-                                if let Some(r) = rcpt.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
+                                es.push(e_old);
+                                ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec()));
                             }
-                            // Publish witness for the newly added element: W_new(e_new) = V_old
-                            let w_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_old_anchor).to_vec());
-                            let rcpt = accumulator.method::<_, ()>("publishWitness", (cred_name.clone(), e_u, w_b))?.send().await?.await?;
+                            // Include the newly added element: W_new(e_new) = V_old
+                            es.push(e_u);
+                            ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_old_anchor).to_vec()));
+                            let rcpt = accumulator.method::<_, ()>("publishWitnessBatch", (cred_name.clone(), es, ws))?.send().await?.await?;
                             if let Some(r) = rcpt.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
                             if metrics {
                                 let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());

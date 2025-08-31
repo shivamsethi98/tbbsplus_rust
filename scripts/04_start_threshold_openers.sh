@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 # Use a separate base port for openers to avoid clashing with issuers (issuers use 9900 by default)
 OPENERS_BASE_PORT=${OPENERS_BASE_PORT:-10900}
 # Number of opener participants to start; default to THRESHOLD_OPENER
-OPENERS_COUNT=${OPENERS_COUNT:-${THRESHOLD_OPENER:-${THRESHOLD:-4}}}
+OPENERS_COUNT=${OPENERS_COUNT:-${THRESHOLD_OPENER:-${THRESHOLD:-5}}}
 
 # Load env produced by 01_ttp_setup.sh if present
 if [[ -f .runtime.env ]]; then

@@ -5,7 +5,7 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. && pwd)
 cd "$ROOT_DIR"
 
 BASE_PORT=${BASE_PORT:-9900}
-THRESHOLD=${THRESHOLD_ISSUER:-${THRESHOLD:-3}}
+THRESHOLD=${THRESHOLD_ISSUER:-${THRESHOLD:-4}}
 
 # Load env produced by stage 1 if present
 if [[ -f .runtime.env ]]; then

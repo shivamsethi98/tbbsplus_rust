@@ -50,7 +50,6 @@ contract Accumulator {
     mapping(bytes32 => mapping(uint256 => bool)) private revoked;
 
     event AccumulatorUpdated(string indexed name, bytes delta);
-    event WitnessAvailable(string indexed name, uint256 indexed e, bytes witness, bytes delta);
     event MappingPublished(string indexed name, uint256 indexed sid, bytes32 Ahash, uint256 e);
 
     modifier onlyRegistry() {
@@ -75,12 +74,21 @@ contract Accumulator {
         emit AccumulatorUpdated(name, delta128);
     }
 
-    /// @notice Publish membership witness for element `e` under credential `name`
-    function publishWitness(string calldata name, uint256 e, bytes calldata witness128) external onlyOpener {
-        require(witness128.length == 128, "bad wit len");
+    /// @notice Publish membership witnesses for multiple elements in a single transaction
+    function publishWitnessBatch(
+        string calldata name,
+        uint256[] calldata es,
+        bytes[] calldata witnesses128
+    ) external onlyOpener {
+        require(es.length == witnesses128.length, "len mismatch");
         bytes32 k = _key(name);
-        witnesses[k][e] = witness128;
-        emit WitnessAvailable(name, e, witness128, deltas[k]);
+        bytes memory deltaCached = deltas[k];
+        require(deltaCached.length == 128, "delta missing");
+        for (uint256 i = 0; i < es.length; i++) {
+            bytes calldata w = witnesses128[i];
+            require(w.length == 128, "bad wit len");
+            witnesses[k][es[i]] = w;
+        }
     }
 
     function getDelta(string calldata name) external view returns (bytes memory) {
