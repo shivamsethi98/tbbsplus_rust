@@ -1,12 +1,7 @@
 use ark_bls12_381::{Bls12_381 as E, Fq, Fr, G1Affine};
-use ark_ec::AffineRepr;
-use ark_ff::PrimeField;
-use ark_serialize::CanonicalSerialize;
-use bbs_plus::{
-    proof::PoKOfSignatureG1Protocol,
-    setup::{KeypairG2, SignatureParamsG1},
-    signature::SignatureG1,
-};
+use ark_ec::{AffineRepr, CurveGroup};
+use ark_ff::{PrimeField, UniformRand};
+use bbs_plus::prelude::*;
 use blake2::Blake2b512;
 use dock_crypto_utils::signature::MessageOrBlinding;
 use eyre::Result;
@@ -14,26 +9,34 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
 use sha3::{Digest, Keccak256};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use secret_sharing_and_dkg::shamir_ss::deal_random_secret;
 
 #[derive(Serialize)]
 struct PokJson {
-    messageCount: usize,
+    message_count: usize,
     g1: String,
     h0: String,
-    H: Vec<String>,
-    APrime: String,
-    ABar: String,
+    h: Vec<String>,
+    aprime: String,
+    abar: String,
     d: String,
-    T1: String,
-    T2: String,
-    revealedIdx: Vec<usize>,
-    revealedVals: Vec<String>,
+    t1: String,
+    t2: String,
+    revealed_idx: Vec<usize>,
+    revealed_vals: Vec<String>,
     challenge: String,
-    respA: String,
-    respH0: String,
-    respR3: String,
-    respSPrime: String,
-    respMsgs: Vec<String>,
+    resp_a: String,
+    resp_h0: String,
+    resp_r3: String,
+    resp_sprime: String,
+    resp_msgs: Vec<String>,
+    // Optional encryption relation
+    ybar: Option<String>,
+    t1enc: Option<String>,
+    t2enc: Option<String>,
+    tenc: Option<String>,
+    resp_a3: Option<String>,
+    resp_k: Option<String>,
 }
 
 fn keccak_to_fr(bytes: &[u8]) -> Fr {
@@ -94,12 +97,19 @@ fn main() -> Result<()> {
     let out_path = env::args().nth(1).or_else(|| env::var("OUT").ok()).unwrap_or_else(|| "pok.json".to_string());
     let mut rng = StdRng::seed_from_u64(23);
 
-    // Demo setup
-    let m: usize = env::var("MSG_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let params = SignatureParamsG1::<E>::new::<Blake2b512>(b"demo-pok", m as u32);
-    let keypair = KeypairG2::<E>::generate_using_rng(&mut rng, &params);
+    // Params aligned with TTP (same label and count)
+    let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".to_string());
+    let m: usize = env::var("MESSAGE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let params = SignatureParamsG1::<E>::new::<Blake2b512>(cred_name.as_bytes(), m as u32);
     let msgs: Vec<Fr> = (0..m).map(|i| Fr::from((i as u64) + 5)).collect();
-    let sig = SignatureG1::<E>::new(&mut rng, &msgs, &keypair.secret_key, &params).expect("sign");
+    // Secret aligned with TTP (seeded, threshold/n)
+    let t: u16 = env::var("THRESHOLD_ISSUER").expect("THRESHOLD_ISSUER required").parse().unwrap_or(3);
+    let n: u16 = env::var("TOTAL").unwrap_or_else(|_| "4".into()).parse().unwrap_or(4);
+    let mut rng_sk = StdRng::seed_from_u64(42);
+    let (secret, _shares, _poly) = deal_random_secret::<_, Fr>(&mut rng_sk, t, n)
+        .map_err(|e| eyre::eyre!("deal_random_secret failed: {:?}", e))?;
+    let sk = SecretKey(secret);
+    let sig = SignatureG1::<E>::new(&mut rng, &msgs, &sk, &params).expect("sign");
 
     // Choose a revealed set (indices strictly increasing)
     let revealed_idx: Vec<usize> = env::var("REVEALED")
@@ -113,8 +123,11 @@ fn main() -> Result<()> {
     let message_iter = msgs.iter().enumerate().map(|(i, m)| {
         if revealed.contains_key(&i) { MessageOrBlinding::RevealMessage(m) } else { MessageOrBlinding::BlindMessageRandomly(m) }
     });
-    let pok = PoKOfSignatureG1Protocol::<E>::init(&mut rng, &sig, &params, message_iter)
-        .expect("pok init");
+    // Build Ybar and use the new init_with_encryption; fallback to init if needed in future
+    let y_sk = Fr::rand(&mut rng);
+    let ybar = params.g1.mul_bigint(y_sk.into_bigint()).into_affine();
+    let pok = PoKOfSignatureG1Protocol::<E>::init_with_encryption(&mut rng, &sig, &params, message_iter, &ybar)
+        .expect("pok init with enc");
 
     // Transcript bytes and challenge
     let mut transcript = vec![];
@@ -123,9 +136,9 @@ fn main() -> Result<()> {
     let c = keccak_to_fr(&transcript);
     let proof = pok.gen_proof(&c).expect("gen proof");
 
-    // Extract responses/order
-    let resp1 = proof.sc_resp_1; // contains t (T1) and 2 responses
-    let (respA, respH0) = (resp1.response1, resp1.response2);
+    // Extract responses/order (borrow to avoid moving out of `proof`)
+    let resp1_ref = &proof.sc_resp_1; // contains t (T1) and 2 responses
+    let (resp_a_ref, resp_h0_ref) = (&resp1_ref.response1, &resp1_ref.response2);
 
     // bases_2 order: undisclosed H (in param index order), then d, then h0
     let mut resp_msgs = vec![];
@@ -135,29 +148,63 @@ fn main() -> Result<()> {
         resp_msgs.extend(all.iter().take(undis_count).map(fr_to_be32_hex));
         let resp_r3 = &all[undis_count + 0];
         let resp_sprime = &all[undis_count + 1];
+        // Verify all Schnorr relations (except pairing). This includes optional encryption relation.
+        proof
+            .verify_schnorr_proofs(&revealed, &c, params.g1, params.h_0, params.h.clone(), None)
+            .map_err(|e| eyre::eyre!("verify_schnorr_proofs failed: {:?}", e))?;
+        if proof.Y_bar.is_some() { println!("[export] verify_schnorr_proofs (incl. encryption) = OK"); }
+        // Use library verification (includes both Schnorr relations and optional encryption, plus pairing)
+        let pk = PublicKeyG2::generate_using_secret_key(&sk, &params);
+        proof
+            .verify(&revealed, &c, pk, params.clone())
+            .map_err(|e| eyre::eyre!("off-chain proof.verify failed: {:?}", e))?;
+
+        // Optional encryption relation fields for JSON (no extra manual checks needed)
+        let (y_hex, t1e_hex, t2e_hex, tenc_hex, resp_a3_hex, resp_k_hex) = if let (Some(yb), Some(t1e), Some(t2e), Some(enc)) = (
+            proof.Y_bar.as_ref(),
+            proof.T1_enc.as_ref(),
+            proof.T2_enc.as_ref(),
+            proof.sc_resp_enc.as_ref(),
+        ) {
+            (Some(g1_hex(yb)), Some(g1_hex(t1e)), Some(g1_hex(t2e)), Some(g1_hex(&enc.t)), Some(fr_to_be32_hex(&enc.response1)), Some(fr_to_be32_hex(&enc.response2)))
+        } else { (None, None, None, None, None, None) };
         // Build JSON
+        if let (Some(y_hex), Some(t1e_hex), Some(t2e_hex), Some(tenc_hex), Some(resp_a3_hex), Some(resp_k_hex)) =
+            (&y_hex, &t1e_hex, &t2e_hex, &tenc_hex, &resp_a3_hex, &resp_k_hex)
+        {
+            println!(
+            "Encryption relation:\n  Ybar: {}\n  T1enc: {}\n  T2enc: {}\n  Tenc: {}\n  respA3: {}\n  respK: {}",
+            y_hex, t1e_hex, t2e_hex, tenc_hex, resp_a3_hex, resp_k_hex
+            );
+        }
         let pj = PokJson {
-            messageCount: m,
+            message_count: m,
             g1: g1_hex(&params.g1),
             h0: g1_hex(&params.h_0),
-            H: params.h.iter().map(g1_hex).collect(),
-            APrime: g1_hex(&proof.A_prime),
-            ABar: g1_hex(&proof.A_bar),
+            h: params.h.iter().map(g1_hex).collect(),
+            aprime: g1_hex(&proof.A_prime),
+            abar: g1_hex(&proof.A_bar),
             d: g1_hex(&proof.d),
-            T1: g1_hex(&resp1.t),
-            T2: g1_hex(&proof.T2),
-            revealedIdx: revealed_idx.clone(),
-            revealedVals: revealed_idx.iter().map(|i| fr_to_be32_hex(&msgs[*i])).collect(),
+            t1: g1_hex(&resp1_ref.t),
+            t2: g1_hex(&proof.T2),
+            revealed_idx: revealed_idx.clone(),
+            revealed_vals: revealed_idx.iter().map(|i| fr_to_be32_hex(&msgs[*i])).collect(),
             challenge: fr_to_be32_hex(&c),
-            respA: fr_to_be32_hex(&respA),
-            respH0: fr_to_be32_hex(&respH0),
-            respR3: fr_to_be32_hex(resp_r3),
-            respSPrime: fr_to_be32_hex(resp_sprime),
-            respMsgs: resp_msgs,
+            resp_a: fr_to_be32_hex(resp_a_ref),
+            resp_h0: fr_to_be32_hex(resp_h0_ref),
+            resp_r3: fr_to_be32_hex(resp_r3),
+            resp_sprime: fr_to_be32_hex(resp_sprime),
+            resp_msgs: resp_msgs,
+            ybar: y_hex,
+            t1enc: t1e_hex,
+            t2enc: t2e_hex,
+            tenc: tenc_hex,
+            resp_a3: resp_a3_hex,
+            resp_k: resp_k_hex,
         };
-    let json = serde_json::to_string_pretty(&pj)?;
+        let json = serde_json::to_string_pretty(&pj)?;
         let p = PathBuf::from(out_path);
-    fs::write(&p, json)?;
+        fs::write(&p, json)?;
         println!("Wrote PoK JSON to {}", p.display());
     } else {
         eprintln!("Partial responses not supported in this exporter");

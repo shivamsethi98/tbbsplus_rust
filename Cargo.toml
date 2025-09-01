@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 thiserror = "1.0"
 hex = "0.4"
 dotenvy = "0.15"
+eyre = "0.6"
 
 # Additional dependencies for selective disclosure example (using local crypto libraries)
 schnorr_pok = { path = "crypto/schnorr_pok" }
@@ -39,9 +40,17 @@ base64 = "0.21"
 rand = "0.8"
 futures = "0.3"
 ethers = { version = "2", default-features = false, features = ["abigen", "ws", "rustls"] }
+vb_accumulator = { path = "crypto/vb_accumulator" }
+once_cell = "1.19"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+short_group_sig = { path = "crypto/short_group_sig" }
+ethereum-types = "0.15.1"
 
 [features]
 mpc = ["libp2p"]
+interactive = []
 
 [[bin]]
 name = "issuer_onchain"
@@ -50,43 +59,58 @@ required-features = ["mpc"]
 
 [[bin]]
 name = "client"
-path = "src/bin/client.rs"
+path = "src/bin/client/main.rs"
 required-features = ["mpc"]
+
 
 [[bin]]
 name = "ttp"
 path = "src/bin/ttp.rs"
 
-# Exporter to generate PoK JSON matching TTP deterministic key
+
+
 [[bin]]
-name = "export_pok_json_ttp"
-path = "src/bin/export_pok_json_ttp.rs"
+name = "export_pok_json"
+path = "src/bin/export_pok_json.rs"
 
-# Examples
-[[example]]
-name = "basic_credential"
-path = "examples/basic_credential.rs"
 
-[[example]]
-name = "blind_credential"
-path = "examples/blind_credential.rs"
+[[bin]]
+name = "cred_status"
+path = "src/bin/cred_status.rs"
 
-[[example]]
-name = "selective_disclosure"
-path = "examples/selective_disclosure.rs"
+[[bin]]
+name = "opener"
+path = "src/bin/opener.rs"
 
-[[example]]
-name = "threshold_demo_simple"
-path = "examples/threshold_system/threshold_demo_simple.rs"
+[[bin]]
+name = "service_provider"
+path = "src/bin/service_provider.rs"
 
-[[example]]
-name = "threshold_demo1"
-path = "examples/threshold_system/threshold_demo1.rs"
+[[bin]]
+name = "opener_threshold"
+path = "src/bin/opener_threshold.rs"
+required-features = ["mpc"]
 
-[[example]]
-name = "hybrid_onchain_verification"
-path = "examples/hybrid_onchain_verification.rs"
+[[bin]]
+name = "opener_aggregator"
+path = "src/bin/opener_aggregator.rs"
+required-features = ["mpc"]
 
-[[example]]
-name = "bbs_proof_system_demo"
-path = "examples/bbs_proof_system_demo.rs"
+[[bin]]
+name = "issuance_metrics"
+path = "metrics/scenarios/issuance_sum.rs"
+
+[[bin]]
+name = "presentation_metrics"
+path = "metrics/scenarios/presentation_metrics.rs"
+[[bin]]
+name = "acc_register_info_metrics"
+path = "metrics/scenarios/acc_register_info_metrics.rs"
+
+[[bin]]
+name = "sp_agg_open_revoke"
+path = "metrics/scenarios/sp_agg_open_revoke.rs"
+
+[[bin]]
+name = "deploy_gas_metrics"
+path = "metrics/scenarios/deploy_gas_metrics.rs"

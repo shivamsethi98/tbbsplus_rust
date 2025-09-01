@@ -1,4 +1,4 @@
-//! Proof of knowledge of BBS+ signature and corresponding messages as per section 4.5 of the BBS+ paper
+ //! Proof of knowledge of BBS+ signature and corresponding messages as per section 4.5 of the BBS+ paper
 //! # Examples
 //!
 //! Creating proof of knowledge of signature and verifying it:
@@ -132,6 +132,14 @@ pub struct PoKOfSignatureG1Protocol<E: Pairing> {
     pub sc_comm_2: SchnorrCommitment<E::G1Affine>,
     #[serde_as(as = "Vec<ArkObjectBytes>")]
     sc_wits_2: Vec<E::ScalarField>,
+    // Optional encryption relation (A', Ybar) with witnesses (a3=r1^{-1}, k)
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    Y_bar: Option<E::G1Affine>,
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    T1_enc: Option<E::G1Affine>,
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    T2_enc: Option<E::G1Affine>,
+    sc_comm_enc: Option<PokPedersenCommitmentProtocol<E::G1Affine>>,
 }
 
 /// Proof of knowledge of BBS+ signature in G1. It contains the randomized signature, commitment (Schnorr step 1)
@@ -156,6 +164,14 @@ pub struct PoKOfSignatureG1Proof<E: Pairing> {
     /// for Either is not supported out of the box and had to be implemented
     pub sc_resp_2: Option<SchnorrResponse<E::G1Affine>>,
     pub sc_partial_resp_2: Option<PartialSchnorrResponse<E::G1Affine>>,
+    // --- Optional encryption relation outputs ---
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    pub Y_bar: Option<E::G1Affine>,
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    pub T1_enc: Option<E::G1Affine>,
+    #[serde_as(as = "Option<ArkObjectBytes>")]
+    pub T2_enc: Option<E::G1Affine>,
+    pub sc_resp_enc: Option<PokPedersenCommitment<E::G1Affine>>,
 }
 
 impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
@@ -253,6 +269,110 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
             sc_comm_1,
             sc_comm_2,
             sc_wits_2: wits_2,
+            Y_bar: None,
+            T1_enc: None,
+            T2_enc: None,
+            sc_comm_enc: None,
+        })
+    }
+
+    /// Initiate the protocol and additionally set up the encryption relation with opener public key `Y_bar`.
+    /// Proves T2_enc = A' * a3 + Y_bar * k and produces T1_enc = g1 * k bound to the same challenge.
+    pub fn init_with_encryption<'a, MBI, R: RngCore>(
+        rng: &mut R,
+        signature: &SignatureG1<E>,
+        params: &SignatureParamsG1<E>,
+        messages_and_blindings: MBI,
+        Y_bar: &E::G1Affine,
+    ) -> Result<Self, BBSPlusError>
+    where
+        MBI: IntoIterator<Item = MessageOrBlinding<'a, E::ScalarField>>,
+    {
+        let (messages, indexed_blindings) =
+            match split_messages_and_blindings(rng, messages_and_blindings, params) {
+                Ok(t) => t,
+                Err(l) => {
+                    return Err(BBSPlusError::MessageCountIncompatibleWithSigParams(
+                        l,
+                        params.supported_message_count(),
+                    ))
+                }
+            };
+
+        let mut r1 = E::ScalarField::rand(rng);
+        while r1.is_zero() {
+            r1 = E::ScalarField::rand(rng);
+        }
+        let r2 = E::ScalarField::rand(rng);
+        let r3 = r1.inverse().unwrap();
+
+        // b = (e+x) * A = g1 + h_0*s + sum(h_i*m_i) for all i in I
+        let b = params.b(messages.iter().enumerate(), &signature.s)?;
+
+        // A' = A * r1
+        let A_prime = signature.A.mul_bigint(r1.into_bigint());
+        // A_bar = r1 * b - e * A'
+        let b_r1 = b * r1;
+        let A_bar = b_r1 - (A_prime.mul_bigint(signature.e.into_bigint()));
+        // d = r1 * b - r2 * h_0
+        let d = b_r1 - params.h_0.mul_bigint(r2.into_bigint());
+        let d_affine = d.into_affine();
+        // s' = s - r2*r3
+        let s_prime = signature.s - (r2 * r3);
+
+        let A_prime_affine = A_prime.into_affine();
+
+        // Commit for relation 1: witnesses (-e, r2) over (A', h0)
+        let sc_comm_1 = PokPedersenCommitmentProtocol::init(
+            -signature.e,
+            E::ScalarField::rand(rng),
+            &A_prime_affine,
+            r2,
+            E::ScalarField::rand(rng),
+            &params.h_0,
+        );
+
+        // Prepare relation 2 witnesses: all unrevealed m_j, -r3, s'
+        let h_blinding_message = indexed_blindings
+            .into_iter()
+            .map(|(idx, blinding)| (params.h[idx], blinding, messages[idx]));
+
+        let (bases_2, randomness_2, wits_2): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(
+            h_blinding_message
+                .into_iter()
+                .chain([(d_affine, rand(rng), -r3), (params.h_0, rand(rng), s_prime)]),
+        );
+
+        // Commit for relation 2
+        let sc_comm_2 = SchnorrCommitment::new(&bases_2, randomness_2);
+
+        // Encryption relation witnesses (a3=r3, k) over (A', Y_bar)
+        let k = E::ScalarField::rand(rng);
+        let T1_enc = params.g1.mul_bigint(k.into_bigint()).into_affine();
+        let T2_enc = (A_prime_affine
+            .mul_bigint(r3.into_bigint())
+            + Y_bar.into_group().mul_bigint(k.into_bigint()))
+        .into_affine();
+        let sc_comm_enc = PokPedersenCommitmentProtocol::init(
+            r3,
+            E::ScalarField::rand(rng),
+            &A_prime_affine,
+            k,
+            E::ScalarField::rand(rng),
+            Y_bar,
+        );
+
+        Ok(Self {
+            A_prime: A_prime_affine,
+            A_bar: A_bar.into_affine(),
+            d: d_affine,
+            sc_comm_1,
+            sc_comm_2,
+            sc_wits_2: wits_2,
+            Y_bar: Some(*Y_bar),
+            T1_enc: Some(T1_enc),
+            T2_enc: Some(T2_enc),
+            sc_comm_enc: Some(sc_comm_enc),
         })
     }
 
@@ -261,18 +381,35 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
         &self,
         revealed_msgs: &BTreeMap<usize, E::ScalarField>,
         params: &SignatureParamsG1<E>,
-        writer: W,
+        mut writer: W,
     ) -> Result<(), BBSPlusError> {
-        Self::compute_challenge_contribution(
-            &self.A_prime,
-            &self.A_bar,
-            &self.d,
-            &self.sc_comm_1.t,
-            &self.sc_comm_2.t,
-            revealed_msgs,
-            params,
-            writer,
-        )
+        // Base PoK transcript bytes
+        self.A_prime.serialize_compressed(&mut writer)?;
+        self.A_bar.serialize_compressed(&mut writer)?;
+        self.d.serialize_compressed(&mut writer)?;
+        params.h_0.serialize_compressed(&mut writer)?;
+        params.g1.serialize_compressed(&mut writer)?;
+        self.sc_comm_1.t.serialize_compressed(&mut writer)?;
+        self.sc_comm_2.t.serialize_compressed(&mut writer)?;
+        for i in 0..params.h.len() {
+            params.h[i].serialize_compressed(&mut writer)?;
+            if let Some(m) = revealed_msgs.get(&i) {
+                m.serialize_compressed(&mut writer)?;
+            }
+        }
+        // Optional encryption relation bytes
+        if let (Some(yb), Some(t1e), Some(t2e), Some(enc)) = (
+            self.Y_bar.as_ref(),
+            self.T1_enc.as_ref(),
+            self.T2_enc.as_ref(),
+            self.sc_comm_enc.as_ref(),
+        ) {
+            yb.serialize_compressed(&mut writer)?;
+            t1e.serialize_compressed(&mut writer)?;
+            enc.t.serialize_compressed(&mut writer)?;
+            t2e.serialize_compressed(&mut writer)?;
+        }
+        Ok(())
     }
 
     /// Generate proof. Post-challenge phase of the protocol.
@@ -285,6 +422,19 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
         // Schnorr response for relation `g1 + \sum_{i in D}(h_i*m_i)` = `d*r3 + {h_0}*{-s'} + \sum_{j not in D}(h_j*{-m_j})`
         let sc_resp_2 = self.sc_comm_2.response(&self.sc_wits_2, challenge)?;
 
+        // Optional encryption relation response
+        let (ybar_opt, t1_opt, t2_opt, enc_opt) = if let (Some(yb), Some(t1), Some(t2), Some(enc)) = (
+            mem::take(&mut self.Y_bar),
+            mem::take(&mut self.T1_enc),
+            mem::take(&mut self.T2_enc),
+            mem::take(&mut self.sc_comm_enc),
+        ) {
+            let r = enc.gen_proof(challenge);
+            (Some(yb), Some(t1), Some(t2), Some(r))
+        } else {
+            (None, None, None, None)
+        };
+
         Ok(PoKOfSignatureG1Proof {
             A_prime: self.A_prime,
             A_bar: self.A_bar,
@@ -293,6 +443,10 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
             T2: self.sc_comm_2.t,
             sc_resp_2: Some(sc_resp_2),
             sc_partial_resp_2: None,
+            Y_bar: ybar_opt,
+            T1_enc: t1_opt,
+            T2_enc: t2_opt,
+            sc_resp_enc: enc_opt,
         })
     }
 
@@ -318,6 +472,19 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
         // Schnorr response for relation `g1 + \sum_{i in D}(h_i*m_i)` = `d*r3 + {h_0}*{-s'} + \sum_{j not in D}(h_j*{-m_j})`
         let sc_resp_2 = self.sc_comm_2.partial_response(wits, challenge)?;
 
+        // Optional encryption relation response
+        let (ybar_opt, t1_opt, t2_opt, enc_opt) = if let (Some(yb), Some(t1), Some(t2), Some(enc)) = (
+            mem::take(&mut self.Y_bar),
+            mem::take(&mut self.T1_enc),
+            mem::take(&mut self.T2_enc),
+            mem::take(&mut self.sc_comm_enc),
+        ) {
+            let r = enc.gen_proof(challenge);
+            (Some(yb), Some(t1), Some(t2), Some(r))
+        } else {
+            (None, None, None, None)
+        };
+
         Ok(PoKOfSignatureG1Proof {
             A_prime: self.A_prime,
             A_bar: self.A_bar,
@@ -326,6 +493,10 @@ impl<E: Pairing> PoKOfSignatureG1Protocol<E> {
             T2: self.sc_comm_2.t,
             sc_resp_2: None,
             sc_partial_resp_2: Some(sc_resp_2),
+            Y_bar: ybar_opt,
+            T1_enc: t1_opt,
+            T2_enc: t2_opt,
+            sc_resp_enc: enc_opt,
         })
     }
 
@@ -434,18 +605,35 @@ impl<E: Pairing> PoKOfSignatureG1Proof<E> {
         &self,
         revealed_msgs: &BTreeMap<usize, E::ScalarField>,
         params: &SignatureParamsG1<E>,
-        writer: W,
+        mut writer: W,
     ) -> Result<(), BBSPlusError> {
-        PoKOfSignatureG1Protocol::compute_challenge_contribution(
-            &self.A_prime,
-            &self.A_bar,
-            &self.d,
-            &self.sc_resp_1.t,
-            &self.T2,
-            revealed_msgs,
-            params,
-            writer,
-        )
+        // Base PoK transcript bytes
+        self.A_prime.serialize_compressed(&mut writer)?;
+        self.A_bar.serialize_compressed(&mut writer)?;
+        self.d.serialize_compressed(&mut writer)?;
+        params.h_0.serialize_compressed(&mut writer)?;
+        params.g1.serialize_compressed(&mut writer)?;
+        self.sc_resp_1.t.serialize_compressed(&mut writer)?;
+        self.T2.serialize_compressed(&mut writer)?;
+        for i in 0..params.h.len() {
+            params.h[i].serialize_compressed(&mut writer)?;
+            if let Some(m) = revealed_msgs.get(&i) {
+                m.serialize_compressed(&mut writer)?;
+            }
+        }
+        // Optional encryption relation bytes
+        if let (Some(yb), Some(t1e), Some(t2e), Some(enc)) = (
+            self.Y_bar.as_ref(),
+            self.T1_enc.as_ref(),
+            self.T2_enc.as_ref(),
+            self.sc_resp_enc.as_ref(),
+        ) {
+            yb.serialize_compressed(&mut writer)?;
+            t1e.serialize_compressed(&mut writer)?;
+            enc.t.serialize_compressed(&mut writer)?;
+            t2e.serialize_compressed(&mut writer)?;
+        }
+        Ok(())
     }
 
     /// Get the response from post-challenge phase of the Schnorr protocol for the given message index
@@ -585,35 +773,51 @@ impl<E: Pairing> PoKOfSignatureG1Proof<E> {
         // pr = -g1 + \sum_{i in D}(h_i*{-m_i}) = -(g1 + \sum_{i in D}(h_i*{m_i}))
         let pr = -E::G1::msm_unchecked(&bases_revealed, &exponents) - g1;
         let pr = pr.into_affine();
-        if let Some(resp) = &self.sc_resp_2 {
+        let base_check: Result<(), BBSPlusError> = if let Some(resp) = &self.sc_resp_2 {
             if missing_responses.is_some() {
-                return Err(BBSPlusError::MissingResponsesProvidedForFullSchnorrProofVerification);
-            }
-            return match resp.is_valid(&bases_2, &pr, &self.T2, challenge) {
-                Ok(()) => Ok(()),
-                Err(SchnorrError::InvalidResponse) => {
-                    Err(BBSPlusError::SecondSchnorrVerificationFailed)
+                Err(BBSPlusError::MissingResponsesProvidedForFullSchnorrProofVerification)
+            } else {
+                match resp.is_valid(&bases_2, &pr, &self.T2, challenge) {
+                    Ok(()) => Ok(()),
+                    Err(SchnorrError::InvalidResponse) => {
+                        Err(BBSPlusError::SecondSchnorrVerificationFailed)
+                    }
+                    Err(other) => Err(BBSPlusError::SchnorrError(other)),
                 }
-                Err(other) => Err(BBSPlusError::SchnorrError(other)),
-            };
+            }
         } else if let Some(resp) = &self.sc_partial_resp_2 {
             if missing_responses.is_none() {
-                return Err(BBSPlusError::MissingResponsesNeededForPartialSchnorrProofVerification);
-            }
-            let adjusted_missing = msg_index_map_to_schnorr_response_map(
-                missing_responses.unwrap(),
-                revealed_msgs.keys(),
-            );
-            return match resp.is_valid(&bases_2, &pr, &self.T2, challenge, adjusted_missing) {
-                Ok(()) => Ok(()),
-                Err(SchnorrError::InvalidResponse) => {
-                    Err(BBSPlusError::SecondSchnorrVerificationFailed)
+                Err(BBSPlusError::MissingResponsesNeededForPartialSchnorrProofVerification)
+            } else {
+                let adjusted_missing = msg_index_map_to_schnorr_response_map(
+                    missing_responses.unwrap(),
+                    revealed_msgs.keys(),
+                );
+                match resp.is_valid(&bases_2, &pr, &self.T2, challenge, adjusted_missing) {
+                    Ok(()) => Ok(()),
+                    Err(SchnorrError::InvalidResponse) => {
+                        Err(BBSPlusError::SecondSchnorrVerificationFailed)
+                    }
+                    Err(other) => Err(BBSPlusError::SchnorrError(other)),
                 }
-                Err(other) => Err(BBSPlusError::SchnorrError(other)),
-            };
+            }
         } else {
             Err(BBSPlusError::NeedEitherPartialOrCompleteSchnorrResponse)
-        }
+        };
+
+        base_check.and_then(|_| -> Result<(), BBSPlusError> {
+            // Optional 3rd Schnorr: encryption relation T2_enc = A' * a3 + Ybar * k
+            if let (Some(ybar), Some(t2e), Some(enc)) = (
+                self.Y_bar.as_ref(),
+                self.T2_enc.as_ref(),
+                self.sc_resp_enc.as_ref(),
+            ) {
+                if !enc.verify(t2e, &self.A_prime, ybar, challenge) {
+                    return Err(BBSPlusError::ThirdSchnorrVerificationFailed);
+                }
+            }
+            Ok(())
+        })
     }
 }
 

@@ -6,6 +6,8 @@ pragma solidity ^0.8.24;
 library Bls12381 {
     address internal constant G1ADD = address(0x0b);
     address internal constant G1MSM = address(0x0c);
+    address internal constant G2ADD = address(0x0d);
+    address internal constant G2MSM = address(0x0e);
 
     error BlsPrecompileFailed();
     error BadLen();
@@ -93,6 +95,55 @@ library Bls12381 {
                 out[o + j] = p[j];
             }
             o += 128;
+            // append 32-byte big-endian scalar
+            bytes32 s = bytes32(scalars[i]);
+            for (uint256 j = 0; j < 32; j++) {
+                out[o + j] = s[j];
+            }
+            o += 32;
+        }
+    }
+
+    /// @notice Call G2 addition precompile with 2 concatenated 256-byte points.
+    /// @param a 256-byte uncompressed G2 point
+    /// @param b 256-byte uncompressed G2 point
+    /// @return c 256-byte uncompressed G2 point result
+    function g2add(bytes memory a, bytes memory b) internal view returns (bytes memory c) {
+        require(a.length == 256 && b.length == 256, "bad G2 len");
+        bytes memory input = bytes.concat(a, b);
+        (bool ok, bytes memory out) = G2ADD.staticcall(input);
+        if (!ok || out.length != 256) revert BlsPrecompileFailed();
+        return out;
+    }
+
+    /// @notice Call G2 MSM precompile with concatenated pairs: (256-byte point || 32-byte scalar)
+    /// @param input concatenated pairs for k>=1; length must be 288*k
+    /// @return out256 256-byte uncompressed G2 point result of MSM
+    function g2msm(bytes memory input) internal view returns (bytes memory out256) {
+        require(input.length % 288 == 0 && input.length > 0, "bad G2MSM len");
+        (bool ok, bytes memory out) = G2MSM.staticcall(input);
+        if (!ok || out.length != 256) revert BlsPrecompileFailed();
+        return out;
+    }
+
+    /// @notice Utilities to help build G2 MSM calldata.
+    function concatMSM_G2(bytes[] memory points256, uint256[] memory scalars)
+        internal
+        pure
+        returns (bytes memory out)
+    {
+        require(points256.length == scalars.length, "len mismatch");
+        uint256 k = points256.length;
+        out = new bytes(288 * k);
+        uint256 o = 0;
+        for (uint256 i = 0; i < k; i++) {
+            bytes memory p = points256[i];
+            require(p.length == 256, "bad G2 pt");
+            // copy 256-byte point
+            for (uint256 j = 0; j < 256; j++) {
+                out[o + j] = p[j];
+            }
+            o += 256;
             // append 32-byte big-endian scalar
             bytes32 s = bytes32(scalars[i]);
             for (uint256 j = 0; j < 32; j++) {

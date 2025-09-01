@@ -1,14 +1,15 @@
-pub mod config;
-pub mod net;
 pub mod types;
 pub mod mesh;
+pub mod helpers;
 #[cfg(feature = "mpc")]
 pub mod mpc;
 pub mod threshold_phases;
-// pub mod threshold_simple;
-// pub mod threshold_robust;
-// pub mod mesh_v2;  // Using mesh_v2_simple instead
-pub mod mesh_v2_simple;
-// pub mod threshold_coordinator;
-pub mod session;
+
+// Phase 0 scaffolding: new modular boundaries (no behavior changes yet)
+pub mod config;
+pub mod persistence;
+pub mod onchain;
+pub mod chain;
+pub mod crypto;
+// vb_accum was removed; use vb_accumulator crate directly in binaries
 

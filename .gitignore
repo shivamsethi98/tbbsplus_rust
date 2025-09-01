@@ -2,16 +2,25 @@
 /typechain-types
 /artifacts
 /out
-/.runtime
+.runtime*
 /.venv/
 /.vscode/
 /.venv
 # Added by cargo
 #
 # already existing elements were commented out
-
+/test
+/tests
+/redundant_files
+/contracts_bak
 #/target
 node_modules
 /cache
 /cache_hardhat
 /docs
+/redundant_files
+/scripts/cache_hardhat/
+/metrics/results/
+/metrics/**/*.ndjson
+*.env
+*.hex
