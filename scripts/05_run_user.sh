@@ -24,4 +24,4 @@ REGISTRY_CONTRACT=$REGISTRY_CONTRACT \
 PARAMS_CONTRACT=$PARAMS_CONTRACT \
 CRED_NAME=$CRED_NAME \
 MESSAGE_COUNT=$MESSAGE_COUNT \
-METRICS=1 cargo run --bin client --features mpc,interactive
+cargo run --bin client --features mpc,interactive

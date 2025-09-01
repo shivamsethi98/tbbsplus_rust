@@ -35,7 +35,7 @@ for i in $(seq 1 $THRESHOLD); do
 		TOTAL=$TOTAL \
 		MESSAGE_COUNT=$MESSAGE_COUNT \
 	SHARES_FILE=${SHARES_FILE:-.runtime.shares.json} \
-		METRICS=1 cargo run --features mpc --bin issuer_onchain | sed -u "s/^/[issuer-$i] /"
+		cargo run --features mpc --bin issuer_onchain | sed -u "s/^/[issuer-$i] /"
 	) &
 
 done

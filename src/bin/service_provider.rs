@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             if auto_revoke {
                 if let Some(e_u) = e_for_revoke {
                     let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env.clone(), e_u))?;
-                    let t0 = std::time::Instant::now();
+                    let rev_start = std::time::Instant::now();
                     let pending = call.send().await?;
                     let rcpt = pending.await?;
                     println!("ServiceProvider(auto): requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
@@ -180,7 +180,6 @@ async fn main() -> anyhow::Result<()> {
                         })();
                     }
                     // Wait for MemberRevoked to compute revoke E2E
-                    let rev_start = std::time::Instant::now();
                     let mut saw_rev = false;
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     while std::time::Instant::now() < deadline {
