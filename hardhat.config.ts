@@ -5,7 +5,7 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-const INFURA_KEY = process.env.INFURA_KEY || "c9bc72c05c7746e59893a52424e9e478";
+const INFURA_KEY = process.env.INFURA_KEY;
 
 const FORK_URL = process.env.FORK_URL || `https://mainnet.infura.io/v3/${INFURA_KEY}`;
 const SHOULD_FORK = process.env.FORK === "1";
