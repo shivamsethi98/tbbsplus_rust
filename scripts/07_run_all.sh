@@ -15,7 +15,7 @@ set -a; source .runtime.env; set +a
 METRICS_FILE_BASE=${METRICS_FILE_BASE:-metrics/results}
 
 if ! command -v gnome-terminal >/dev/null 2>&1; then
-  echo "[runner] gnome-terminal is required for this script (no background fallback)." >&2
+  echo "[runner] gnome-terminal is required for this script." >&2
   exit 1
 fi
 

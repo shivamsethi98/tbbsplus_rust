@@ -13,7 +13,8 @@ use ethers::types::U256;
 pub use bbs_plus::proof::PoKOfSignatureG1Proof as PokProof;
 
 
-use crate::orchestration::crypto::encoding::{fr_to_u256, g1_to_eip2537_bytes, keccak_to_fr, eip2537_g1_to_affine};
+use crate::orchestration::crypto::encoding::{fr_to_u256, g1_to_eip2537_bytes, eip2537_g1_to_affine};
+use sha3::Keccak256;
 
 pub struct EncExtras {
     pub t1_b: EthBytes,
@@ -43,7 +44,7 @@ pub fn build_pok_and_proof(
     let mut transcript = Vec::new();
     pok.challenge_contribution(&revealed_msgs, params_bbs, &mut transcript)
         .map_err(|e| anyhow::anyhow!("challenge contrib failed: {:?}", e))?;
-    let c_fr = keccak_to_fr(&transcript);
+    let c_fr = compute_random_oracle_challenge::<Fr, Keccak256>(&transcript);
     let proof = pok.gen_proof(&c_fr).map_err(|e| anyhow::anyhow!("gen_proof failed: {:?}", e))?;
     Ok((proof, c_fr, revealed_idx.clone()))
 }
