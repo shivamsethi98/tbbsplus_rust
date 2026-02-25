@@ -526,5 +526,6 @@ pub mod tests {
         check(&mut rng, ote_params, 5, 8, 30, 3, &gadget_vector);
         check(&mut rng, ote_params, 10, 20, 10, 3, &gadget_vector);
         check(&mut rng, ote_params, 20, 30, 10, 3, &gadget_vector);
+        check(&mut rng, ote_params, 5, 8, 128, 3, &gadget_vector);
     }
 }

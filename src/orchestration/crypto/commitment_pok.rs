@@ -5,7 +5,7 @@ use ark_bls12_381::{Bls12_381, Fr};
 pub fn verify_from_fields(
     params_bbs: &bbs_plus::prelude::SignatureParamsG1<Bls12_381>,
     commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
-    sid: u64,
+    user_id: &ethers::types::U256,
     cred_name: &str,
     revealed_idx: &[u32],
     revealed_vals: &[ethers::types::U256],
@@ -18,7 +18,7 @@ pub fn verify_from_fields(
     crate::orchestration::crypto::pok::verify_commitment_pok_from_fields(
         params_bbs,
         commitment,
-        sid,
+        user_id,
         cred_name,
         &revealed_idx.to_vec(),
         &revealed_vals.to_vec(),

@@ -32,6 +32,9 @@ contract Params {
     // Opener keys for encryption/accumulator: Ybar in G1 (128B) and opener pkG2 (256B)
     bytes openerYbarG1;
     bytes openerPkG2;
+    // Batch sizes for aggregators (0 = no batching / single-user fallback)
+    uint256 batchSizeReq;
+    uint256 batchSizePres;
     }
     mapping(uint256 => CredParams) private paramsById;
 
@@ -64,6 +67,8 @@ contract Params {
         uint256 t,
         uint256 n,
         uint256[] memory public_m_encoding,
+        uint256 batchSizeReq,
+        uint256 batchSizePres,
         bytes calldata blob,
         uint16[] calldata indices,
         bytes[] calldata commitmentsG2
@@ -88,6 +93,8 @@ contract Params {
         if (cp.n != 0) { require(cp.n == n, "n mismatch"); }
         cp.n = n;
         cp.public_m_encoding = public_m_encoding;
+        cp.batchSizeReq = batchSizeReq;
+        cp.batchSizePres = batchSizePres;
         // hLen is maintained by setHByName; do not overwrite here
 
         // Persist compact blob directly into storage fields; keep cp.H set via setHByName
@@ -203,6 +210,21 @@ contract Params {
         require(id != 0, "not found");
         CredParams storage cp = paramsById[id];
         return cp.H;
+    }
+
+    // --- Batch size config ---
+    function getBatchSizesByName(string memory name) external view returns (uint256, uint256) {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        CredParams storage cp = paramsById[id];
+        return (cp.batchSizeReq, cp.batchSizePres);
+    }
+
+    function setBatchSizes(string memory name, uint256 reqSize, uint256 presSize) external onlyOwner {
+        uint256 id = nameToId[name];
+        require(id != 0, "not found");
+        paramsById[id].batchSizeReq = reqSize;
+        paramsById[id].batchSizePres = presSize;
     }
 
     // --- Opener admin (roster and multiaddrs) ---

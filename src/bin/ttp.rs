@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let n: u16 = env::var("TOTAL").unwrap_or_else(|_| "4".into()).parse()?;
     let mcount: u32 = env::var("MESSAGE_COUNT").unwrap_or_else(|_| "5".into()).parse()?;
+    let batch_size_req: u64 = env::var("BATCH_SIZE_REQ").unwrap_or_else(|_| "1".into()).parse()?;
+    let batch_size_pres: u64 = env::var("BATCH_SIZE_PRES").unwrap_or_else(|_| "1".into()).parse()?;
 
     let ws = Provider::<Ws>::connect(ws_url).await?;
     let client = std::sync::Arc::new(SignerMiddleware::new(ws, owner_pk));
@@ -197,6 +199,8 @@ async fn main() -> anyhow::Result<()> {
             t_issuer.into(),
             n.into(),
             vec![U256::from(1u64), U256::from(2u64)],
+            batch_size_req.into(),
+            batch_size_pres.into(),
             blob.clone().into(),
             indices.clone(),
             commits.clone(),
@@ -262,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
         lines.push_str(&format!("OPENER_YBAR_128=0x{}\n", hex::encode(&ybar_bytes)));
         // Avoid clashing with EOA private-key env var name; export G2 public key under an explicit name
         lines.push_str(&format!("OPENER_PK_G2_256=0x{}\n", hex::encode(&opener_pk_bytes)));
+        lines.push_str(&format!("BATCH_SIZE_REQ={}\n", batch_size_req));
+        lines.push_str(&format!("BATCH_SIZE_PRES={}\n", batch_size_pres));
         
         use std::fs::OpenOptions;
         let mut file = OpenOptions::new()

@@ -7,7 +7,6 @@ use blake2::Blake2b512;
 use ark_ff::PrimeField;
 use schnorr_pok::{SchnorrChallengeContributor, pok_generalized_pedersen::{SchnorrCommitment, compute_random_oracle_challenge}};
 use ethers::types::Bytes as EthBytes;
-use ethers::types::TxHash;
 use ethers::types::U256;
 
 pub use bbs_plus::proof::PoKOfSignatureG1Proof as PokProof;
@@ -188,7 +187,7 @@ pub fn build_commitment_pok(
     hidden_msgs: &std::collections::BTreeMap<usize, Fr>,
     blinding: &Fr,
     mcount: u32,
-    sid: u64,
+    user_id: &U256,
     cred_name: &str,
     revealed_idx: &Vec<u32>,
     revealed_vals: &Vec<U256>,
@@ -217,7 +216,7 @@ pub fn build_commitment_pok(
     // Transcript for challenge: domain separator + sid + name + mcount + revealed pairs sorted + hidden idx set + commitment + t + context
     let mut chal_bytes = Vec::new();
     chal_bytes.extend_from_slice(b"TBBS+_Blind_PoK_v1");
-    chal_bytes.extend_from_slice(&sid.to_be_bytes());
+    { let mut uid_be = [0u8; 32]; user_id.to_big_endian(&mut uid_be); chal_bytes.extend_from_slice(&uid_be); }
     chal_bytes.extend_from_slice(&(mcount as u64).to_be_bytes());
     chal_bytes.extend_from_slice(cred_name.as_bytes());
     // revealed pairs sorted by idx
@@ -274,7 +273,7 @@ pub fn build_commitment_pok(
 pub fn verify_commitment_pok_from_fields(
     params: &SignatureParamsG1<Bls12_381>,
     commitment: &<Bls12_381 as ark_ec::pairing::Pairing>::G1Affine,
-    sid: u64,
+    user_id: &U256,
     cred_name: &str,
     revealed_idx: &Vec<u32>,
     revealed_vals: &Vec<U256>,
@@ -297,7 +296,7 @@ pub fn verify_commitment_pok_from_fields(
     // Recompute challenge transcript
     let mut chal_bytes = Vec::new();
     chal_bytes.extend_from_slice(b"TBBS+_Blind_PoK_v1");
-    chal_bytes.extend_from_slice(&sid.to_be_bytes());
+    { let mut uid_be = [0u8; 32]; user_id.to_big_endian(&mut uid_be); chal_bytes.extend_from_slice(&uid_be); }
     chal_bytes.extend_from_slice(&(params.h.len() as u64).to_be_bytes());
     chal_bytes.extend_from_slice(cred_name.as_bytes());
     let mut pairs: Vec<(u32, &U256)> = revealed_idx.iter().cloned().zip(revealed_vals.iter()).collect();

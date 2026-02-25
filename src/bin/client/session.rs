@@ -11,7 +11,6 @@ use ethers::types::{Bytes as EthBytes, U256};
 pub struct Session {
     pub user_id: String,
     pub cred_name: String,
-    pub sid: u64,
     pub params: ParamsBundle,
     pub messages: Vec<Fr>,
     pub signature: SignatureG1<Bls12_381>,
@@ -22,13 +21,12 @@ impl Session {
     pub async fn load<M: ethers::providers::Middleware + 'static>(
         user_id: &str,
         cred_name: &str,
-        sid: u64,
         params_contract: &ParamsContract<M>,
     ) -> anyhow::Result<Self> {
         let params = onchain::fetch_params_bundle(params_contract, cred_name).await?;
         let store = CredentialsStore::new(user_id, cred_name);
 
-        let msgs_hex: Vec<String> = match store.load_messages(sid)? {
+        let msgs_hex: Vec<String> = match store.load_messages()? {
             Some(MessagesFile(v)) => v,
             None => anyhow::bail!("messages.json missing"),
         };
@@ -38,7 +36,7 @@ impl Session {
             messages.push(Fr::deserialize_compressed(&bytes[..])?);
         }
         let sig_file = store
-            .load_signature(sid)?
+            .load_signature()?
             .ok_or_else(|| anyhow::anyhow!("agg_signature.json missing"))?;
         let a_hex = sig_file.a.as_str();
         let e_hex = sig_file.e.as_str();
@@ -49,12 +47,11 @@ impl Session {
         let e = Fr::deserialize_compressed(&hex::decode(e_hex.trim_start_matches("0x"))?[..])?;
         let s = Fr::deserialize_compressed(&hex::decode(s_hex.trim_start_matches("0x"))?[..])?;
         let signature = SignatureG1::<Bls12_381> { A: a, e, s };
-        let revealed = store.load_revealed(sid)?;
+        let revealed = store.load_revealed()?;
 
         Ok(Session {
             user_id: user_id.to_owned(),
             cred_name: cred_name.to_owned(),
-            sid,
             params,
             messages,
             signature,
@@ -70,7 +67,6 @@ impl Session {
 pub struct RequestSession {
     pub user_id: String,
     pub cred_name: String,
-    pub sid: u64,
     pub params: ParamsBundle,
     pub revealed_idx: Vec<u32>,
     pub revealed_vals: Vec<U256>,
@@ -89,7 +85,6 @@ impl RequestSession {
     pub fn new(
         user_id: &str,
         cred_name: &str,
-        sid: u64,
         params: ParamsBundle,
         revealed_idx: Vec<u32>,
         revealed_vals: Vec<U256>,
@@ -103,6 +98,6 @@ impl RequestSession {
         resp_vec_u256: Vec<U256>,
         context_bytes: ethers::types::Bytes,
     ) -> Self {
-        Self { user_id: user_id.to_owned(), cred_name: cred_name.to_owned(), sid, params, revealed_idx, revealed_vals, commitment_u, commitment_b, h0_b, h_b, hidden_idx_vec, t_b, c_u256, resp_vec_u256, context_bytes }
+        Self { user_id: user_id.to_owned(), cred_name: cred_name.to_owned(), params, revealed_idx, revealed_vals, commitment_u, commitment_b, h0_b, h_b, hidden_idx_vec, t_b, c_u256, resp_vec_u256, context_bytes }
     }
 }

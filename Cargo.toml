@@ -42,6 +42,7 @@ futures = "0.3"
 ethers = { version = "2", default-features = false, features = ["abigen", "ws", "rustls"] }
 vb_accumulator = { path = "crypto/vb_accumulator" }
 once_cell = "1.19"
+fs2 = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -79,10 +80,6 @@ name = "cred_status"
 path = "src/bin/cred_status.rs"
 
 [[bin]]
-name = "opener"
-path = "src/bin/opener.rs"
-
-[[bin]]
 name = "service_provider"
 path = "src/bin/service_provider.rs"
 
@@ -114,3 +111,15 @@ path = "metrics/scenarios/sp_agg_open_revoke.rs"
 [[bin]]
 name = "deploy_gas_metrics"
 path = "metrics/scenarios/deploy_gas_metrics.rs"
+
+[[bin]]
+name = "benchmark_batching"
+path = "src/bin/benchmark_batching.rs"
+
+[[bin]]
+name = "presentation_aggregator"
+path = "src/bin/presentation_aggregator.rs"
+
+[[bin]]
+name = "request_aggregator"
+path = "src/bin/request_aggregator.rs"

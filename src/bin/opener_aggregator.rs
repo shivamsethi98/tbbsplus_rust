@@ -20,10 +20,9 @@ use tbbsplus_rust::orchestration::mesh::p2p::Mesh;
 #[cfg(feature = "mpc")]
 use libp2p::Multiaddr;
 use secret_sharing_and_dkg::common::lagrange_basis_at_0;
-// Use vb_accumulator directly (no wrapper)
+// Use vb_accumulator directly for membership verification (no witness batch updates)
 use std::time::Instant;
 use std::io::Write as _;
-use vb_accumulator::witness::{MembershipWitness as VbMembershipWitness, Witness as VbWitnessTrait};
 use vb_accumulator::positive::Accumulator as _;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -112,6 +111,11 @@ async fn main() -> anyhow::Result<()> {
     let chain_id: u64 = env::var("CHAIN_ID").unwrap_or_else(|_| "31337".into()).parse()?;
     let cred_name = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
     let participant_id: u16 = env::var("PID").unwrap_or_else(|_| "1".into()).parse()?;
+
+    // --- Batch accumulator config ---
+    let batch_add_size: usize = env::var("BATCH_ADD_SIZE").unwrap_or_else(|_| "1".into()).parse()?;
+    let batch_add_timeout_ms: u64 = env::var("BATCH_ADD_TIMEOUT_MS").unwrap_or_else(|_| "5000".into()).parse()?;
+    let reannounce_ms: u64 = env::var("AGG_REANNOUNCE_MS").unwrap_or_else(|_| "800".into()).parse().unwrap_or(800);
 
     let wallet: LocalWallet = env::var("AGGREGATOR_PK")
         .or_else(|_| env::var("OWNER_PK"))
@@ -214,8 +218,9 @@ async fn main() -> anyhow::Result<()> {
         .from_block(BlockNumber::Latest);
     let mut stream_conf = client.provider().subscribe_logs(&filter_conf).await?;
 
-    use std::collections::{BTreeMap};
+    use std::collections::{BTreeMap, BTreeSet};
     let mut partials: BTreeMap<u64, Vec<(u16, Vec<u8>, Vec<u8>)>> = BTreeMap::new();
+    let mut open_seen: BTreeMap<u64, BTreeSet<u16>> = BTreeMap::new(); // dedup: sid -> set of from_idx received
     let mut announces: BTreeMap<u64, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
     let mut del_shares: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
     let mut e_by_sid: BTreeMap<u64, U256> = BTreeMap::new();
@@ -233,6 +238,15 @@ async fn main() -> anyhow::Result<()> {
     let mut members: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // all added e values
     let mut revoked_set: std::collections::BTreeSet<U256> = std::collections::BTreeSet::new(); // revoked e values
 
+    // Accumulator addition state
+    let mut local_v: Option<Vec<u8>> = None; // locally-tracked V (not yet submitted to chain)
+    let mut pending_adds: Vec<U256> = Vec::new(); // buffered elements for batch chain submission
+    let mut pending_v_new: Option<ethers::types::Bytes> = None; // final delta for the batch
+    let mut batch_add_first: Option<std::time::Instant> = None; // first arrival timestamp
+    // Serialized addition queue: buffer Confirmed events and process one V-chain round at a time
+    let mut add_queue: std::collections::VecDeque<(u64, U256)> = std::collections::VecDeque::new();
+    let mut add_in_progress: bool = false;
+
     // Initialize members from past Confirmed events (through registry)
     let filter_conf_all = Filter::new()
         .address(ValueOrArray::Value(registry.address()))
@@ -242,10 +256,10 @@ async fn main() -> anyhow::Result<()> {
         .to_block(BlockNumber::Latest);
     if let Ok(init_logs) = client.provider().get_logs(&filter_conf_all).await {
         for lg in init_logs {
-            if let Some(sid_topic) = lg.topics.get(2) {
-                let sid_u = U256::from_big_endian(sid_topic.as_bytes());
+            if let Some(uid_topic) = lg.topics.get(2) {
+                let uid_u = U256::from_big_endian(uid_topic.as_bytes());
                 let (_a_bytes, e_u, _s_u, _status): (ethers::types::Bytes, U256, U256, u8) = registry
-                    .method("getSignature", (cred_name.clone(), sid_u))?
+                    .method("getSignature", (cred_name.clone(), uid_u))?
                     .call().await
                     .unwrap_or((ethers::types::Bytes::from_static(&[]), U256::zero(), U256::zero(), 0));
                 if !e_u.is_zero() { members.insert(e_u); }
@@ -272,37 +286,49 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             ev = stream_conf.next() => {
                 if let Some(lg) = ev {
-                    let sid_topic = lg.topics.get(2).cloned().unwrap_or_default();
-                    let sid_u = U256::from_big_endian(sid_topic.as_bytes());
-                    println!("[agg] Confirmed event for sid={}", sid_u);
+                    let uid_topic = lg.topics.get(2).cloned().unwrap_or_default();
+                    let user_id_u = U256::from_big_endian(uid_topic.as_bytes());
+                    println!("[agg] Confirmed event for userId={}", user_id_u);
                     let t0_reg = std::time::Instant::now();
+                    // Derive a u64 session id by hashing the userId (userId is U256, too large for u64 cast)
+                    let add_sid: u64 = {
+                        let mut uid_be = [0u8; 32]; user_id_u.to_big_endian(&mut uid_be);
+                        let h = ethers::utils::keccak256(uid_be);
+                        u64::from_be_bytes(h[..8].try_into().unwrap())
+                    };
                     let (a_bytes, e_u, _s_u, _status): (ethers::types::Bytes, U256, U256, u8) = registry
-                        .method("getSignature", (cred_name.clone(), sid_u))?
+                        .method("getSignature", (cred_name.clone(), user_id_u))?
                         .call().await
                         .unwrap_or((ethers::types::Bytes::from_static(&[]), U256::zero(), U256::zero(), 0));
                     if a_bytes.0.len() == 128 && !e_u.is_zero() {
-                        let _ah = H256::from(ethers::utils::keccak256(&a_bytes.0));
-                        // Threshold addition announce
-                        // Get current V (Delta) or fall back to g1
-                        let delta_bytes: ethers::types::Bytes = accumulator.method("getDelta", (cred_name.clone(),))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-let v128: Vec<u8> = if delta_bytes.0.len() == 128 { delta_bytes.0.to_vec() } else {
-                            let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await?;
-g1_b.0.to_vec()
-                        };
-                        // Choose subset of openers (first threshold indices from peers)
-                        let mut subset: Vec<u16> = peers.iter().map(|(i, _)| *i).collect();
-                        subset.sort_unstable();
-                        if subset.len() > threshold as usize { subset.truncate(threshold as usize); }
-                        if subset.len() < threshold as usize { println!("[agg] WARN: subset smaller than threshold: {} < {}", subset.len(), threshold); }
-                        // Broadcast add announce
-let msg = AccAddAnnounceMsg { sid: sid_u.as_u64(), name: cred_name.clone(), aggregator_idx: participant_id, aggregator_peer_id: local_peer_id_str.clone(), subset: subset.clone(), v128: v128.clone(), e_hex: format!("0x{:x}", e_u), seq: 1 };
-                        let payload = serde_json::to_vec(&msg)?;
-                        handle.broadcast("acc-add-announce", payload).await?;
-add_meta.insert(sid_u.as_u64(), (subset.clone(), v128.clone(), e_u, 1));
-add_start.insert(sid_u.as_u64(), t0_reg);
-                        println!("[agg] addition round announced for sid={} subset={:?}", sid_u, subset);
+                        // Queue for serialized processing (V-chain: each round must complete before next)
+                        add_queue.push_back((add_sid, e_u));
+                        add_start.insert(add_sid, t0_reg);
+                        println!("[agg] Confirmed queued userId={} sid={} queue_len={}", user_id_u, add_sid, add_queue.len());
+                        // Start immediately if no round in progress
+                        if !add_in_progress {
+                            let (next_sid, next_e) = add_queue.pop_front().unwrap();
+                            let v128: Vec<u8> = if let Some(ref lv) = local_v {
+                                lv.clone()
+                            } else {
+                                let delta_bytes: ethers::types::Bytes = accumulator.method("getDelta", (cred_name.clone(),))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                if delta_bytes.0.len() == 128 { delta_bytes.0.to_vec() } else {
+                                    let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await?;
+                                    g1_b.0.to_vec()
+                                }
+                            };
+                            let mut subset: Vec<u16> = peers.iter().map(|(i, _)| *i).collect();
+                            subset.sort_unstable();
+                            if subset.len() > threshold as usize { subset.truncate(threshold as usize); }
+                            if subset.len() < threshold as usize { println!("[agg] WARN: subset smaller than threshold: {} < {}", subset.len(), threshold); }
+                            let msg = AccAddAnnounceMsg { sid: next_sid, name: cred_name.clone(), aggregator_idx: participant_id, aggregator_peer_id: local_peer_id_str.clone(), subset: subset.clone(), v128: v128.clone(), e_hex: format!("0x{:x}", next_e), seq: 1 };
+                            handle.broadcast("acc-add-announce", serde_json::to_vec(&msg)?).await?;
+                            add_meta.insert(next_sid, (subset.clone(), v128.clone(), next_e, 1));
+                            add_in_progress = true;
+                            println!("[agg] addition announced sid={} subset={:?}", next_sid, subset);
+                        }
                     } else {
-                        println!("[agg] WARN: Confirmed but missing/invalid (A,e) for sid={}", sid_u);
+                        println!("[agg] WARN: Confirmed but missing/invalid (A,e) for userId={}", user_id_u);
                     }
                 }
             },
@@ -347,8 +373,15 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                 if let Some(dm) = dm {
                     // Open partials, deletion shares, or addition contributions
                     if let Ok(msg) = serde_json::from_slice::<OpenPartialMsg>(&dm.data) {
+                        // Deduplicate: skip if this opener already submitted a partial for this sid
+                        let seen = open_seen.entry(msg.sid).or_default();
+                        if !seen.insert(msg.from_idx) {
+                            println!("[agg] duplicate open partial from {} (sid={}) ignored", msg.from_idx, msg.sid);
+                            continue;
+                        }
                         let entry = partials.entry(msg.sid).or_default();
                         entry.push((msg.from_idx, msg.tbar_128.clone(), Vec::new()));
+                        println!("[agg] open partial from {} (sid={}, {}/{})", msg.from_idx, msg.sid, entry.len(), threshold);
                         if entry.len() as u16 >= threshold {
                             // Verify and recombine
                             let t0_recon = Instant::now();
@@ -414,6 +447,10 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                                 } else {
                                     println!("[agg] opened: e unresolved yet");
                                 }
+                                // Clean up completed open session so it won't be re-announced
+                                announces.remove(&msg.sid);
+                                partials.remove(&msg.sid);
+                                open_seen.remove(&msg.sid);
                             }
                         }
                     } else if let Ok(v) = serde_json::from_slice::<AccDelSigShareMsg>(&dm.data) {
@@ -433,32 +470,8 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             if let Some(e_u) = e_by_sid.get(&v.sid).cloned() {
                                 let rcpt = accumulator.method::<_, ()>("deleteMember", (cred_name.clone(), e_u, new_delta_b.clone()))?.send().await?.await?;
                                 println!("[agg] deleteMember executed for sid={} e=0x{:x}", v.sid, e_u);
-                                // After removal, batch update witnesses for remaining members
-                                let v_new_anchor = new_delta_aff;
-                                let e_removed_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_u);
-                                let to_update: Vec<U256> = members.iter().cloned().collect();
-                                let mut es: Vec<U256> = Vec::new();
-                                let mut ws: Vec<ethers::types::Bytes> = Vec::new();
-                                for e_old in to_update.into_iter() {
-                                    if revoked_set.contains(&e_old) { continue; }
-                                    if e_old == e_u { continue; }
-                                    let wit_b: ethers::types::Bytes = accumulator.method("getWitness", (cred_name.clone(), e_old))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-                                    if wit_b.0.len() != 128 { continue; }
-                                    let w_old = match eip2537_g1_to_affine(&wit_b.0[..]) { Ok(v) => v, Err(_) => continue };
-                                    let e_old_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_old);
-                                    if let Ok((_d, w_new)) = VbMembershipWitness::<ark_bls12_381::G1Affine>::compute_update_after_removal(
-                                        &e_old_fr,
-                                        &e_removed_fr,
-                                        &w_old,
-                                        &v_new_anchor,
-                                    ) {
-                                        es.push(e_old);
-                                        ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec()));
-                                    }
-                                }
-                                if !es.is_empty() {
-                                    let _ = accumulator.method::<_, ()>("publishWitnessBatch", (cred_name.clone(), es, ws))?.send().await?.await?;
-                                }
+                                // Witnesses are now computed off-chain by users from event logs.
+                                // No publishWitnessBatch needed.
                                 // Update local sets
                                 revoked_set.insert(e_u);
                                 members.remove(&e_u);
@@ -542,62 +555,147 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                             );
                             if !ok {
                                 println!("[agg] ERROR: vb_accumulator membership verify failed; aborting setDelta for sid={}", ac.sid);
-                                // hard fail this round; clear pending state to avoid spinning
                                 add_meta.remove(&ac.sid);
                                 add_contribs.remove(&ac.sid);
                                 add_seen.remove(&ac.sid);
+                                // Release lock and drain queue even on failure
+                                add_in_progress = false;
+                                if !add_queue.is_empty() {
+                                    let (next_sid, next_e) = add_queue.pop_front().unwrap();
+                                    let v128: Vec<u8> = if let Some(ref lv) = local_v {
+                                        lv.clone()
+                                    } else {
+                                        let delta_bytes: ethers::types::Bytes = accumulator.method("getDelta", (cred_name.clone(),))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                        if delta_bytes.0.len() == 128 { delta_bytes.0.to_vec() } else {
+                                            let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await?;
+                                            g1_b.0.to_vec()
+                                        }
+                                    };
+                                    let mut subset: Vec<u16> = peers.iter().map(|(i, _)| *i).collect();
+                                    subset.sort_unstable();
+                                    if subset.len() > threshold as usize { subset.truncate(threshold as usize); }
+                                    let msg = AccAddAnnounceMsg { sid: next_sid, name: cred_name.clone(), aggregator_idx: participant_id, aggregator_peer_id: local_peer_id_str.clone(), subset: subset.clone(), v128: v128.clone(), e_hex: format!("0x{:x}", next_e), seq: 1 };
+                                    handle.broadcast("acc-add-announce", serde_json::to_vec(&msg)?).await?;
+                                    add_meta.insert(next_sid, (subset.clone(), v128.clone(), next_e, 1));
+                                    add_in_progress = true;
+                                    println!("[agg] next queued addition started after error: sid={}", next_sid);
+                                }
                                 continue;
                             }
                             if std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false) {
                                 let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
                                 let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_add_verify_sum","sid": ac.sid, "threshold": threshold, "ms": t0_verify.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
                             }
-                            // Metrics: start acc_register_info_e2e and combine gas of setDelta + publishWitness
-                            let metrics = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
-                            let mut gas_total = U256::zero();
+                            // Buffer for batch submission
                             let v_new_b = ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_new).to_vec());
-                            let rcpt_delta = accumulator.method::<_, ()>("setDelta", (cred_name.clone(), v_new_b))?.send().await?.await?;
-                            if let Some(r) = rcpt_delta.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
-                            // Batch update witnesses for all existing members
-                            let mut es: Vec<U256> = Vec::new();
-                            let mut ws: Vec<ethers::types::Bytes> = Vec::new();
-                            let to_update: Vec<U256> = members.iter().cloned().collect();
-                            for e_old in to_update.into_iter() {
-                                if revoked_set.contains(&e_old) { continue; }
-                                let wit_b: ethers::types::Bytes = accumulator.method("getWitness", (cred_name.clone(), e_old))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
-                                if wit_b.0.len() != 128 { continue; }
-                                let w_old = match eip2537_g1_to_affine(&wit_b.0[..]) { Ok(v) => v, Err(_) => continue };
-                                let e_old_fr: Fr = tbbsplus_rust::orchestration::crypto::encoding::u256_to_fr(&e_old);
-                                let (_d, w_new) = VbMembershipWitness::<ark_bls12_381::G1Affine>::compute_update_after_addition(
-                                    &e_old_fr,
-                                    &e_fr,
-                                    &w_old,
-                                    &v_old_anchor,
-                                );
-                                es.push(e_old);
-                                ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&w_new).to_vec()));
-                            }
-                            // Include the newly added element: W_new(e_new) = V_old
-                            es.push(e_u);
-                            ws.push(ethers::types::Bytes::from(g1_to_eip2537_bytes(&v_old_anchor).to_vec()));
-                            let rcpt = accumulator.method::<_, ()>("publishWitnessBatch", (cred_name.clone(), es, ws))?.send().await?.await?;
-                            if let Some(r) = rcpt.as_ref() { if let Some(g) = r.gas_used { gas_total += g; } }
-                            if metrics {
-                                let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
-                                let ms: u64 = add_start.remove(&ac.sid).map(|t0| t0.elapsed().as_millis() as u64).unwrap_or(0);
-                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario":"acc_register_info_e2e","sid": ac.sid, "threshold": threshold, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
-                            }
+                            local_v = Some(g1_to_eip2537_bytes(&v_new).to_vec());
+                            pending_adds.push(e_u);
+                            pending_v_new = Some(v_new_b.clone());
+                            if batch_add_first.is_none() { batch_add_first = Some(std::time::Instant::now()); }
                             members.insert(e_u);
-                            println!("[agg] addition complete for sid={}, setDelta+publishWitness done", ac.sid);
+                            println!("[agg] addition verified for sid={}, buffered ({}/{})", ac.sid, pending_adds.len(), batch_add_size);
                             add_meta.remove(&ac.sid);
                             add_contribs.remove(&ac.sid);
                             add_seen.remove(&ac.sid);
+
+                            // Flush batch if full or in single mode
+                            if pending_adds.len() >= batch_add_size || batch_add_size <= 1 {
+                                let metrics = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
+                                let final_v = pending_v_new.take().unwrap();
+                                let es: Vec<U256> = pending_adds.drain(..).collect();
+                                let n = es.len();
+                                let rcpt = if n == 1 {
+                                    accumulator.method::<_, ()>("addMember", (cred_name.clone(), es[0], final_v))?.send().await?.await?
+                                } else {
+                                    accumulator.method::<_, ()>("addMembers", (cred_name.clone(), es.clone(), final_v))?.send().await?.await?
+                                };
+                                let gas_total = rcpt.as_ref().and_then(|r| r.gas_used).unwrap_or_default();
+                                let scenario = if n == 1 { "acc_register_info_e2e" } else { "acc_addMembers_batch" };
+                                if metrics {
+                                    let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                                    let ms: u64 = add_start.remove(&ac.sid).map(|t0| t0.elapsed().as_millis() as u64).unwrap_or(0);
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "sid": ac.sid, "threshold": threshold, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                                }
+                                local_v = None;
+                                batch_add_first = None;
+                                println!("[agg] {} done: {} member(s) added", scenario, n);
+                            }
+                            // V-chain round complete: start next queued addition
+                            add_in_progress = false;
+                            if !add_queue.is_empty() {
+                                let (next_sid, next_e) = add_queue.pop_front().unwrap();
+                                let v128: Vec<u8> = if let Some(ref lv) = local_v {
+                                    lv.clone()
+                                } else {
+                                    let delta_bytes: ethers::types::Bytes = accumulator.method("getDelta", (cred_name.clone(),))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                                    if delta_bytes.0.len() == 128 { delta_bytes.0.to_vec() } else {
+                                        let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await?;
+                                        g1_b.0.to_vec()
+                                    }
+                                };
+                                let mut subset: Vec<u16> = peers.iter().map(|(i, _)| *i).collect();
+                                subset.sort_unstable();
+                                if subset.len() > threshold as usize { subset.truncate(threshold as usize); }
+                                if subset.len() < threshold as usize { println!("[agg] WARN: subset smaller than threshold"); }
+                                let msg = AccAddAnnounceMsg { sid: next_sid, name: cred_name.clone(), aggregator_idx: participant_id, aggregator_peer_id: local_peer_id_str.clone(), subset: subset.clone(), v128: v128.clone(), e_hex: format!("0x{:x}", next_e), seq: 1 };
+                                handle.broadcast("acc-add-announce", serde_json::to_vec(&msg)?).await?;
+                                add_meta.insert(next_sid, (subset.clone(), v128.clone(), next_e, 1));
+                                add_in_progress = true;
+                                println!("[agg] next queued addition started: sid={}", next_sid);
+                            }
                         }
                     }
                 }
             }
-            // Periodically re-announce pending additions for late-joining openers (no seq)
-            _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {
+            // Periodically re-announce pending sessions + flush batch on timeout
+            _ = tokio::time::sleep(std::time::Duration::from_millis(reannounce_ms)) => {
+                // Flush pending batch adds if timeout expired
+                if !pending_adds.is_empty() {
+                    let timeout_elapsed = batch_add_first
+                        .map(|t| t.elapsed().as_millis() as u64 >= batch_add_timeout_ms)
+                        .unwrap_or(false);
+                    if timeout_elapsed {
+                        let metrics = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
+                        let final_v = pending_v_new.take().unwrap();
+                        let es: Vec<U256> = pending_adds.drain(..).collect();
+                        let n = es.len();
+                        let rcpt = if n == 1 {
+                            accumulator.method::<_, ()>("addMember", (cred_name.clone(), es[0], final_v))?.send().await?.await?
+                        } else {
+                            accumulator.method::<_, ()>("addMembers", (cred_name.clone(), es.clone(), final_v))?.send().await?.await?
+                        };
+                        let gas_total = rcpt.as_ref().and_then(|r| r.gas_used).unwrap_or_default();
+                        let scenario = if n == 1 { "acc_register_info_e2e" } else { "acc_addMembers_batch" };
+                        if metrics {
+                            let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
+                            let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "threshold": threshold, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                        }
+                        local_v = None;
+                        batch_add_first = None;
+                        println!("[agg] batch timeout flush: {} member(s) added", n);
+                    }
+                }
+                // Timer: drain queue if idle (safety net for edge cases)
+                if !add_in_progress && !add_queue.is_empty() {
+                    let (next_sid, next_e) = add_queue.pop_front().unwrap();
+                    let v128: Vec<u8> = if let Some(ref lv) = local_v {
+                        lv.clone()
+                    } else {
+                        let delta_bytes: ethers::types::Bytes = accumulator.method("getDelta", (cred_name.clone(),))?.call().await.unwrap_or_else(|_| ethers::types::Bytes::from_static(&[]));
+                        if delta_bytes.0.len() == 128 { delta_bytes.0.to_vec() } else {
+                            let (g1_b, _h0_b, _g2_b): (ethers::types::Bytes, ethers::types::Bytes, ethers::types::Bytes) = params.method("getG1H0G2ByName", (cred_name.clone(),))?.call().await?;
+                            g1_b.0.to_vec()
+                        }
+                    };
+                    let mut subset: Vec<u16> = peers.iter().map(|(i, _)| *i).collect();
+                    subset.sort_unstable();
+                    if subset.len() > threshold as usize { subset.truncate(threshold as usize); }
+                    let msg = AccAddAnnounceMsg { sid: next_sid, name: cred_name.clone(), aggregator_idx: participant_id, aggregator_peer_id: local_peer_id_str.clone(), subset: subset.clone(), v128: v128.clone(), e_hex: format!("0x{:x}", next_e), seq: 1 };
+                    handle.broadcast("acc-add-announce", serde_json::to_vec(&msg)?).await?;
+                    add_meta.insert(next_sid, (subset.clone(), v128.clone(), next_e, 1));
+                    add_in_progress = true;
+                    println!("[agg] timer: queued addition started: sid={}", next_sid);
+                }
                 let keys: Vec<u64> = add_meta.keys().cloned().collect();
                 for sid in keys {
                     if let Some((subset, v128, e_u, seq)) = add_meta.get_mut(&sid) {
@@ -620,6 +718,25 @@ add_start.insert(sid_u.as_u64(), t0_reg);
                         let payload = serde_json::to_vec(&msg)?;
                         let _ = handle.broadcast("acc-add-announce", payload).await;
                         println!("[agg] re-announced addition for sid={} subset={:?}", sid, subset);
+                    }
+                }
+                // Re-announce pending open sessions that haven't reached threshold yet
+                let open_sids: Vec<u64> = announces.keys().cloned().collect();
+                for sid in open_sids {
+                    let num_partials = partials.get(&sid).map(|v| v.len()).unwrap_or(0);
+                    if (num_partials as u16) < threshold {
+                        if let Some((t1, t2)) = announces.get(&sid) {
+                            let announce = OpenAnnounceMsg {
+                                sid,
+                                name: cred_name.clone(),
+                                aggregator_idx: participant_id,
+                                aggregator_peer_id: local_peer_id_str.clone(),
+                                t1: t1.clone(),
+                                t2: t2.clone(),
+                            };
+                            let _ = handle.broadcast("open-announce", serde_json::to_vec(&announce)?).await;
+                            println!("[agg] re-announced open sid={} ({}/{} partials)", sid, num_partials, threshold);
+                        }
                     }
                 }
             }

@@ -6091,6 +6091,7 @@ dependencies = [
  "ethereum-types 0.15.1",
  "ethers",
  "eyre",
+ "fs2",
  "futures",
  "hex",
  "legogroth16",

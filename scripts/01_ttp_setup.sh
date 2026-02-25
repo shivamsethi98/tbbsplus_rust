@@ -13,6 +13,8 @@ TOTAL=${TOTAL:-5}
 MESSAGE_COUNT=${MESSAGE_COUNT:-5}
 CRED_NAME=${CRED_NAME:-ANON_CRED}
 SHARES_FILE=${SHARES_FILE:-.runtime.shares.json}
+BATCH_SIZE_REQ=${BATCH_SIZE_REQ:-1}
+BATCH_SIZE_PRES=${BATCH_SIZE_PRES:-1}
 
 
 echo "[00] Check whether anvil is running with hardfork=prague on port ${ANVIL_PORT:-8545}"
@@ -72,28 +74,38 @@ export ETH_WS=ws://127.0.0.1:${ANVIL_PORT}
 export CHAIN_ID=31337
 # Write/refresh .runtime.env (verify vars will be added after step 04)
 cat > .runtime.env <<EOF
-ETH_WS=$ETH_WS
-CHAIN_ID=$CHAIN_ID
-REQ_CONTRACT=$REQ_CONTRACT
-REGISTRY_CONTRACT=${REGISTRY_CONTRACT}
-PARAMS_CONTRACT=$PARAMS_CONTRACT
-ACC_CONTRACT=$ACC_CONTRACT
-CRED_NAME=$CRED_NAME
-MESSAGE_COUNT=$MESSAGE_COUNT
-THRESHOLD_ISSUER=$THRESHOLD_ISSUER
-THRESHOLD_OPENER=$THRESHOLD_OPENER
-TOTAL=$TOTAL
-BASE_PORT=$BASE_PORT
-SHARES_FILE=$SHARES_FILE
+export ETH_WS=$ETH_WS
+export CHAIN_ID=$CHAIN_ID
+export REQ_CONTRACT=$REQ_CONTRACT
+export REGISTRY_CONTRACT=${REGISTRY_CONTRACT}
+export PARAMS_CONTRACT=$PARAMS_CONTRACT
+export ACC_CONTRACT=$ACC_CONTRACT
+export CRED_NAME=$CRED_NAME
+export MESSAGE_COUNT=$MESSAGE_COUNT
+export THRESHOLD_ISSUER=$THRESHOLD_ISSUER
+export THRESHOLD_OPENER=$THRESHOLD_OPENER
+export TOTAL=$TOTAL
+export BASE_PORT=$BASE_PORT
+export SHARES_FILE=$SHARES_FILE
+export BATCH_SIZE_REQ=$BATCH_SIZE_REQ
+export BATCH_SIZE_PRES=$BATCH_SIZE_PRES
 EOF
-set -a; source .runtime.env; set +a
+source .runtime.env
 
 echo "[04] Deploy Verify contract"
 VERIFY_ENV=$(DEPLOY_METRICS_FILE="$DEPLOY_METRICS_FILE" npx hardhat run --network localhost scripts/deploy_pok_verifiers.ts | sed -n 's/^export /export /p')
 eval "$VERIFY_ENV"
 # Append verify var
 {
-  echo "VERIFY_CONTRACT=${VERIFY_CONTRACT}"
+  echo "export VERIFY_CONTRACT=${VERIFY_CONTRACT}"
+} >> .runtime.env
+
+echo "[04b] Deploy BatchVerify contract"
+BATCH_VERIFY_ENV=$(DEPLOY_METRICS_FILE="$DEPLOY_METRICS_FILE" npx hardhat run --network localhost scripts/deploy_batch_verifier.ts | sed -n 's/^export /export /p')
+eval "$BATCH_VERIFY_ENV"
+# Append batch verify var
+{
+  echo "export BATCH_VERIFY_CONTRACT=${BATCH_VERIFY_CONTRACT}"
 } >> .runtime.env
 
 echo "[05] Allowlist issuers & set multiaddrs in Params"
@@ -103,7 +115,7 @@ echo "[06] Run TTP (sets g1/h0/H, g2base, pkG2, and writes shares)"
 # Use Anvil's first default private key (0xf39f...)
 export OWNER_PK=${OWNER_PK:-0xac0974bec36b3...} # placeholder, will set exact next line
 export OWNER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-eval "$(SHARES_FILE=$SHARES_FILE cargo run --features mpc --bin ttp | sed -n 's/^export /export /p')"
+eval "$(SHARES_FILE=$SHARES_FILE BATCH_SIZE_REQ=$BATCH_SIZE_REQ BATCH_SIZE_PRES=$BATCH_SIZE_PRES cargo run --features mpc --bin ttp | sed -n 's/^export /export /p')"
 
 
 

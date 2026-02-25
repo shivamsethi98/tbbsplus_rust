@@ -81,8 +81,10 @@ contract VerifyWrapper {
     
 
 
-    /// @notice Verify PoK, encryption relation, pairing, AND accumulator membership
-    /// @dev Reads pk/g2base/Ybar from Params by name, then calls Accumulator.verifyMembership
+    /// @notice [DEPRECATED] Verify PoK, encryption relation, pairing, AND accumulator membership with raw witness
+    /// @dev Use verifyPokEncWithPairingAndMembershipPokFromParamsEmit (ZK membership proof) instead.
+    ///      This path requires the prover to supply a raw witness128, exposing the witness to the verifier.
+    ///      Kept for backwards compatibility only.
     function verifyPokEncWithPairingAndMembershipFromParamsEmit(
         BbsPlusPokVerify.PublicSignatureParts memory sig,
         BbsPlusPokVerify.VerificationContext memory ctx,
@@ -142,7 +144,7 @@ contract VerifyWrapper {
         return true;
     }
 
-    /// @notice Verify PoK, encryption relation, pairing, AND zk membership proof (no witness)
+    /// @notice [PRIMARY] Verify PoK, encryption relation, pairing, AND zk membership proof (no witness needed)
     function verifyPokEncWithPairingAndMembershipPokFromParamsEmit(
         BbsPlusPokVerify.PublicSignatureParts memory sig,
         BbsPlusPokVerify.VerificationContext memory ctx,
@@ -209,6 +211,89 @@ contract VerifyWrapper {
         bytes calldata g2_2
     ) external view returns (bool) {
         return Verify.verifyPairing(g1_1, g2_1, g1_2, g2_2);
+    }
+
+    // ========================== BATCH VERIFICATION ==========================
+
+    event BatchPresentationVerified(string indexed name, uint256 count);
+
+    /// @notice Batched BBS+ pairing verification using random linear combination.
+    /// @dev For N signatures, instead of N individual pairing checks:
+    ///        e(A'_j, pk) · e(-Abar_j, g2) = 1  (for each j)
+    ///      uses one batched check:
+    ///        e(∑ δ_j·A'_j, pk) · e(-(∑ δ_j·Abar_j), g2) = 1
+    ///      Gas savings: 1 pairing instead of N pairings, plus 2 G1MSMs of size N.
+    /// @param APrimes_concat N concatenated 128-byte A' points
+    /// @param ABars_concat N concatenated 128-byte Abar points
+    /// @param pkG2 256-byte shared public key in G2
+    /// @param g2base 256-byte G2 generator
+    /// @return ok true if batched pairing check passes
+    function verifyBbsPairingBatch(
+        bytes calldata APrimes_concat,
+        bytes calldata ABars_concat,
+        bytes memory pkG2,
+        bytes memory g2base
+    ) external view returns (bool ok) {
+        uint256 n = APrimes_concat.length / 128;
+        require(n > 0 && APrimes_concat.length == n * 128, "bad A' len");
+        require(ABars_concat.length == n * 128, "bad Abar len");
+        require(pkG2.length == 256 && g2base.length == 256, "bad G2 len");
+
+        // Derive random challenges δ_j = H(APrimes || ABars || prevrandao || j) mod Fr
+        bytes32 seed = keccak256(abi.encodePacked(APrimes_concat, ABars_concat, block.prevrandao));
+        uint256[] memory deltas = new uint256[](n);
+        bytes[] memory APrimes = new bytes[](n);
+        bytes[] memory ABars = new bytes[](n);
+        for (uint256 j = 0; j < n; j++) {
+            deltas[j] = uint256(keccak256(abi.encodePacked(seed, j))) % Verify.FR_MODULUS;
+            if (deltas[j] == 0) deltas[j] = 1;
+            APrimes[j] = APrimes_concat[j * 128 : (j + 1) * 128];
+            ABars[j] = ABars_concat[j * 128 : (j + 1) * 128];
+        }
+
+        // L = MSM(A'_j, δ_j) — combined A' for first pairing
+        bytes memory L = Bls12381.g1msm(Bls12381.concatMSM(APrimes, deltas));
+
+        // R = MSM(Abar_j, δ_j) — combined Abar for second pairing (negated)
+        bytes memory R = Bls12381.g1msm(Bls12381.concatMSM(ABars, deltas));
+        bytes memory negR = Bls12381.g1neg(R);
+
+        // Single pairing check: e(L, pk) · e(-R, g2) = 1
+        ok = Verify.verifyPairing(L, pkG2, negR, g2base);
+    }
+
+    /// @notice Batched accumulator membership pairing verification.
+    /// @dev Same random linear combination technique for accumulator membership pairings:
+    ///        e(A'_acc_j, pk_acc) · e(-Abar_acc_j, g2) = 1  (for each j)
+    ///      becomes:
+    ///        e(∑ δ_j·A'_acc_j, pk_acc) · e(-(∑ δ_j·Abar_acc_j), g2) = 1
+    function verifyAccPairingBatch(
+        bytes calldata APrimes_concat,
+        bytes calldata ABars_concat,
+        bytes memory pkAccG2,
+        bytes memory g2base
+    ) external view returns (bool ok) {
+        uint256 n = APrimes_concat.length / 128;
+        require(n > 0 && APrimes_concat.length == n * 128, "bad A' len");
+        require(ABars_concat.length == n * 128, "bad Abar len");
+        require(pkAccG2.length == 256 && g2base.length == 256, "bad G2 len");
+
+        bytes32 seed = keccak256(abi.encodePacked(APrimes_concat, ABars_concat, block.prevrandao));
+        uint256[] memory deltas = new uint256[](n);
+        bytes[] memory APrimes = new bytes[](n);
+        bytes[] memory ABars = new bytes[](n);
+        for (uint256 j = 0; j < n; j++) {
+            deltas[j] = uint256(keccak256(abi.encodePacked(seed, j))) % Verify.FR_MODULUS;
+            if (deltas[j] == 0) deltas[j] = 1;
+            APrimes[j] = APrimes_concat[j * 128 : (j + 1) * 128];
+            ABars[j] = ABars_concat[j * 128 : (j + 1) * 128];
+        }
+
+        bytes memory L = Bls12381.g1msm(Bls12381.concatMSM(APrimes, deltas));
+        bytes memory R = Bls12381.g1msm(Bls12381.concatMSM(ABars, deltas));
+        bytes memory negR = Bls12381.g1neg(R);
+
+        ok = Verify.verifyPairing(L, pkAccG2, negR, g2base);
     }
 
 

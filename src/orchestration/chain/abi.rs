@@ -35,6 +35,7 @@ pub fn load_embedded_abi(name: &str) -> Option<Abi> {
         "CredentialRegistry" => parse(include_bytes!("../../../artifacts/contracts/CredentialRegistry.sol/CredentialRegistry.json")),
         "VerifyWrapper" => parse(include_bytes!("../../../artifacts/contracts/Verify.sol/VerifyWrapper.json")),
         "Accumulator" => parse(include_bytes!("../../../artifacts/contracts/Accumulator.sol/Accumulator.json")),
+        "BatchVerifyWrapper" => parse(include_bytes!("../../../artifacts/contracts/BatchVerify.sol/BatchVerifyWrapper.json")),
         _ => None,
     }
 }

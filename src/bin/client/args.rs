@@ -2,12 +2,12 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Sub {
-    /// Request a credential for a session id
-    Request { sid: u64, #[arg(short, long)] wait: bool },
+    /// Request a credential
+    Request { #[arg(short, long)] wait: bool },
     /// Verify (fetch and persist artifacts) then enter actions
-    Verify { sid: u64 },
-    /// Enter actions for an existing sid
-    Present { sid: u64 },
+    Verify,
+    /// Enter actions for an existing credential
+    Present,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -22,18 +22,18 @@ pub struct Args {
 
 #[derive(Debug, Clone)]
 pub enum Mode {
-    Request { sid: u64, wait_and_verify: bool },
-    Verify { sid: u64 },
-    Present { sid: u64 },
+    Request { wait_and_verify: bool },
+    Verify,
+    Present,
     Interactive,
 }
 
 pub fn parse_mode() -> Mode {
     let a = Args::parse();
     match a.cmd {
-        Some(Sub::Request { sid, wait }) => Mode::Request { sid, wait_and_verify: wait },
-        Some(Sub::Verify { sid }) => Mode::Verify { sid },
-        Some(Sub::Present { sid }) => Mode::Present { sid },
+        Some(Sub::Request { wait }) => Mode::Request { wait_and_verify: wait },
+        Some(Sub::Verify) => Mode::Verify,
+        Some(Sub::Present) => Mode::Present,
         None => Mode::Interactive,
     }
 }

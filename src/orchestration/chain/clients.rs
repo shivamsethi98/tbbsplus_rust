@@ -49,6 +49,37 @@ impl<M: Middleware + 'static> RegistryClient<M> {
             (cred_name, sid, participant_id, r_bytes128, u_u256, e_u256, s_u256, t),
         )?)
     }
+
+    /// Build a `submitShareBatch` call for N users in one tx.
+    /// `r_concat` is the concatenation of N × 128-byte R points.
+    pub fn submit_share_batch_call(
+        &self,
+        cred_name: String,
+        user_ids: Vec<U256>,
+        participant_id: u16,
+        r_concat: EthBytes,
+        us: Vec<U256>,
+        es: Vec<U256>,
+        ss: Vec<U256>,
+    ) -> anyhow::Result<ContractCall<M, ()>> {
+        Ok(self.contract.method(
+            "submitShareBatch",
+            (cred_name, user_ids, participant_id, r_concat, us, es, ss),
+        )?)
+    }
+
+    /// Build a `confirmBatchRandomized` call — batch pairing verification (Eq 27).
+    /// Permissionless: can be called by any issuer once all users have Unverified status.
+    pub fn confirm_batch_randomized_call(
+        &self,
+        cred_name: String,
+        user_ids: Vec<U256>,
+    ) -> anyhow::Result<ContractCall<M, ()>> {
+        Ok(self.contract.method(
+            "confirmBatchRandomized",
+            (cred_name, user_ids),
+        )?)
+    }
 }
 
 pub struct VerifyClient<M> { pub contract: Contract<M> }
@@ -102,7 +133,7 @@ impl<M: Middleware + 'static> ParamsClient<M> {
         }
         // fetch and cache from getParamsByName (CredParams tuple)
         let pc: (
-            U256, U256, U256, Vec<U256>, U256, EthBytes, EthBytes, EthBytes, EthBytes, Vec<EthBytes>, EthBytes, EthBytes
+            U256, U256, U256, Vec<U256>, U256, EthBytes, EthBytes, EthBytes, EthBytes, Vec<EthBytes>, EthBytes, EthBytes, U256, U256
         ) = self.contract.method("getParamsByName", cred_name.clone())?.call().await?;
         let t = pc.1.as_u64() as u16;
         let lock = self.threshold_cache.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
@@ -129,7 +160,7 @@ impl<M: Middleware + 'static> ParamsClient<M> {
             }
         }
         let pc: (
-            U256, U256, U256, Vec<U256>, U256, EthBytes, EthBytes, EthBytes, EthBytes, Vec<EthBytes>, EthBytes, EthBytes
+            U256, U256, U256, Vec<U256>, U256, EthBytes, EthBytes, EthBytes, EthBytes, Vec<EthBytes>, EthBytes, EthBytes, U256, U256
         ) = self.contract.method("getParamsByName", cred_name.clone())?.call().await?;
         let m = pc.0.as_u64() as u32;
         let lock = self.mcount_cache.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
@@ -162,6 +193,13 @@ impl<M: Middleware + 'static> ParamsClient<M> {
         Ok(idx.as_u64() as u16)
     }
 
+    pub async fn get_batch_sizes(&self, cred_name: String) -> anyhow::Result<(u32, u32)> {
+        let result: (U256, U256) = self.contract
+            .method("getBatchSizesByName", cred_name)?
+            .call().await?;
+        Ok((result.0.as_u32(), result.1.as_u32()))
+    }
+
     pub async fn get_issuer_multiaddrs(&self, issuer: Address) -> anyhow::Result<Vec<String>> {
         Ok(self.contract.method::<_, Vec<String>>("getIssuerMultiaddrs", issuer)?.call().await?)
     }
@@ -181,5 +219,15 @@ impl<M: Middleware + 'static> ParamsClient<M> {
         if let Some(lock) = self.h_cache.get() { if let Ok(mut m) = lock.write() { m.remove(cred_name); } }
         if let Some(lock) = self.g1h0g2_cache.get() { if let Ok(mut m) = lock.write() { m.remove(cred_name); } }
         if let Some(lock) = self.mcount_cache.get() { if let Ok(mut m) = lock.write() { m.remove(cred_name); } }
+    }
+}
+
+pub struct BatchVerifyClient<M> { pub contract: Contract<M> }
+impl<M: Middleware + 'static> BatchVerifyClient<M> {
+    pub fn new(addr: Address, client: Arc<M>) -> anyhow::Result<Self> {
+        let abi = load_embedded_abi("BatchVerifyWrapper")
+            .or_else(|| load_abi_from_artifact("artifacts/contracts/BatchVerify.sol/BatchVerifyWrapper.json").ok())
+            .ok_or_else(|| anyhow::anyhow!("BatchVerifyWrapper ABI not found"))?;
+        Ok(Self { contract: Contract::new(addr, abi, client) })
     }
 }

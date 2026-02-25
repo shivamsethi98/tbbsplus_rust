@@ -4,7 +4,7 @@ members = [
     "utils",
     "schnorr_pok",
     "bbs_plus",
-    "bbs_pok_circuits",
+    # "bbs_pok_circuits",
     "vb_accumulator",
     "proof_system",
     "coconut",

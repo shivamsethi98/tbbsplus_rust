@@ -1,15 +1,7 @@
 
 use ark_bls12_381::{Bls12_381, Fr, Fq};
-use ark_serialize::CanonicalSerialize;
-use ark_std::{rand::{rngs::StdRng, SeedableRng}, UniformRand};
-use bbs_plus::prelude::*;
-use blake2::Blake2b512;
 use ark_ff::PrimeField;
-use schnorr_pok::{SchnorrChallengeContributor, pok_generalized_pedersen::{SchnorrCommitment, compute_random_oracle_challenge}};
-use ethers::types::Bytes as EthBytes;
-use ethers::types::TxHash;
 use ethers::types::U256;
-
 
 
 pub fn fq2_pair_to_be(x_c0: &Fq, x_c1: &Fq) -> [u8; 128] {

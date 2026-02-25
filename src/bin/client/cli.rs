@@ -9,12 +9,6 @@ pub fn prompt_line(prompt: &str) -> anyhow::Result<String> {
     Ok(s.trim_end().to_string())
 }
 
-pub fn prompt_parse_u64(prompt: &str, default: u64) -> anyhow::Result<u64> {
-    let l = prompt_line(&format!("{} [default: {}]", prompt, default))?;
-    if l.trim().is_empty() { return Ok(default); }
-    Ok(l.trim().parse()?)
-}
-
 pub fn parse_revealed(line: &str) -> anyhow::Result<(Vec<u32>, Vec<U256>)> {
     let mut idx = Vec::new();
     let mut vals = Vec::new();

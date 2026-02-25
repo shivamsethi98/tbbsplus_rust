@@ -1,26 +1,89 @@
 use std::env;
+use std::collections::HashMap;
+use std::sync::Arc;
 use ethers::prelude::*;
 use ethers::providers::{Provider, Ws};
 use ethers::abi::RawLog;
 use futures::StreamExt;
+
 use tbbsplus_rust::orchestration::chain::clients::{VerifyClient, AccumulatorClient};
 use std::io::Write as _;
+
+/// Status of an opened credential entry tracked by the SP.
+#[derive(Clone, Debug)]
+enum EntryStatus {
+    /// requestOpen sent, waiting for Opened event
+    Opening,
+    /// Opened received, e resolved — available for manual revocation
+    Opened,
+    /// requestRevokeByE sent, waiting for MemberRevoked
+    Revoking,
+    /// MemberRevoked confirmed
+    Revoked,
+}
+
+impl std::fmt::Display for EntryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryStatus::Opening => write!(f, "OPENING"),
+            EntryStatus::Opened => write!(f, "OPENED"),
+            EntryStatus::Revoking => write!(f, "REVOKING.."),
+            EntryStatus::Revoked => write!(f, "REVOKED"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenedEntry {
+    /// Credential element in the accumulator
+    e: U256,
+    /// Truncated hex of A (the opened signature point)
+    a_short: String,
+    /// Prover address topic (if available)
+    prover: H256,
+    status: EntryStatus,
+}
+
+fn print_table(entries: &HashMap<usize, OpenedEntry>) {
+    if entries.is_empty() {
+        println!("\n  (no opened signatures yet)\n");
+        return;
+    }
+    println!();
+    println!("  {:<4} {:<12} {:<20} {:<44}", "#", "STATUS", "A (short)", "e");
+    println!("  {}", "-".repeat(82));
+    let mut keys: Vec<usize> = entries.keys().copied().collect();
+    keys.sort();
+    for k in keys {
+        let ent = &entries[&k];
+        let e_str = if ent.e.is_zero() { "pending...".to_string() } else { format!("0x{:x}", ent.e) };
+        let e_display = if e_str.len() > 42 { format!("{}...", &e_str[..42]) } else { e_str };
+        println!("  {:<4} {:<12} {:<20} {}", k, ent.status, ent.a_short, e_display);
+    }
+    println!();
+}
+
+fn print_help() {
+    println!("  Commands:");
+    println!("    r <N>   revoke entry N");
+    println!("    l       list opened signatures");
+    println!("    q       quit");
+    println!();
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let ws_url = env::var("ETH_WS").unwrap_or_else(|_| "ws://127.0.0.1:8545".into());
     let chain_id: u64 = env::var("CHAIN_ID").unwrap_or_else(|_| "31337".into()).parse()?;
-    // Use SP_PK for service provider; fallback to requested dev key
     let owner_pk: LocalWallet = env::var("SP_PK")
         .unwrap_or_else(|_| "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".into())
         .parse::<LocalWallet>()?
         .with_chain_id(chain_id);
 
     let ws = Provider::<Ws>::connect(ws_url).await?;
-    let client = std::sync::Arc::new(SignerMiddleware::new(ws, owner_pk));
+    let client = Arc::new(SignerMiddleware::new(ws, owner_pk));
 
-    // Resolve VerifyWrapper address(es)
     let verify_addr_env = env::var("POK_VERIFY_WRAPPER").ok();
     let verify_addr_fallback = env::var("VERIFY_CONTRACT").ok();
     let mut verify_addrs: Vec<Address> = Vec::new();
@@ -28,280 +91,363 @@ async fn main() -> anyhow::Result<()> {
     if let Some(s) = verify_addr_fallback { if let Ok(a) = s.parse::<Address>() { if !verify_addrs.contains(&a) { verify_addrs.push(a); } } }
     if verify_addrs.is_empty() { anyhow::bail!("POK_VERIFY_WRAPPER/VERIFY_CONTRACT env missing or invalid"); }
     let acc_addr: Address = env::var("ACC_CONTRACT")?.parse()?;
+    let name_env = env::var("CRED_NAME").expect("CRED_NAME");
 
     let verify = VerifyClient::new(verify_addrs[0], client.clone())?;
     let accumulator = AccumulatorClient::new(acc_addr, client.clone())?;
-    let metrics_on = std::env::var("METRICS").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false);
-    let metrics_file = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/service_provider.ndjson".into());
-    let threshold: u16 = env::var("THRESHOLD_OPENER").or_else(|_| env::var("THRESHOLD")).ok().and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    // Non-interactive defaults for testing: auto open and auto revoke
-    let auto_open = env::var("SP_AUTO_OPEN").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
-    let auto_revoke = env::var("SP_AUTO_REVOKE").map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("y")).unwrap_or(true);
+    // Optional BatchVerifyWrapper support
+    let batch_verify_addr: Option<Address> = env::var("BATCH_VERIFY_CONTRACT")
+        .ok()
+        .and_then(|s| s.parse::<Address>().ok());
 
-    // Subscribe to PresentationVerified(name, prover, T1, T2)
-    // (already imported above) use ethers::types::{Filter, ValueOrArray, H256, BlockNumber};
-    let event_sig = H256::from(ethers::utils::keccak256(b"PresentationVerified(string,address,bytes,bytes)"));
-    let filter = Filter::new()
-        .address(ValueOrArray::Array(verify_addrs.clone()))
-        .topic0(ValueOrArray::Value(event_sig))
-        .from_block(BlockNumber::Latest);
-    let mut stream = client.provider().subscribe_logs(&filter).await?;
-
-    // Decode helper
-    let ev = verify.contract.abi().event("PresentationVerified")?;
-    // Also subscribe to Accumulator events for status reporting
+    // --- Event subscriptions ---
     use ethers::types::{Filter, ValueOrArray, H256, BlockNumber};
-    let acc_addr_h = acc_addr;
+
+    // PresentationVerified (single)
+    let ev_pres_sig = H256::from(ethers::utils::keccak256(b"PresentationVerified(string,address,bytes,bytes)"));
+    let mut pres_stream = client.provider().subscribe_logs(
+        &Filter::new()
+            .address(ValueOrArray::Array(verify_addrs.clone()))
+            .topic0(ValueOrArray::Value(ev_pres_sig))
+            .from_block(BlockNumber::Latest),
+    ).await?;
+    let pres_abi = verify.contract.abi().event("PresentationVerified")?;
+
+    // BatchPresentationVerified (from BatchVerifyWrapper)
+    let ev_batch_pres_sig = H256::from(ethers::utils::keccak256(
+        b"BatchPresentationVerified(string,uint256,bytes,bytes)",
+    ));
+    let batch_pres_stream = if let Some(ba) = batch_verify_addr {
+        Some(
+            client.provider().subscribe_logs(
+                &Filter::new()
+                    .address(ValueOrArray::Value(ba))
+                    .topic0(ValueOrArray::Value(ev_batch_pres_sig))
+                    .from_block(BlockNumber::Latest),
+            ).await?,
+        )
+    } else {
+        None
+    };
+    // Wrap in a fuse-able stream so tokio::select! can use it
+    let mut batch_pres_stream = batch_pres_stream;
+
+    // Accumulator events (Opened, MemberRevoked)
     let ev_opened = H256::from(ethers::utils::keccak256(b"Opened(string,bytes)"));
     let ev_revoked = H256::from(ethers::utils::keccak256(b"MemberRevoked(string,uint256,bytes)"));
-    let name_topic = {
-        let name_env0 = env::var("CRED_NAME").expect("CRED_NAME");
-        H256::from(ethers::utils::keccak256(name_env0.as_bytes()))
-    };
-    let mut status_stream = client.provider().subscribe_logs(&Filter::new().address(ValueOrArray::Value(acc_addr_h)).from_block(BlockNumber::Latest)).await?;
+    let name_topic = H256::from(ethers::utils::keccak256(name_env.as_bytes()));
+    let mut acc_stream = client.provider().subscribe_logs(
+        &Filter::new()
+            .address(ValueOrArray::Value(acc_addr))
+            .from_block(BlockNumber::Latest),
+    ).await?;
     let acc_opened_abi = accumulator.contract.abi().event("Opened")?;
 
-    println!("service_provider: listening for PresentationVerified from {:?} (auto_open={}, auto_revoke={})", verify_addrs, auto_open, auto_revoke);
-    while let Some(log) = stream.next().await {
-        let raw = RawLog { topics: log.topics.clone(), data: log.data.to_vec() };
-        let parsed = match ev.parse_log(raw) { Ok(p) => p, Err(e) => { eprintln!("parse err: {:?}", e); continue; } };
-        // params: name (indexed), prover (indexed), T1 (bytes), T2 (bytes)
-        let _name_topic = log.topics.get(1).cloned().unwrap_or_default();
-        let _prover = log.topics.get(2).cloned().unwrap_or_default();
-        let mut t1: Vec<u8> = Vec::new();
-        let mut t2: Vec<u8> = Vec::new();
-        for p in &parsed.params {
-            if p.name == "T1" { if let ethers::abi::Token::Bytes(b) = &p.value { t1 = b.clone(); } }
-            if p.name == "T2" { if let ethers::abi::Token::Bytes(b) = &p.value { t2 = b.clone(); } }
+    // Async stdin via channel + blocking reader
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut buf = String::new();
+            if stdin.read_line(&mut buf).is_err() { break; }
+            if line_tx.send(buf).is_err() { break; }
         }
-        if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens (T1={}, T2={})", t1.len(), t2.len()); continue; }
-        if auto_open {
-            let name_env = env::var("CRED_NAME").expect("CRED_NAME");
-            let t1b = ethers::types::Bytes::from(t1.clone());
-            let t2b = ethers::types::Bytes::from(t2.clone());
-            let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b))?;
-            let t0 = std::time::Instant::now();
-            let pending = call.send().await?;
-            let rcpt = pending.await?;
-            println!("ServiceProvider(auto): requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
-            if metrics_on {
-                let _ = (||{
-                    let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap());
-                    let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
-                    let gas = rcpt.as_ref().and_then(|r| r.gas_used).map(|g| g.to_string());
-                    let eff = rcpt.as_ref().and_then(|r| r.effective_gas_price).map(|p| p.to_string());
-                    let hash = rcpt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash));
-                    let blk = rcpt.as_ref().and_then(|r| r.block_number).map(|b| b.as_u64());
-                    let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
-                    let _=writeln!(f, "{}", serde_json::json!({
-                        "scenario":"sp_requestOpen",
-                        "threshold": threshold,
-                        "hash": hash,
-                        "blockNumber": blk,
-                        "gasUsed": gas,
-                        "effectiveGasPrice": eff,
-                        "costWei": cost
-                    }));
-                    Ok::<(),()>(())
-                })();
-            }
-            let mut notified = false;
-            let start = std::time::Instant::now();
-            let mut e_for_revoke: Option<U256> = None;
-            while start.elapsed().as_secs() < 30 {
-                if let Some(lg) = status_stream.next().await {
-                    if lg.address == acc_addr_h && !lg.topics.is_empty() {
-                        if lg.topics[0] == ev_opened && lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) {
-                            println!("ServiceProvider(auto): Opened emitted");
-                            if metrics_on {
-                                let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
-                                    use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_open_e2e","threshold": threshold, "ms": t0.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
-                            }
-                            let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
-                            if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
-                                let mut a_bytes: Vec<u8> = Vec::new();
-                                for p in parsed.params.iter() {
-                                    if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
-                                }
-                                if a_bytes.len() == 128 {
-                                    let mut e_u = U256::zero();
-                                    for _ in 0..50 {
-                                        match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
-                                            Ok(call) => { match call.call().await { Ok(x) => { e_u = x; }, Err(err) => { eprintln!("ServiceProvider: getEByA call error: {:?}", err); } } }
-                                            Err(err) => { eprintln!("ServiceProvider: getEByA method error: {:?}", err); }
-                                        }
-                                        if e_u != U256::zero() { break; }
-                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                    }
-                                    if e_u != U256::zero() {
-                                        println!("ServiceProvider: resolved e=0x{:x} via A->e mapping", e_u);
-                                        e_for_revoke = Some(e_u);
-                                    } else {
-                                        println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
-                                    }
-                                }
-                            }
-                            notified = true; break;
-                        } else if lg.topics[0] == ev_revoked {
-                            // Ignore unrelated MemberRevoked during open E2E window
-                            continue;
-                        }
-                    }
-                } else { break; }
-            }
-            if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 30s"); }
-            if auto_revoke {
-                if let Some(e_u) = e_for_revoke {
-                    let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env.clone(), e_u))?;
-                    let rev_start = std::time::Instant::now();
-                    let pending = call.send().await?;
-                    let rcpt = pending.await?;
-                    println!("ServiceProvider(auto): requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
-                    if metrics_on {
-                        let _ = (||{
-                            let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap());
-                            let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap();
-                            let gas = rcpt.as_ref().and_then(|r| r.gas_used).map(|g| g.to_string());
-                            let eff = rcpt.as_ref().and_then(|r| r.effective_gas_price).map(|p| p.to_string());
-                            let hash = rcpt.as_ref().map(|r| format!("0x{:x}", r.transaction_hash));
-                            let blk = rcpt.as_ref().and_then(|r| r.block_number).map(|b| b.as_u64());
-                            let cost = match (rcpt.as_ref().and_then(|r| r.gas_used), rcpt.as_ref().and_then(|r| r.effective_gas_price)) { (Some(g), Some(p)) => Some((g*p).to_string()), _ => None };
-                            let _=writeln!(f, "{}", serde_json::json!({
-                                "scenario":"sp_requestRevokeByE",
-                                "threshold": threshold,
-                                "hash": hash,
-                                "blockNumber": blk,
-                                "gasUsed": gas,
-                                "effectiveGasPrice": eff,
-                                "costWei": cost
-                            }));
-                            Ok::<(),()>(())
-                        })();
-                    }
-                    // Wait for MemberRevoked to compute revoke E2E
-                    let mut saw_rev = false;
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    while std::time::Instant::now() < deadline {
-                        if let Some(lg) = status_stream.next().await {
-                            if lg.address == acc_addr_h && !lg.topics.is_empty() && lg.topics[0] == ev_revoked {
-                                // Filter by name and expected e
-                                let mut e_be = [0u8; 32];
-                                e_u.to_big_endian(&mut e_be);
-                                let e_topic = H256::from(e_be);
-                                if lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) == false { continue; }
-                                if lg.topics.get(2).map(|t| *t == e_topic).unwrap_or(false) == false { continue; }
-                                println!("ServiceProvider: MemberRevoked emitted");
-                                if metrics_on {
-                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&metrics_file).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&metrics_file).unwrap(); use std::io::Write; let _=writeln!(f, "{}", serde_json::json!({"scenario":"sp_revoke_e2e","threshold": threshold, "ms": rev_start.elapsed().as_millis() as u64})); Ok::<(),()>(())})();
-                                }
-                                saw_rev = true; break;
-                            }
-                        } else { break; }
-                    }
-                    if !saw_rev { println!("ServiceProvider: MemberRevoked not observed within 30s"); }
-                } else {
-                    println!("ServiceProvider(auto): skip revoke (e not resolved)");
+    });
+
+    // --- State ---
+    let mut entries: HashMap<usize, OpenedEntry> = HashMap::new();
+    let mut next_idx: usize = 1;
+    // Map from pending (T1 hash) → entry idx, so we can correlate Opened events
+    let mut pending_opens: HashMap<Vec<u8>, usize> = HashMap::new();
+
+    println!("Service Provider — interactive mode");
+    println!("  Listening for PresentationVerified from {:?}", verify_addrs);
+    if let Some(ba) = batch_verify_addr {
+        println!("  Listening for BatchPresentationVerified from {:?}", ba);
+    }
+    println!("  Auto-opens presentations, then YOU choose when to revoke.");
+    print_help();
+    print!("> ");
+    let _ = std::io::stdout().flush();
+
+    loop {
+        tokio::select! {
+            // --- Branch 1: PresentationVerified event ---
+            Some(log) = pres_stream.next() => {
+                let raw = RawLog { topics: log.topics.clone(), data: log.data.to_vec() };
+                let parsed = match pres_abi.parse_log(raw) { Ok(p) => p, Err(e) => { eprintln!("parse err: {:?}", e); continue; } };
+                let prover = log.topics.get(2).cloned().unwrap_or_default();
+                let mut t1: Vec<u8> = Vec::new();
+                let mut t2: Vec<u8> = Vec::new();
+                for p in &parsed.params {
+                    if p.name == "T1" { if let ethers::abi::Token::Bytes(b) = &p.value { t1 = b.clone(); } }
+                    if p.name == "T2" { if let ethers::abi::Token::Bytes(b) = &p.value { t2 = b.clone(); } }
                 }
-            }
-            continue;
-        }
-        // Interactive prompt fallback
-        println!("ServiceProvider: choose action: [1] open-only  [2] revoke-by-e  [other] skip");
-        let mut ans = String::new();
-        std::io::stdin().read_line(&mut ans).ok();
-        match ans.trim() {
-            "1" | "" => {
-                let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-                let t1b = ethers::types::Bytes::from(t1);
-                let t2b = ethers::types::Bytes::from(t2);
-                let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env, t1b, t2b))?;
+                if t1.len() != 128 || t2.len() != 128 { eprintln!("bad T lens"); continue; }
+
+                println!("\n[event] PresentationVerified from prover {:?}", prover);
+
+                // Auto-open
+                let t1b = ethers::types::Bytes::from(t1.clone());
+                let t2b = ethers::types::Bytes::from(t2.clone());
+                let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b))?;
                 let pending = call.send().await?;
                 let rcpt = pending.await?;
-                println!("ServiceProvider: requestOpen sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
-                let mut notified = false;
-                let start = std::time::Instant::now();
-                while start.elapsed().as_secs() < 10 {
-                    if let Some(lg) = status_stream.next().await {
-                        if lg.address == acc_addr_h && !lg.topics.is_empty() {
-                            if lg.topics[0] == ev_opened {
-                                println!("ServiceProvider: Opened emitted");
-                                // Decode (name, A)
-                                let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
-                                if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
-                                    // We cannot recover indexed string param from topics; use configured credential name
-                                    let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-                                    let mut a_bytes: Vec<u8> = Vec::new();
-                                    for p in parsed.params.iter() {
-                                        if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
-                                    }
-                                    if a_bytes.len() == 128 {
-                                        // Try to resolve e via A->e mapping with a few retries (mapping may be populated just after Opened)
-                                        let mut e_u = U256::zero();
-                                        for _ in 0..10 {
-                                            match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
-                                                Ok(call) => {
-                                                    match call.call().await {
-                                                        Ok(x) => { e_u = x; }
-                                                        Err(err) => { eprintln!("ServiceProvider: getEByA call error: {:?}", err); }
-                                                    }
-                                                }
-                                                Err(err) => { eprintln!("ServiceProvider: getEByA method error: {:?}", err); }
-                                            }
-                                            if e_u != U256::zero() { break; }
-                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                        }
-                                        if e_u != U256::zero() {
-                                            println!("ServiceProvider: resolved e=0x{:x} via A->e mapping", e_u);
-                                            // Fetch witness for e (may not be available immediately)
-                                            let mut witness_ok = false;
-                                            for _ in 0..10 {
-                                                match accumulator.contract.method::<_, ethers::types::Bytes>("getWitness", (name_env.clone(), e_u)) {
-                                                    Ok(wc) => {
-                                                        match wc.call().await {
-                                                            Ok(wb) => {
-                                                                if wb.0.len() == 128 { witness_ok = true; break; }
-                                                            }
-                                                            Err(err) => eprintln!("ServiceProvider: getWitness call error: {:?}", err),
-                                                        }
-                                                    }
-                                                    Err(err) => eprintln!("ServiceProvider: getWitness method error: {:?}", err),
-                                                }
-                                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                            }
-                                            if witness_ok {
-                                                println!("ServiceProvider: witness available (len=128) for e=0x{:x}", e_u);
-                                            } else {
-                                                println!("ServiceProvider: witness not yet available for e=0x{:x}", e_u);
-                                            }
-                                        } else {
-                                            println!("ServiceProvider: A->e mapping not yet populated; will be available soon if on-chain mapping is enabled");
-                                        }
-                                    }
-                                }
-                                notified = true; break;
-                            }
-                            if lg.topics[0] == ev_revoked { println!("ServiceProvider: MemberRevoked emitted"); notified = true; break; }
-                        }
-                    } else { break; }
+                let status_ok = rcpt.as_ref().and_then(|r| r.status).unwrap_or(U64::from(0)) == U64::from(1);
+                println!("[sp] requestOpen tx status={}", if status_ok { "OK" } else { "FAIL" });
+
+                if status_ok {
+                    let idx = next_idx;
+                    next_idx += 1;
+                    entries.insert(idx, OpenedEntry {
+                        e: U256::zero(),
+                        a_short: "...".to_string(),
+                        prover,
+                        status: EntryStatus::Opening,
+                    });
+                    // Track by T1 hash so we can match the Opened event
+                    let t1_hash = ethers::utils::keccak256(&t1).to_vec();
+                    pending_opens.insert(t1_hash, idx);
+                    print_table(&entries);
                 }
-                if !notified { println!("ServiceProvider: no Opened/MemberRevoked within 10s"); }
-            }
-            "2" => {
-                use std::io::Write as _;
-                print!("Enter e (hex 0x..): ");
+                print!("> ");
                 let _ = std::io::stdout().flush();
-                let mut e_hex = String::new();
-                std::io::stdin().read_line(&mut e_hex).ok();
-                let e_hex = e_hex.trim();
-                let e_u = match U256::from_str_radix(e_hex.trim_start_matches("0x"), 16) { Ok(v) => v, Err(_) => { eprintln!("bad e"); continue; } };
-                let name_env = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
-                let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env, e_u))?;
-                let pending = call.send().await?;
-                let rcpt = pending.await?;
-                println!("ServiceProvider: requestRevokeByE sent; tx status={:?}", rcpt.as_ref().and_then(|r| r.status));
             }
-            _ => { println!("ServiceProvider: skipped"); }
+
+            // --- Branch 1b: BatchPresentationVerified event ---
+            Some(log) = async {
+                match batch_pres_stream.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending::<Option<ethers::types::Log>>().await,
+                }
+            } => {
+                // Decode batchSize, T1s, T2s from ABI-encoded event data
+                // Event: BatchPresentationVerified(string indexed name, uint256 batchSize, bytes T1s, bytes T2s)
+                let data = &log.data;
+                if data.len() < 32 {
+                    eprintln!("[batch] event data too short");
+                } else {
+                    // ABI decode: batchSize (uint256) + offset T1s + offset T2s + T1s bytes + T2s bytes
+                    let tokens = match ethers::abi::decode(
+                        &[
+                            ethers::abi::ParamType::Uint(256),
+                            ethers::abi::ParamType::Bytes,
+                            ethers::abi::ParamType::Bytes,
+                        ],
+                        data,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => { eprintln!("[batch] decode err: {:?}", e); continue; }
+                    };
+                    let batch_size = tokens[0].clone().into_uint().unwrap_or_default().as_u64() as usize;
+                    let t1s_bytes = tokens[1].clone().into_bytes().unwrap_or_default();
+                    let t2s_bytes = tokens[2].clone().into_bytes().unwrap_or_default();
+
+                    println!("\n[event] BatchPresentationVerified — {} users", batch_size);
+
+                    if t1s_bytes.len() != batch_size * 128 || t2s_bytes.len() != batch_size * 128 {
+                        eprintln!("[batch] T1s/T2s length mismatch: {}*128 vs {}/{}", batch_size, t1s_bytes.len(), t2s_bytes.len());
+                    } else {
+                        // Auto-open each user in the batch
+                        for j in 0..batch_size {
+                            let t1 = &t1s_bytes[j * 128..(j + 1) * 128];
+                            let t2 = &t2s_bytes[j * 128..(j + 1) * 128];
+                            let t1b = ethers::types::Bytes::from(t1.to_vec());
+                            let t2b = ethers::types::Bytes::from(t2.to_vec());
+                            let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b));
+                            match call {
+                                Ok(c) => {
+                                    match c.send().await {
+                                        Ok(pending) => {
+                                            let rcpt = pending.await;
+                                            let ok = rcpt.as_ref().ok()
+                                                .and_then(|r| r.as_ref())
+                                                .and_then(|r| r.status)
+                                                .unwrap_or(U64::from(0)) == U64::from(1);
+                                            println!("[sp] batch[{}] requestOpen tx status={}", j, if ok { "OK" } else { "FAIL" });
+                                            if ok {
+                                                let idx = next_idx;
+                                                next_idx += 1;
+                                                entries.insert(idx, OpenedEntry {
+                                                    e: U256::zero(),
+                                                    a_short: format!("batch#{}", j),
+                                                    prover: H256::zero(),
+                                                    status: EntryStatus::Opening,
+                                                });
+                                                let t1_hash = ethers::utils::keccak256(t1).to_vec();
+                                                pending_opens.insert(t1_hash, idx);
+                                            }
+                                        }
+                                        Err(e) => { eprintln!("[sp] batch[{}] requestOpen send err: {:?}", j, e); }
+                                    }
+                                }
+                                Err(e) => { eprintln!("[sp] batch[{}] requestOpen build err: {:?}", j, e); }
+                            }
+                        }
+                        print_table(&entries);
+                    }
+                }
+                print!("> ");
+                let _ = std::io::stdout().flush();
+            }
+
+            // --- Branch 2: Accumulator events (Opened / MemberRevoked) ---
+            Some(lg) = acc_stream.next() => {
+                if lg.topics.is_empty() { continue; }
+
+                if lg.topics[0] == ev_opened && lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) {
+                    // Parse A from Opened event
+                    let raw = RawLog { topics: lg.topics.clone(), data: lg.data.to_vec() };
+                    let mut a_bytes: Vec<u8> = Vec::new();
+                    if let Ok(parsed) = acc_opened_abi.parse_log(raw) {
+                        for p in parsed.params.iter() {
+                            if p.name == "A" { if let ethers::abi::Token::Bytes(b) = &p.value { a_bytes = b.clone(); } }
+                        }
+                    }
+                    let a_short = if a_bytes.len() >= 8 { format!("0x{}...", hex::encode(&a_bytes[..8])) } else { "??".into() };
+                    println!("\n[event] Opened — A={}", a_short);
+
+                    // Resolve e via A→e mapping
+                    let mut e_u = U256::zero();
+                    if a_bytes.len() == 128 {
+                        for _ in 0..50 {
+                            match accumulator.contract.method::<_, U256>("getEByA", (name_env.clone(), ethers::types::Bytes::from(a_bytes.clone()))) {
+                                Ok(call) => { if let Ok(x) = call.call().await { e_u = x; } }
+                                Err(_) => {}
+                            }
+                            if !e_u.is_zero() { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+
+                    // Try to find which pending entry this belongs to.
+                    // Heuristic: take the oldest Opening entry (FIFO), since we can't
+                    // directly correlate T1→A without the opener's secret.
+                    let matched_idx = {
+                        let mut oldest: Option<usize> = None;
+                        let mut keys: Vec<usize> = entries.keys().copied().collect();
+                        keys.sort();
+                        for k in keys {
+                            if matches!(entries[&k].status, EntryStatus::Opening) {
+                                oldest = Some(k);
+                                break;
+                            }
+                        }
+                        oldest
+                    };
+
+                    if let Some(idx) = matched_idx {
+                        let ent = entries.get_mut(&idx).unwrap();
+                        ent.e = e_u;
+                        ent.a_short = a_short;
+                        ent.status = EntryStatus::Opened;
+                        if e_u.is_zero() {
+                            println!("[sp] could not resolve e for entry #{} (A->e mapping missing?)", idx);
+                        } else {
+                            println!("[sp] entry #{} opened: e=0x{:x}", idx, e_u);
+                        }
+                    } else {
+                        // No pending entry — might be from a different SP or stale event
+                        if !e_u.is_zero() {
+                            let idx = next_idx; next_idx += 1;
+                            entries.insert(idx, OpenedEntry { e: e_u, a_short, prover: H256::zero(), status: EntryStatus::Opened });
+                            println!("[sp] new entry #{} from external open: e=0x{:x}", idx, e_u);
+                        }
+                    }
+                    print_table(&entries);
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                }
+                else if lg.topics[0] == ev_revoked && lg.topics.get(1).map(|t| *t == name_topic).unwrap_or(false) {
+                    let e_topic = lg.topics.get(2).cloned().unwrap_or_default();
+                    let e_u = U256::from_big_endian(e_topic.as_bytes());
+                    println!("\n[event] MemberRevoked — e=0x{:x}", e_u);
+                    // Update any matching entry
+                    for ent in entries.values_mut() {
+                        if ent.e == e_u && matches!(ent.status, EntryStatus::Revoking) {
+                            ent.status = EntryStatus::Revoked;
+                        }
+                    }
+                    print_table(&entries);
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+
+            // --- Branch 3: User input ---
+            Some(line) = line_rx.recv() => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                if line == "q" || line == "quit" {
+                    println!("Bye.");
+                    break;
+                }
+                if line == "l" || line == "list" {
+                    print_table(&entries);
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                if line == "h" || line == "help" || line == "?" {
+                    print_help();
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                if line.starts_with("r ") || line.starts_with("revoke ") {
+                    let num_str = line.split_whitespace().nth(1).unwrap_or("");
+                    let idx: usize = match num_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => { println!("  usage: r <N>"); print!("> "); let _ = std::io::stdout().flush(); continue; }
+                    };
+                    let ent = match entries.get(&idx) {
+                        Some(e) => e.clone(),
+                        None => { println!("  entry #{} not found", idx); print!("> "); let _ = std::io::stdout().flush(); continue; }
+                    };
+                    if !matches!(ent.status, EntryStatus::Opened) {
+                        println!("  entry #{} is {} — can only revoke OPENED entries", idx, ent.status);
+                        print!("> ");
+                        let _ = std::io::stdout().flush();
+                        continue;
+                    }
+                    if ent.e.is_zero() {
+                        println!("  entry #{} has no resolved e — cannot revoke", idx);
+                        print!("> ");
+                        let _ = std::io::stdout().flush();
+                        continue;
+                    }
+                    println!("[sp] requesting revocation for entry #{} (e=0x{:x})...", idx, ent.e);
+                    let call = accumulator.contract.method::<_, ()>("requestRevokeByE", (name_env.clone(), ent.e))?;
+                    match call.send().await {
+                        Ok(pending) => {
+                            match pending.await {
+                                Ok(rcpt) => {
+                                    let ok = rcpt.as_ref().and_then(|r| r.status).unwrap_or(U64::from(0)) == U64::from(1);
+                                    println!("[sp] requestRevokeByE tx status={}", if ok { "OK" } else { "FAIL" });
+                                    if ok {
+                                        entries.get_mut(&idx).unwrap().status = EntryStatus::Revoking;
+                                    }
+                                }
+                                Err(e) => { eprintln!("[sp] revoke tx error: {:?}", e); }
+                            }
+                        }
+                        Err(e) => { eprintln!("[sp] revoke send error: {:?}", e); }
+                    }
+                    print_table(&entries);
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                println!("  unknown command: {}", line);
+                print_help();
+                print!("> ");
+                let _ = std::io::stdout().flush();
+            }
         }
     }
     Ok(())
