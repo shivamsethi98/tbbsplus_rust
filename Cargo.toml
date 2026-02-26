@@ -113,10 +113,6 @@ name = "deploy_gas_metrics"
 path = "metrics/scenarios/deploy_gas_metrics.rs"
 
 [[bin]]
-name = "benchmark_batching"
-path = "src/bin/benchmark_batching.rs"
-
-[[bin]]
 name = "presentation_aggregator"
 path = "src/bin/presentation_aggregator.rs"
 
