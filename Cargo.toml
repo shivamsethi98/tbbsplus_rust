@@ -119,3 +119,7 @@ path = "src/bin/presentation_aggregator.rs"
 [[bin]]
 name = "request_aggregator"
 path = "src/bin/request_aggregator.rs"
+
+[[bin]]
+name = "bench_summary"
+path = "metrics/scenarios/bench_summary.rs"

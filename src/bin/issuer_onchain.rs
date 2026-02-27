@@ -78,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
     let cred_name: String = env::var("CRED_NAME").unwrap_or_else(|_| "ANON_CRED".into());
 
     // --- Batch config ---
-    let batch_size: u32 = env::var("BATCH_SIZE").unwrap_or_else(|_| "1".into()).parse()?;
+    // Initial batch_size from env; re-read from on-chain Params each loop iteration
+    // so updates via setBatchSizes() take effect without restarting issuers.
+    let mut batch_size: u32 = env::var("BATCH_SIZE").unwrap_or_else(|_| "1".into()).parse()?;
     let batch_timeout_ms: u64 = env::var("BATCH_TIMEOUT_MS").unwrap_or_else(|_| "5000".into()).parse()?;
     let is_batch_leader = participant_id == 1; // lowest PID = batch leader
 
@@ -236,6 +238,27 @@ async fn main() -> anyhow::Result<()> {
     let batch_timeout = Duration::from_millis(batch_timeout_ms);
 
     loop {
+        // Re-read batch size from on-chain Params so changes take effect without restart
+        if pending_batch.is_empty() {
+            match params_client.get_batch_sizes(cred_name.clone()).await {
+                Ok((sz, _)) => {
+                    let new_sz = if sz == 0 { 1 } else { sz };
+                    if new_sz != batch_size {
+                        info!(pid=%participant_id, old=%batch_size, new=%new_sz, "batch_size updated from on-chain Params");
+                        batch_size = new_sz;
+                        // Clear in-memory session dedup so users from a prior batch size
+                        // can be re-issued (bench iterates sizes with the same user set).
+                        sessions.clear();
+                        deadlines.clear();
+                        info!(pid=%participant_id, "cleared session caches for new batch size");
+                    }
+                }
+                Err(e) => {
+                    warn!(pid=%participant_id, error=%e, "failed to read batch sizes from Params; keeping current");
+                }
+            }
+        }
+
         // Determine timeout for batch trigger
         let timeout_fut = if batch_size > 1 && !pending_batch.is_empty() {
             let elapsed = batch_first_arrival.unwrap().elapsed();
@@ -253,8 +276,9 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ev) = ev_opt {
             let ev = ev?;
             let user_id: U256 = ev.user_id;
-            if let Some(state) = sessions.get(&user_id) {
-                if matches!(state, SidState::ShareSubmitted) { continue; }
+            if sessions.contains_key(&user_id) {
+                info!(pid=%participant_id, %user_id, "skipping duplicate SigReqBBSPlusVerified");
+                continue;
             }
             info!(pid=%participant_id, %user_id, "SigReqBBSPlusVerified");
 
@@ -501,6 +525,17 @@ async fn main() -> anyhow::Result<()> {
         let phase1_output = p1
             .finish_for_bbs_plus::<blake2::Blake2b512>(&key_shares[(participant_id - 1) as usize])
             .map_err(|e| anyhow::anyhow!("phase1 finish failed: {:?}", e))?;
+
+        // ── Diagnostic: log Phase1 output for cross-issuer comparison ──
+        {
+            let e_hex: Vec<String> = phase1_output.e.iter().map(|x| format!("{:?}", x)).collect();
+            let s_hex: Vec<String> = phase1_output.s.iter().map(|x| format!("{:?}", x)).collect();
+            let uid_hex: Vec<String> = batch_requests.iter().map(|r| format!("0x{:x}", r.user_id)).collect();
+            info!(pid=%participant_id, batch_sid, n=%actual_batch_size,
+                  user_ids=?uid_hex, e_vals=?e_hex, s_vals=?s_hex,
+                  "phase1_output diagnostic (e, s should match across all issuers)");
+        }
+
         for req in &batch_requests { sessions.insert(req.user_id, SidState::P1Done); }
 
         // ── Phase 2 ──
@@ -699,6 +734,7 @@ async fn main() -> anyhow::Result<()> {
             if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
                 call = call.gas_price(U256::from(1_000_000_000u64));
             }
+            let t0_submit = std::time::Instant::now();
             match call.send().await {
                 Ok(pend) => {
                     let rcpt = pend.await?.ok_or_else(|| anyhow::anyhow!("no receipt"))?;
@@ -713,7 +749,9 @@ async fn main() -> anyhow::Result<()> {
                     metrics_append(metrics, &metrics_file, json!({
                         "scenario":"submitShareBatch", "batch_size": actual_batch_size,
                         "idx": participant_id, "gasUsed": gas_used.to_string(),
-                        "effectiveGasPrice": eff_price.to_string(), "costWei": cost.to_string()
+                        "perUserGas": (gas_used / actual_batch_size as u64).to_string(),
+                        "effectiveGasPrice": eff_price.to_string(), "costWei": cost.to_string(),
+                        "ms": t0_submit.elapsed().as_millis() as u64
                     }));
                     for uid in &user_ids_u256 {
                         sessions.insert(*uid, SidState::ShareSubmitted);
@@ -780,6 +818,7 @@ async fn main() -> anyhow::Result<()> {
                         if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
                             confirm_call = confirm_call.gas_price(U256::from(1_000_000_000u64));
                         }
+                        let t0_confirm = std::time::Instant::now();
                         match confirm_call.send().await {
                             Ok(pend) => {
                                 let rcpt = pend.await?.ok_or_else(|| anyhow::anyhow!("no confirm receipt"))?;
@@ -794,11 +833,66 @@ async fn main() -> anyhow::Result<()> {
                                 metrics_append(metrics, &metrics_file, json!({
                                     "scenario":"confirmBatchRandomized", "batch_size": actual_batch_size,
                                     "idx": participant_id, "gasUsed": gas_used.to_string(),
-                                    "effectiveGasPrice": eff_price.to_string(), "costWei": cost.to_string()
+                                    "perUserGas": (gas_used / actual_batch_size as u64).to_string(),
+                                    "effectiveGasPrice": eff_price.to_string(), "costWei": cost.to_string(),
+                                    "ms": t0_confirm.elapsed().as_millis() as u64
                                 }));
                             }
                             Err(e) => {
-                                warn!(pid=%participant_id, batch_sid, error=?e, "confirmBatchRandomized failed (may retry)");
+                                warn!(pid=%participant_id, batch_sid, n=%actual_batch_size,
+                                      error=?e, "confirmBatchRandomized FAILED for full batch");
+
+                                // Diagnostic fallback: try confirming each user individually.
+                                // If individual confirms succeed ⇒ batch check bug.
+                                // If they also fail ⇒ MPC produced invalid signatures.
+                                warn!(pid=%participant_id, batch_sid,
+                                      "falling back to individual confirmBatchRandomized per user…");
+                                for uid in &user_ids_u256 {
+                                    let t0_ind = std::time::Instant::now();
+                                    let ind_result: Result<Option<ethers::types::TransactionReceipt>, anyhow::Error> = {
+                                        let mut ind_call = registry.confirm_batch_randomized_call(
+                                            cred_name.clone(), vec![*uid],
+                                        )?;
+                                        if ws_url.contains("127.0.0.1") || ws_url.contains("localhost") {
+                                            ind_call = ind_call.gas_price(U256::from(1_000_000_000u64));
+                                        }
+                                        let x = match ind_call.send().await {
+                                            Ok(pend) => pend.await.map_err(|e| anyhow::anyhow!("{:?}", e)),
+                                            Err(e) => Err(anyhow::anyhow!("{:?}", e)),
+                                        }; x
+                                    };
+                                    match ind_result {
+                                        Ok(Some(rcpt)) => {
+                                            let gas_used = rcpt.gas_used.unwrap_or_default();
+                                            let eff_price = rcpt.effective_gas_price.unwrap_or_default();
+                                            let cost = gas_used * eff_price;
+                                            info!(
+                                                pid=%participant_id, batch_sid,
+                                                userId=%uid, gas=%gas_used,
+                                                tx=?rcpt.transaction_hash,
+                                                "individual confirmBatchRandomized OK"
+                                            );
+                                            metrics_append(metrics, &metrics_file, json!({
+                                                "scenario":"confirmBatchRandomized",
+                                                "batch_size": 1,
+                                                "idx": participant_id,
+                                                "gasUsed": gas_used.to_string(),
+                                                "perUserGas": gas_used.to_string(),
+                                                "effectiveGasPrice": eff_price.to_string(),
+                                                "costWei": cost.to_string(),
+                                                "ms": t0_ind.elapsed().as_millis() as u64
+                                            }));
+                                        }
+                                        Ok(None) => {
+                                            error!(pid=%participant_id, userId=%uid,
+                                                   "individual confirm: no receipt");
+                                        }
+                                        Err(e) => {
+                                            error!(pid=%participant_id, userId=%uid,
+                                                   error=%e, "individual confirmBatchRandomized ALSO FAILED — MPC signature invalid");
+                                        }
+                                    }
+                                }
                             }
                         };
                     }

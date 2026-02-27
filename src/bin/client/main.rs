@@ -142,7 +142,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
             }
-            // Chain check: if Confirmed was missed locally but signature exists on-chain, pull it and persist
+            // Chain check: if Confirmed was missed locally but signature exists on-chain, pull it and persist.
+            // Skip this shortcut when BATCH_REQUEST_EXPORT is set — we always want a fresh request.
+            if std::env::var("BATCH_REQUEST_EXPORT").is_err() {
             if let Some(registry) = registry_opt.as_ref() {
                 let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), user_id_u256).await?;
                 if abytes.0.len() == 128 {
@@ -176,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                     if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
                 }
             }
+            } // end BATCH_REQUEST_EXPORT guard
             let pb = fetch_params_bundle(&params_contract, &cred_name).await?;
             let mcount_onchain = pb.mcount; let params_bbs = pb.params_bbs.clone();
             if let Some(pos) = revealed_idx.iter().position(|&i| i == 0) { revealed_vals[pos] = user_id_u256; }
@@ -254,26 +257,25 @@ async fn main() -> anyhow::Result<()> {
                     file.unlock()?;
                     println!("[batch-export] request #{} written to {} ({} total)", count, out_path, count);
                 }
-                if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
+                // If --wait is set, fall through to wait for Confirmed event
+                // (the aggregator will submit the batch tx on our behalf).
+                // Otherwise exit immediately.
+                if !wait_and_verify {
+                    if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
+                }
             }
 
+            let is_batch_export = std::env::var("BATCH_REQUEST_EXPORT").is_ok();
+
             if wait_and_verify {
-                if registry_opt.is_none() { anyhow::bail!("REGISTRY_CONTRACT/RELAY_CONTRACT missing; cannot wait for Aggregated event"); }
+                if registry_opt.is_none() { anyhow::bail!("REGISTRY_CONTRACT/RELAY_CONTRACT missing; cannot wait for Confirmed event"); }
                 let registry = registry_opt.as_ref().unwrap();
-                // Build Aggregated and Confirmed streams
+                // Subscribe to Confirmed event stream
                 use ethers::types::{Filter, ValueOrArray, BlockNumber};
-                let topic_agg = H256::from(ethers::utils::keccak256(b"Aggregated(string,uint256,bytes,uint256,uint256)"));
                 let name_topic = H256::from(ethers::utils::keccak256(cred_name.as_bytes()));
                 let mut uid_be = [0u8; 32];
                 user_id_u256.to_big_endian(&mut uid_be);
                 let uid_topic = H256::from(uid_be);
-                let filter_agg = Filter::new()
-                    .address(ValueOrArray::Value(registry.address()))
-                    .topic0(ValueOrArray::Value(topic_agg))
-                    .topic1(ValueOrArray::Value(name_topic))
-                    .topic2(ValueOrArray::Value(uid_topic))
-                    .from_block(BlockNumber::Latest);
-                let mut agg_stream = client.provider().subscribe_logs(&filter_agg).await?;
                 let topic_conf = H256::from(ethers::utils::keccak256(b"Confirmed(string,uint256)"));
                 let filter_conf = Filter::new()
                     .address(ValueOrArray::Value(registry.address()))
@@ -282,34 +284,51 @@ async fn main() -> anyhow::Result<()> {
                     .topic2(ValueOrArray::Value(uid_topic))
                     .from_block(BlockNumber::Latest);
                 let mut conf_stream = client.provider().subscribe_logs(&filter_conf).await?;
-                let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
-                    req_session.cred_name.clone(),
-                    req_session.commitment_u.clone(), req_session.commitment_b.clone(),
-                    req_session.revealed_idx.clone(), req_session.revealed_vals.clone(),
-                    req_session.h0_b.clone(), req_session.h_b.clone(),
-                    req_session.hidden_idx_vec.clone(), req_session.t_b.clone(),
-                    req_session.c_u256, req_session.resp_vec_u256.clone(),
-                    req_session.context_bytes.clone(),
-                );
-                let t0_total = t0_pok;
-                let t0_send = Instant::now();
-                let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
-                if let Some(rcpt) = rcpt_opt.as_ref() {
-                    let gas_used = rcpt.gas_used.unwrap_or_default();
-                    let eff_price = rcpt.effective_gas_price.unwrap_or_default();
-                    let cost = gas_used * eff_price;
-                    metrics_append(metrics, &metrics_file, json!({
-                        "scenario":"requestCredential",
-                        "userId": format!("0x{:x}", user_id_u256),
-                        "gasUsed": gas_used.to_string(),
-                        "effectiveGasPrice": eff_price.to_string(),
-                        "costWei": cost.to_string()
-                    }));
-                    let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)")); let mut found = false; for lg in rcpt.logs.iter() { if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; } } println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" });
+
+                // In batch mode the aggregator submits the tx; in single mode we submit directly.
+                if !is_batch_export {
+                    let topic_agg = H256::from(ethers::utils::keccak256(b"Aggregated(string,uint256,bytes,uint256,uint256)"));
+                    let filter_agg = Filter::new()
+                        .address(ValueOrArray::Value(registry.address()))
+                        .topic0(ValueOrArray::Value(topic_agg))
+                        .topic1(ValueOrArray::Value(name_topic))
+                        .topic2(ValueOrArray::Value(uid_topic))
+                        .from_block(BlockNumber::Latest);
+                    let mut _agg_stream = client.provider().subscribe_logs(&filter_agg).await?;
+                    let try_verified_call = req.broadcast_sig_req_bbs_plus_verified(
+                        req_session.cred_name.clone(),
+                        req_session.commitment_u.clone(), req_session.commitment_b.clone(),
+                        req_session.revealed_idx.clone(), req_session.revealed_vals.clone(),
+                        req_session.h0_b.clone(), req_session.h_b.clone(),
+                        req_session.hidden_idx_vec.clone(), req_session.t_b.clone(),
+                        req_session.c_u256, req_session.resp_vec_u256.clone(),
+                        req_session.context_bytes.clone(),
+                    );
+                    let t0_send = Instant::now();
+                    let rcpt_opt = match try_verified_call.send().await { Ok(p) => p.await?, Err(e) => return Err(anyhow::anyhow!("verified request failed: {:?}", e)) };
+                    if let Some(rcpt) = rcpt_opt.as_ref() {
+                        let gas_used = rcpt.gas_used.unwrap_or_default();
+                        let eff_price = rcpt.effective_gas_price.unwrap_or_default();
+                        let cost = gas_used * eff_price;
+                        metrics_append(metrics, &metrics_file, json!({
+                            "scenario":"requestCredential",
+                            "userId": format!("0x{:x}", user_id_u256),
+                            "gasUsed": gas_used.to_string(),
+                            "effectiveGasPrice": eff_price.to_string(),
+                            "costWei": cost.to_string()
+                        }));
+                        let topic_sig = H256::from(ethers::utils::keccak256(b"SigReqBBSPlusVerified(address,uint256,string,bytes,uint32[],uint256[],uint32[],bytes,uint256,uint256[],bytes)")); let mut found = false; for lg in rcpt.logs.iter() { if lg.address == req_addr && !lg.topics.is_empty() && lg.topics[0] == topic_sig { found = true; break; } } println!("[on-chain] commitment PoK verified: {}", if found { "OK" } else { "UNKNOWN" });
+                    }
+                    if let Some(rcpt) = rcpt_opt.clone() { let txh = rcpt.transaction_hash; if let Some(bn) = rcpt.block_number { persist_request_meta(&user_id, &cred_name, txh, bn.as_u64()).ok(); } }
+                } else {
+                    println!("[batch-wait] waiting for Confirmed event (aggregator submits batch tx)...");
                 }
-                if let Some(rcpt) = rcpt_opt.clone() { let txh = rcpt.transaction_hash; if let Some(bn) = rcpt.block_number { persist_request_meta(&user_id, &cred_name, txh, bn.as_u64()).ok(); } }
+
+                let t0_total = t0_pok;
+                // In batch mode, allow longer wait — aggregator poll + issuer MPC + accumulator update
+                let confirm_timeout_secs = if is_batch_export { 300 } else { 60 };
                 // Wait for Confirmed and then fetch signature; persist artifacts; enter action loop
-                if let Ok(Some(_lg)) = tokio::time::timeout(std::time::Duration::from_secs(60), conf_stream.next()).await {
+                if let Ok(Some(_lg)) = tokio::time::timeout(std::time::Duration::from_secs(confirm_timeout_secs), conf_stream.next()).await {
                     metrics_append(metrics, &metrics_file, json!({"scenario":"issuance_e2e_confirmed","userId": format!("0x{:x}", user_id_u256),"ms": t0_total.elapsed().as_millis() as u64}));
                     // Fetch aggregated signature from registry
                     let (abytes, e_u, s_u, _status) = registry.get_signature(cred_name.clone(), user_id_u256).await?;
@@ -336,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
                     if std::env::var("AUTO_WITNESS_SYNC").is_ok() || std::env::var("BATCH_PRESENTATION_EXPORT").is_ok() {
                         let sess = session::Session::load(&user_id, &cred_name, &params_contract).await?;
                         println!("[auto] credential confirmed — running witness sync...");
-                        ui::auto_witness_sync(client.clone(), &params_contract, &sess).await?;
+                        ui::auto_witness_sync(client.clone(), &params_contract, &sess, metrics, &metrics_file).await?;
                         if std::env::var("BATCH_PRESENTATION_EXPORT").is_ok() {
                             let out_path = std::env::var("BATCH_PRESENTATION_FILE")
                                 .unwrap_or_else(|_| "batch_presentation.json".into());
@@ -347,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
                                 .filter_map(|s| s.trim().parse().ok())
                                 .collect();
                             println!("[auto] exporting batch presentation to {}...", out_path);
-                            ui::auto_batch_export(client.clone(), &params_contract, &sess, &auto_revealed, &out_path).await?;
+                            ui::auto_batch_export(client.clone(), &params_contract, &sess, &auto_revealed, &out_path, metrics, &metrics_file).await?;
                         }
                         if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
                     }
@@ -396,6 +415,26 @@ async fn main() -> anyhow::Result<()> {
                     let mut s_bytes = Vec::new(); signature.s.serialize_compressed(&mut s_bytes)?;
                     store.save_signature(&SignatureFile { a: format!("0x{}", hex::encode(a_bytes)), e: format!("0x{}", hex::encode(e_bytes)), s: format!("0x{}", hex::encode(s_bytes)) })?;
                     println!("[verify] artifacts written to {}", store.base().display());
+                    // ── Auto witness sync + batch presentation export (non-interactive, same as Request path) ──
+                    #[cfg(feature = "interactive")]
+                    if std::env::var("AUTO_WITNESS_SYNC").is_ok() || std::env::var("BATCH_PRESENTATION_EXPORT").is_ok() {
+                        let sess = session::Session::load(&user_id, &cred_name, &params_contract).await?;
+                        println!("[verify] running witness sync...");
+                        ui::auto_witness_sync(client.clone(), &params_contract, &sess, metrics, &metrics_file).await?;
+                        if std::env::var("BATCH_PRESENTATION_EXPORT").is_ok() {
+                            let out_path = std::env::var("BATCH_PRESENTATION_FILE")
+                                .unwrap_or_else(|_| "batch_presentation.json".into());
+                            let revealed_idx_str = std::env::var("AUTO_REVEALED_IDX")
+                                .unwrap_or_else(|_| "0".into());
+                            let auto_revealed: Vec<u32> = revealed_idx_str
+                                .split(',')
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect();
+                            println!("[verify] exporting batch presentation to {}...", out_path);
+                            ui::auto_batch_export(client.clone(), &params_contract, &sess, &auto_revealed, &out_path, metrics, &metrics_file).await?;
+                        }
+                        if is_interactive { continue 'MAIN_LOOP; } else { return Ok(()); }
+                    }
                     // Enter interactive action loop (off-chain verify, witness, present)
                     #[cfg(feature = "interactive")]
                     {

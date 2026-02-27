@@ -614,7 +614,7 @@ async fn main() -> anyhow::Result<()> {
                                 if metrics {
                                     let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
                                     let ms: u64 = add_start.remove(&ac.sid).map(|t0| t0.elapsed().as_millis() as u64).unwrap_or(0);
-                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "sid": ac.sid, "threshold": threshold, "ms": ms, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                                    let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "sid": ac.sid, "threshold": threshold, "ms": ms, "gasUsedTotal": gas_total.to_string(), "perUserGas": (gas_total / n as u64).to_string()})); Ok::<(),()>(())})();
                                 }
                                 local_v = None;
                                 batch_add_first = None;
@@ -668,7 +668,8 @@ async fn main() -> anyhow::Result<()> {
                         let scenario = if n == 1 { "acc_register_info_e2e" } else { "acc_addMembers_batch" };
                         if metrics {
                             let mf = std::env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/aggregator.ndjson".into());
-                            let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "threshold": threshold, "gasUsedTotal": gas_total.to_string()})); Ok::<(),()>(())})();
+                            let ms: u64 = batch_add_first.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                            let _ = (||{ let _=std::fs::create_dir_all(std::path::Path::new(&mf).parent().unwrap()); let mut f=std::fs::OpenOptions::new().create(true).append(true).open(&mf).unwrap(); let _=writeln!(f, "{}", serde_json::json!({"scenario": scenario, "batch_size": n, "threshold": threshold, "gasUsedTotal": gas_total.to_string(), "perUserGas": (gas_total / n as u64).to_string(), "ms": ms})); Ok::<(),()>(())})();
                         }
                         local_v = None;
                         batch_add_first = None;

@@ -560,8 +560,11 @@ pub async fn auto_witness_sync(
     client: Arc<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     params_contract: &ParamsContract<SignerMiddleware<Provider<Ws>, LocalWallet>>,
     session: &Session,
+    metrics: bool,
+    metrics_file: &str,
 ) -> anyhow::Result<()> {
     use ethers::types::{Filter, ValueOrArray, BlockNumber};
+    let t0_ws = std::time::Instant::now();
 
     let store = CredentialsStore::new(&session.user_id, &session.cred_name);
     // Load signature to get e value
@@ -581,10 +584,25 @@ pub async fn auto_witness_sync(
     let pk_g2_b: EthBytes = params_contract.method("getOpenerPkG2ByName", session.cred_name.to_string())?.call().await?;
     let pk_acc = vb_accumulator::setup::PublicKey::<Bls12_381>(eip2537_g2_to_affine(&pk_g2_b.0[..])?);
 
-    // Current on-chain delta
-    let delta_b: ethers::types::Bytes = acc.contract.method("getDelta", (session.cred_name.to_string(),))?.call().await?;
-    if delta_b.0.len() != 128 { anyhow::bail!("[auto-witness] no Delta on-chain yet"); }
-    let v_current = eip2537_g1_to_affine(&delta_b.0[..])?;
+    // Current on-chain delta — wait for addMembers to land (may lag after Confirmed)
+    let v_current = {
+        let max_wait = std::time::Duration::from_secs(120);
+        let poll = std::time::Duration::from_secs(3);
+        let t0 = std::time::Instant::now();
+        loop {
+            let delta_b: ethers::types::Bytes = acc.contract
+                .method("getDelta", (session.cred_name.to_string(),))?
+                .call().await?;
+            if delta_b.0.len() == 128 {
+                break eip2537_g1_to_affine(&delta_b.0[..])?;
+            }
+            if t0.elapsed() >= max_wait {
+                anyhow::bail!("[auto-witness] no Delta on-chain after {}s", max_wait.as_secs());
+            }
+            println!("[auto-witness] no Delta on-chain yet, retrying in {}s...", poll.as_secs());
+            tokio::time::sleep(poll).await;
+        }
+    };
 
     // Check cached witness first
     let wit_path = store.base().join("witness.bin");
@@ -618,8 +636,26 @@ pub async fn auto_witness_sync(
         .topic1(ValueOrArray::Value(name_topic))
         .topic2(ValueOrArray::Value(my_e_topic))
         .from_block(BlockNumber::Earliest);
-    let my_add_logs = client.provider().get_logs(&filter_my_add).await?;
-    if my_add_logs.is_empty() { anyhow::bail!("[auto-witness] MemberAdded event not found for this credential"); }
+    let my_add_logs;
+    {
+        // The opener_aggregator's addMembers tx may land after Confirmed —
+        // retry for up to 120s waiting for the MemberAdded event.
+        let max_wait = std::time::Duration::from_secs(120);
+        let poll_interval = std::time::Duration::from_secs(3);
+        let t0_poll = std::time::Instant::now();
+        loop {
+            let logs = client.provider().get_logs(&filter_my_add).await?;
+            if !logs.is_empty() {
+                my_add_logs = logs;
+                break;
+            }
+            if t0_poll.elapsed() >= max_wait {
+                anyhow::bail!("[auto-witness] MemberAdded event not found after {}s — addMembers may not have landed yet", max_wait.as_secs());
+            }
+            println!("[auto-witness] MemberAdded not found yet, retrying in {}s...", poll_interval.as_secs());
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
     let my_add_block = my_add_logs[0].block_number.ok_or_else(|| anyhow::anyhow!("MemberAdded log missing block_number"))?.as_u64();
     println!("[auto-witness] MemberAdded found at block {}", my_add_block);
 
@@ -732,6 +768,12 @@ pub async fn auto_witness_sync(
     let acc_view = vb_accumulator::positive::PositiveAccumulator::<ark_bls12_381::G1Affine>::from_accumulated(v_current);
     let ok = vb_accumulator::positive::Accumulator::verify_membership::<Bls12_381>(&acc_view, &signature_e, &wit, &pk_acc, &vb_params);
     println!("[auto-witness] membership {}", if ok { "OK" } else { "FAIL" });
+    metrics_append(metrics, metrics_file, serde_json::json!({
+        "scenario": "witness_sync",
+        "userId": &session.user_id,
+        "ms": t0_ws.elapsed().as_millis() as u64,
+        "events_replayed": updates_applied
+    }));
     if !ok { anyhow::bail!("[auto-witness] membership verification failed"); }
     Ok(())
 }
@@ -744,8 +786,11 @@ pub async fn auto_batch_export(
     session: &Session,
     revealed_idx: &[u32],
     out_path: &str,
+    metrics: bool,
+    metrics_file: &str,
 ) -> anyhow::Result<()> {
     use tbbsplus_rust::orchestration::batching::PresentationData;
+    let t0_pres = std::time::Instant::now();
 
     let store = CredentialsStore::new(&session.user_id, &session.cred_name);
     let pb = onchain::fetch_params_bundle(params_contract, &session.cred_name).await?;
@@ -846,6 +891,11 @@ pub async fn auto_batch_export(
     // File-locked append to batch JSON
     append_to_batch_json(out_path, &pres_data)?;
     println!("[auto-batch] presentation exported to {}", out_path);
+    metrics_append(metrics, metrics_file, serde_json::json!({
+        "scenario": "presentation_build",
+        "userId": &session.user_id,
+        "ms": t0_pres.elapsed().as_millis() as u64
+    }));
     Ok(())
 }
 

@@ -15,8 +15,12 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::fs;
+use std::io::Write as IoWrite;
+
 use ethers::prelude::*;
 use ethers::providers::Provider;
+use serde_json::json;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -45,6 +49,18 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(2);
     let poll_interval = Duration::from_secs(poll_secs);
+    let metrics_on = env::var("METRICS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/presentation_aggregator.ndjson".into());
+
+    fn metrics_append(enabled: bool, path: &str, value: serde_json::Value) {
+        if !enabled { return; }
+        let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            writeln!(f, "{}", serde_json::to_string(&value)?)?;
+            Ok(())
+        })();
+    }
 
     // ── Connect to chain ──
     let rpc_url = env::var("ETH_RPC")
@@ -73,12 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let batch_client = BatchVerifyClient::new(batch_verify_addr, client.clone())?;
     let params_client = ParamsClient::new(params_addr, client.clone())?;
 
-    // ── Read batch size from Params contract ──
-    let (_, batch_size_pres) = params_client.get_batch_sizes(cred_name.clone()).await?;
-    let threshold = if batch_size_pres == 0 { 1 } else { batch_size_pres as usize };
-
     info!(
-        batch_size = %threshold,
         file = %batch_file,
         poll_secs = %poll_secs,
         "presentation aggregator watching…"
@@ -87,6 +98,12 @@ async fn main() -> anyhow::Result<()> {
     // ── Persistent polling loop ──
     loop {
         sleep(poll_interval).await;
+
+        // Re-read batch size each iteration so on-chain changes take effect without restart
+        let threshold = match params_client.get_batch_sizes(cred_name.clone()).await {
+            Ok((_, sz)) => if sz == 0 { 1 } else { sz as usize },
+            Err(e) => { warn!(error = %e, "failed to read batch sizes; using 1"); 1 },
+        };
 
         let presentations =
             match consume_batch_if_ready::<PresentationData>(&batch_file, threshold) {
@@ -149,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         };
 
         info!("sending verifyPresentationBatch tx…");
+        let t0_tx = std::time::Instant::now();
         let send_result = call.send().await;
         match send_result {
             Ok(pending_tx) => {
@@ -164,6 +182,17 @@ async fn main() -> anyhow::Result<()> {
                                 per_user = %(gas_used / b as u64),
                                 "batch presentation verified ({} users)", b
                             );
+                            let eff_price = r.effective_gas_price.unwrap_or_default();
+                            metrics_append(metrics_on, &metrics_file, json!({
+                                "scenario": "verifyPresentationBatch",
+                                "batch_size": b,
+                                "gasUsed": gas_used.to_string(),
+                                "perUserGas": (gas_used / b as u64).to_string(),
+                                "effectiveGasPrice": eff_price.to_string(),
+                                "costWei": (gas_used * eff_price).to_string(),
+                                "hash": format!("0x{:x}", r.transaction_hash),
+                                "ms": t0_tx.elapsed().as_millis() as u64,
+                            }));
                         } else {
                             error!(gas_used = %gas_used, "tx reverted (status=0)");
                         }

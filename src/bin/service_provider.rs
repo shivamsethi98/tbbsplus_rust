@@ -8,6 +8,7 @@ use futures::StreamExt;
 
 use tbbsplus_rust::orchestration::chain::clients::{VerifyClient, AccumulatorClient};
 use std::io::Write as _;
+use std::fs::OpenOptions;
 
 /// Status of an opened credential entry tracked by the SP.
 #[derive(Clone, Debug)]
@@ -83,6 +84,18 @@ async fn main() -> anyhow::Result<()> {
 
     let ws = Provider::<Ws>::connect(ws_url).await?;
     let client = Arc::new(SignerMiddleware::new(ws, owner_pk));
+
+    let metrics_on = env::var("METRICS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let metrics_file = env::var("METRICS_FILE").unwrap_or_else(|_| "metrics/results/service_provider.ndjson".into());
+    fn metrics_append(enabled: bool, path: &str, value: serde_json::Value) {
+        if !enabled { return; }
+        let _ = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(dir) = std::path::Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+            let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+            writeln!(f, "{}", serde_json::to_string(&value)?)?;
+            Ok(())
+        })();
+    }
 
     let verify_addr_env = env::var("POK_VERIFY_WRAPPER").ok();
     let verify_addr_fallback = env::var("VERIFY_CONTRACT").ok();
@@ -192,10 +205,24 @@ async fn main() -> anyhow::Result<()> {
                 let t1b = ethers::types::Bytes::from(t1.clone());
                 let t2b = ethers::types::Bytes::from(t2.clone());
                 let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b))?;
+                let t0_open = std::time::Instant::now();
                 let pending = call.send().await?;
                 let rcpt = pending.await?;
                 let status_ok = rcpt.as_ref().and_then(|r| r.status).unwrap_or(U64::from(0)) == U64::from(1);
                 println!("[sp] requestOpen tx status={}", if status_ok { "OK" } else { "FAIL" });
+                if let (true, Some(ref r)) = (status_ok, rcpt.as_ref()) {
+                    let gas_used = r.gas_used.unwrap_or_default();
+                    let eff_price = r.effective_gas_price.unwrap_or_default();
+                    metrics_append(metrics_on, &metrics_file, serde_json::json!({
+                        "scenario": "requestOpen",
+                        "user_idx": 0,
+                        "gasUsed": gas_used.to_string(),
+                        "effectiveGasPrice": eff_price.to_string(),
+                        "costWei": (gas_used * eff_price).to_string(),
+                        "hash": format!("{:?}", r.transaction_hash),
+                        "ms": t0_open.elapsed().as_millis() as u64,
+                    }));
+                }
 
                 if status_ok {
                     let idx = next_idx;
@@ -258,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
                             let call = accumulator.contract.method::<_, ()>("requestOpen", (name_env.clone(), t1b, t2b));
                             match call {
                                 Ok(c) => {
+                                    let t0_open = std::time::Instant::now();
                                     match c.send().await {
                                         Ok(pending) => {
                                             let rcpt = pending.await;
@@ -266,6 +294,19 @@ async fn main() -> anyhow::Result<()> {
                                                 .and_then(|r| r.status)
                                                 .unwrap_or(U64::from(0)) == U64::from(1);
                                             println!("[sp] batch[{}] requestOpen tx status={}", j, if ok { "OK" } else { "FAIL" });
+                                            if let (true, Ok(Some(ref r))) = (ok, &rcpt) {
+                                                let gas_used = r.gas_used.unwrap_or_default();
+                                                let eff_price = r.effective_gas_price.unwrap_or_default();
+                                                metrics_append(metrics_on, &metrics_file, serde_json::json!({
+                                                    "scenario": "requestOpen",
+                                                    "user_idx": j,
+                                                    "gasUsed": gas_used.to_string(),
+                                                    "effectiveGasPrice": eff_price.to_string(),
+                                                    "costWei": (gas_used * eff_price).to_string(),
+                                                    "hash": format!("{:?}", r.transaction_hash),
+                                                    "ms": t0_open.elapsed().as_millis() as u64,
+                                                }));
+                                            }
                                             if ok {
                                                 let idx = next_idx;
                                                 next_idx += 1;

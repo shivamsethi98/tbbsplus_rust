@@ -349,7 +349,15 @@ contract CredentialRegistry {
             srec.status = Status.Unverified;
             if (bprimes[k].length == 128) { srec.Bprime = bprimes[k]; }
             emit Aggregated(name, userId, A128, p.e, p.s);
+            // Solidity `delete` does NOT clear mappings inside structs, so we
+            // must manually reset seenIdx for each issuer index before deleting
+            // the Pending.  Without this, re-issuance of the same userId hits
+            // "dup idx" because the old seenIdx[i] values persist.
+            uint16 tClear = p.tNeeded;
             delete pendings[k];
+            for (uint16 i = 1; i <= tClear; i++) {
+                delete pendings[k].seenIdx[i];
+            }
         }
     }
 
