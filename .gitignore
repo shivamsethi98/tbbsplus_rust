@@ -17,7 +17,6 @@
 node_modules
 /cache
 /cache_hardhat
-/docs
 /redundant_files
 /scripts/cache_hardhat/
 /metrics/results/
